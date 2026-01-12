@@ -1,0 +1,10 @@
+paddleocr>=2.7.0
+paddlepaddle-gpu>=2.5.0  # or paddlepaddle for CPU
+transformers>=4.30.0
+torch>=2.0.0
+layoutparser>=0.3.4
+detectron2  # For advanced layout detection
+pillow>=9.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pydantic>=2.0.0

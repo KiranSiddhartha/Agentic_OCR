@@ -622,3 +622,36 @@ def segregate_insurance_document(lines):
         "fields": extracted,
         "field_errors": errors
     }
+
+# ============================================================
+# ORCHESTRATOR ENTRYPOINT (REQUIRED – DO NOT REMOVE)
+# ============================================================
+
+def segment_and_extract(lines: List[str]) -> dict:
+    """
+    Unified entrypoint required by orchestrator.py
+
+    This function:
+    - Preserves existing segmentation logic
+    - Adapts output to orchestrator/UI contract
+    - Does NOT alter extraction behavior
+    """
+
+    result = segregate_insurance_document(lines)
+
+    # Convert flat fields -> structured format
+    structured = {}
+    for field, value in result.get("fields", {}).items():
+        if value:
+            structured[field] = {
+                "value": value,
+                "confidence": 0.85,   # neutral default (can be boosted later)
+                "source": "insurance_segmentation"
+            }
+
+    return {
+        "structured": structured,
+        "document_type": result.get("document_type", "OTH"),
+        "policy_type": result.get("policy_type", "UNK"),
+        "field_errors": result.get("field_errors", [])
+    }
