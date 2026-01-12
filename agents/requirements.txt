@@ -1,0 +1,27 @@
+# Core OCR
+paddleocr==2.7.0.3
+paddlepaddle==2.5.2
+
+# Image Processing
+opencv-python==4.8.1.78
+Pillow==10.1.0
+pdf2image==1.16.3
+numpy==1.24.3
+
+# Data Processing
+pydantic==2.5.0
+
+# Web Interface
+streamlit==1.29.0
+
+# Spell checking and text correction
+symspellpy==6.7.6
+
+# LLM-based text processing (optional - for ChatGPT-like intelligence)
+# Uncomment these to enable LLM features:
+# transformers==4.36.0
+# torch==2.0.0
+# (Note: Only needed if you want LLM-based corrections. System works without it.)
+
+# Additional utilities
+python-dateutil==2.8.2
