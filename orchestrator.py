@@ -1,435 +1,321 @@
- 
-# # orchestrator.py
-# # OPTIMAL: Fast (1 retry max) + Accurate + Semantic Arbitration (Agentic)
-
-# from preprocessing import preprocess
-# from agents.vision_agent import run_vision
-# from agents.correction_agent import correct_lines
-# from agents.field_extraction_agent import extract_fields
-# from agents.validation_agent import validate_output
-# from agents.retry_agent import (
-#     should_retry,
-#     get_retry_strategy,
-#     should_terminate_retries,
-#     get_retry_recommendations,
-# )
-# from agents.semantic_field_agent import (
-#     semantic_arbitrate,
-#     find_low_confidence_fields,
-# )
-# from utils.text_utils import normalize_post_ocr, normalize_text, merge_broken_lines, normalize_ocr_artifacts
-
-
-# def run_pipeline(image, max_retries=1, debug=False):
-#     """
-#     OPTIMAL OCR pipeline:
-#     - OCR runs max 1–2 times
-#     - Rules-first extraction
-#     - Semantic agent ONLY resolves ambiguity
-#     - Fast + Accurate + Agentic
-
-#     Expected:
-#       Speed: ~1–2s per page
-#       Accuracy: 93–97%
-#     """
-
-#     retry_count = 0
-#     best_result = None
-#     best_score = 0.0
-#     retry_history = []
-
-#     while retry_count <= max_retries:
-
-#         # --------------------------------------------------
-#         # 1️⃣ Retry Strategy
-#         # --------------------------------------------------
-#         strategy = get_retry_strategy(retry_count)
-
-#         if debug:
-#             print(f"[Retry {retry_count}] Strategy: {strategy['name']}")
-
-#         # --------------------------------------------------
-#         # 2️⃣ Preprocess (ONLY thing that changes per retry)
-#         # --------------------------------------------------
-#         processed = preprocess(image, strategy=strategy)
-
-#         # --------------------------------------------------
-#         # 3️⃣ OCR (single run per retry)
-#         # --------------------------------------------------
-#         lines, ocr_confidence = run_vision(processed)
-
-#         if debug:
-#             print(
-#                 f"[Retry {retry_count}] OCR confidence={ocr_confidence:.3f}, "
-#                 f"lines={len(lines)}"
-#             )
-
-#         # --------------------------------------------------
-#         # 4️⃣ Text Cleanup (LIGHT + SAFE)
-#         # --------------------------------------------------
-#         # lines = [normalize_text(l) for l in lines if l and l.strip()]
-         
-#         lines = [
-#             normalize_post_ocr(l)
-#             for l in lines if l and l.strip()
-#         ]
-
-#         lines = merge_broken_lines(lines)
-
-#         # Remove duplicates (cheap + effective)
-#         seen = set()
-#         unique = []
-#         for line in lines:
-#             key = line.lower().strip()
-#             if key and key not in seen:
-#                 seen.add(key)
-#                 unique.append(line)
-#         lines = unique
-
-#         # --------------------------------------------------
-#         # 5️⃣ Correction Agent (RULE-BASED)
-#         # --------------------------------------------------
-#         lines = correct_lines(lines)
-
-#         # --------------------------------------------------
-#         # 6️⃣ Rule-Based Field Extraction
-#         # --------------------------------------------------
-#         structured = extract_fields(lines)
-
-#         # --------------------------------------------------
-#         # 7️⃣ Validation + Scoring
-#         # --------------------------------------------------
-#         validated, score = validate_output(structured, ocr_confidence)
-
-#         if debug:
-#             print(
-#                 f"[Retry {retry_count}] "
-#                 f"score={score:.3f}, fields={list(validated.keys())}"
-#             )
-
-#         # --------------------------------------------------
-#         # 8️⃣ 🔥 SEMANTIC FIELD ARBITRATION (AGENTIC)
-#         # --------------------------------------------------
-#         low_conf_fields = find_low_confidence_fields(validated)
-
-#         if low_conf_fields and score < 0.92:
-#             if debug:
-#                 print(
-#                     f"[Semantic Agent] Resolving fields: {low_conf_fields}"
-#                 )
-
-#             validated = semantic_arbitrate(
-#                 raw_lines=lines,
-#                 structured=validated,
-#                 low_confidence_fields=low_conf_fields,
-#                 debug=debug,
-#             )
-
-#             # Re-score after semantic resolution
-#             validated, score = validate_output(validated, ocr_confidence)
-
-#             if debug:
-#                 print(
-#                     f"[Semantic Agent] New score={score:.3f}"
-#                 )
-
-#         # --------------------------------------------------
-#         # 9️⃣ Track Best Result
-#         # --------------------------------------------------
-#         if score > best_score:
-#             best_score = score
-#             best_result = {
-#                 "structured": validated,
-#                 "raw_lines": lines,
-#                 "confidence": score,
-#                 "ocr_confidence": ocr_confidence,
-#                 "retries": retry_count,
-#                 "strategy": strategy["name"],
-#             }
-
-#         # --------------------------------------------------
-#         # 🔁 Retry Decision (IMAGE-based only)
-#         # --------------------------------------------------
-#         retry_flag, reason = should_retry(score, structured=validated)
-
-#         retry_history.append({
-#             "retry": retry_count,
-#             "score": score,
-#             "strategy": strategy["name"],
-#             "reason": reason if retry_flag else "Accepted",
-#         })
-
-#         if debug and retry_flag:
-#             print(f"[Retry {retry_count}] Retry triggered: {reason}")
-
-#         if not retry_flag or should_terminate_retries(retry_count, max_retries):
-#             if debug:
-#                 print(f"[Retry {retry_count}] Pipeline complete")
-#             break
-
-#         retry_count += 1
-
-#     # --------------------------------------------------
-#     # 🧾 Final Fallback (safety)
-#     # --------------------------------------------------
-#     if best_result is None:
-#         best_result = {
-#             "structured": {},
-#             "raw_lines": [],
-#             "confidence": 0.0,
-#             "ocr_confidence": 0.0,
-#             "retries": 0,
-#             "strategy": "none",
-#         }
-
-#     best_result["retry_history"] = retry_history
-#     best_result["recommendations"] = get_retry_recommendations(
-#         best_result["confidence"],
-#         best_result["structured"],
-#     )
-
-#     return best_result
-
 # orchestrator.py
-# OPTIMIZED: Parallel processing + smart caching
+# INTELLIGENT CASCADING HYBRID ARCHITECTURE
+# Stage 1 → Stage 2 → Stage 3 → Stage 4 (with smart skipping)
+
 from preprocessing import preprocess
-from agents.vision_agent import run_vision
-from agents.insurance_segmentation import segment_and_extract
-from agents.validation_agent import validate_output
-from agents.retry_agent import (
-    should_retry,
-    get_retry_strategy,
-    should_terminate_retries,
-    get_retry_recommendations,
-)
+from agents.vision_agent import VisionAgent
 from utils.text_utils import merge_broken_lines
 import hashlib
+import time
 
+# ============================================================
+# STAGE IMPORTS
+# ============================================================
 
-# Global cache for repeated documents
+from agents.stage1_deterministic_agent import extract_with_regex
+
+# Stage 2
+try:
+    from agents.stage2_semantic_agent import extract_with_ner
+    STAGE2_AVAILABLE = True
+except ImportError:
+    STAGE2_AVAILABLE = False
+    print("[WARN] Stage 2 (Semantic NER) not available")
+
+# Stage 3
+try:
+    from agents.stage3_layout_agent import extract_with_layoutxlm
+    from agents.relation_extraction_agent import RelationExtractionAgent
+    STAGE3_AVAILABLE = True
+except ImportError:
+    STAGE3_AVAILABLE = False
+    print("[WARN] Stage 3 (Layout) not available")
+
+from agents.validation_agent import validate_and_arbitrate
+
+# ============================================================
+# GLOBAL CACHE & PERFORMANCE TRACKING
+# ============================================================
+
 _PIPELINE_CACHE = {}
 _CACHE_ENABLED = True
+_vision_agent = None  # Singleton
 
+_PERFORMANCE_STATS = {
+    "stage1_hits": 0,
+    "stage2_hits": 0,
+    "stage3_hits": 0,
+    "cache_hits": 0,
+    "avg_stage1_time": 0,
+    "avg_stage2_time": 0,
+    "avg_stage3_time": 0,
+}
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
 
 def run_pipeline(image, max_retries=1, debug=False, use_cache=True):
     """
-    OPTIMIZED pipeline with:
-    - Smart caching (3x faster for repeated docs)
-    - Early exit on high confidence
-    - Minimal processing
+    INTELLIGENT CASCADING HYBRID PIPELINE
     """
-    
-    # Check cache first
-    if use_cache and _CACHE_ENABLED:
-        cache_key = _get_image_hash(image)
-        if cache_key in _PIPELINE_CACHE:
-            if debug:
-                print("[Cache Hit] Returning cached result")
-            return _PIPELINE_CACHE[cache_key]
-    
-    retry_count = 0
-    best_result = None
-    best_score = -1.0
-    retry_history = []
-    
-    while retry_count <= max_retries:
-        
-        # =============================================
-        # STEP 1: Retry Strategy
-        # =============================================
-        strategy = get_retry_strategy(retry_count)
-        
-        if debug:
-            print(f"[Retry {retry_count}] Strategy: {strategy['name']}")
-        
-        # =============================================
-        # STEP 2: Preprocess Image (FAST)
-        # =============================================
-        processed = preprocess(image, strategy=strategy)
-        
-        # =============================================
-        # STEP 3: OCR (PARALLEL)
-        # =============================================
-        lines, ocr_confidence = run_vision(processed)
-        
-        if debug:
-            print(f"[OCR] confidence={ocr_confidence:.3f}, lines={len(lines)}")
-        
-        if not lines:
-            retry_count += 1
-            continue
-        
-        # =============================================
-        # STEP 4: MINIMAL CLEANUP
-        # =============================================
-        lines = [l for l in lines if l and l.strip()]
-        
-        # Smart line merging (preserves layout)
-        lines = merge_broken_lines(lines)
-        
-        # Fast deduplication (case-insensitive)
-        seen = set()
-        deduped = []
-        for line in lines:
-            key = line.lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(line)
-        lines = deduped
-        
-        # =============================================
-        # STEP 5: Extract Fields (FAST)
-        # =============================================
-        result = segment_and_extract(lines)
-        
-        # =============================================
-        # STEP 6: Validation
-        # =============================================
-        validated, score = validate_output(
-            result.get("fields", {}),
-            ocr_confidence
+
+    cache_key = _get_image_hash(image)
+    if use_cache and _CACHE_ENABLED and cache_key in _PIPELINE_CACHE:
+        _PERFORMANCE_STATS["cache_hits"] += 1
+        return _PIPELINE_CACHE[cache_key]
+
+    stage_times = {}
+    total_start = time.time()
+
+    try:
+        # ---------------- PREPROCESS ----------------
+        processed = preprocess(image)
+
+        # ---------------- OCR ----------------
+        global _vision_agent
+        if _vision_agent is None:
+            _vision_agent = VisionAgent(use_layoutxlm=STAGE3_AVAILABLE)
+
+        vision = _vision_agent
+
+        ocr_start = time.time()
+        ocr_results = vision.ocr_engine.run_with_boxes(processed)
+
+        if not ocr_results or not ocr_results.get("text"):
+            return _create_empty_result("No text detected by OCR")
+
+        lines = ocr_results.get("lines", [])
+        if not lines and ocr_results.get("text"):
+            lines = [" ".join(ocr_results["text"])]
+
+        lines = merge_broken_lines([l.strip() for l in lines if l.strip()])
+
+        layout_elements = []
+        if STAGE3_AVAILABLE:
+            try:
+                layout_elements = vision.analyze_layout(processed, ocr_results)
+            except Exception:
+                layout_elements = []
+
+        stage_times["ocr"] = time.time() - ocr_start
+
+        # ---------------- STAGE 1 ----------------
+        stage1_start = time.time()
+        stage1_fields = extract_with_regex(lines, layout_elements)
+        stage_times["stage1"] = time.time() - stage1_start
+        _PERFORMANCE_STATS["stage1_hits"] += 1
+
+        missing_after_stage1 = _identify_missing_fields(stage1_fields)
+        stage1_conf = _calculate_stage_confidence(stage1_fields)
+
+        # ---------------- STAGE 2 ----------------
+        stage2_fields = {}
+        if STAGE2_AVAILABLE and _should_run_stage2(stage1_fields, missing_after_stage1, stage1_conf):
+            stage2_start = time.time()
+            stage2_fields = extract_with_ner(lines, missing_after_stage1)
+            stage_times["stage2"] = time.time() - stage2_start
+            _PERFORMANCE_STATS["stage2_hits"] += 1
+
+        # ---------------- STAGE 3 ----------------
+        combined_fields = {**stage1_fields, **stage2_fields}
+        missing_after_stage2 = _identify_missing_fields(combined_fields)
+        combined_conf = _calculate_stage_confidence(combined_fields)
+
+        stage3_fields = {}
+        if (
+            STAGE3_AVAILABLE
+            and _should_run_stage3(combined_fields, missing_after_stage2, combined_conf, layout_elements)
+        ):
+            stage3_start = time.time()
+            re_agent = RelationExtractionAgent()
+            relations = re_agent.extract_relations(layout_elements, combined_fields)
+            ambiguous = _identify_ambiguous_regions(layout_elements, combined_fields)
+            stage3_fields = extract_with_layoutxlm(ambiguous, relations, missing_after_stage2)
+            stage_times["stage3"] = time.time() - stage3_start
+            _PERFORMANCE_STATS["stage3_hits"] += 1
+
+        # ---------------- STAGE 4 ----------------
+        stage4_start = time.time()
+        merged = _merge_stage_results_hybrid(stage1_fields, stage2_fields, stage3_fields)
+        final_fields, confidence = validate_and_arbitrate(
+            merged,
+            ocr_results.get("avg_confidence", 0.8),
+            stage_breakdown={
+                "stage1": stage1_fields,
+                "stage2": stage2_fields,
+                "stage3": stage3_fields,
+            },
         )
-        
-        if debug:
-            print(f"[Score] {score:.3f}, Fields: {list(validated.keys())}")
-        
-        # =============================================
-        # STEP 7: Track Best Result
-        # =============================================
-        if score > best_score:
-            best_score = score
-            best_result = {
-                "document_type": result.get("document_type", "OTH"),
-                "policy_type": result.get("policy_type", "UNK"),
-                "fields": validated,
-                "raw_lines": lines,
-                "confidence": score,
-                "ocr_confidence": ocr_confidence,
-                "retries": retry_count,
-                "strategy": strategy["name"],
-            }
-        
-        # =============================================
-        # STEP 8: EARLY EXIT (Speed Optimization)
-        # =============================================
-        # If score is very high, no need to retry
-        if score >= 0.95:
-            if debug:
-                print(f"[Early Exit] Score {score:.3f} is excellent, skipping retries")
-            break
-        
-        # =============================================
-        # STEP 9: Retry Decision
-        # =============================================
-        retry_flag, reason = should_retry(score, structured=validated)
-        
-        retry_history.append({
-            "retry": retry_count,
-            "score": score,
-            "strategy": strategy["name"],
-            "reason": reason if retry_flag else "Accepted",
-        })
-        
-        if debug and retry_flag:
-            print(f"[Retry] {reason}")
-        
-        if not retry_flag or should_terminate_retries(retry_count, max_retries):
-            break
-        
-        retry_count += 1
-    
-    # =============================================
-    # STEP 10: Final Fallback
-    # =============================================
-    if best_result is None:
-        best_result = {
-            "document_type": "OTH",
-            "policy_type": "UNK",
-            "fields": {},
-            "raw_lines": [],
-            "confidence": 0.0,
-            "ocr_confidence": 0.0,
-            "retries": 0,
-            "strategy": "none",
+        stage_times["stage4"] = time.time() - stage4_start
+
+        # ---------------- DOCUMENT CLASSIFICATION ----------------
+        from agents.insurance_segmentation import segregate_insurance_document
+        seg = segregate_insurance_document(lines)
+
+        total_time = time.time() - total_start
+
+        result = {
+            "fields": final_fields,
+            "raw_lines": lines,
+            "confidence": confidence,
+            "ocr_confidence": ocr_results.get("avg_confidence", 0.8),
+            "document_type": seg.get("document_type", "INS"),
+            "policy_type": seg.get("policy_type", _infer_policy_type(final_fields)),
+            "metadata": {
+                "pipeline": "intelligent_cascading_hybrid",
+                "stage_times": stage_times,
+                "total_time": total_time,
+                "fields_per_stage": {
+                    "stage1": len(stage1_fields),
+                    "stage2": len(stage2_fields),
+                    "stage3": len(stage3_fields),
+                    "final": len(final_fields),
+                },
+            },
         }
-    
-    best_result["retry_history"] = retry_history
-    best_result["recommendations"] = get_retry_recommendations(
-        best_result["confidence"],
-        best_result["fields"],
-    )
-    
-    # Cache result
-    if use_cache and _CACHE_ENABLED:
-        _PIPELINE_CACHE[cache_key] = best_result
-    
-    return best_result
+
+        if use_cache and cache_key:
+            _PIPELINE_CACHE[cache_key] = result
+
+        return result
+
+    except Exception as e:
+        return _create_empty_result(str(e))
+
+def run_pipeline_batch(
+    images,
+    max_retries=1,
+    debug=False,
+    max_workers=4,
+    use_cache=True,
+):
+    """
+    Batch wrapper for run_pipeline.
+    Preserves existing behavior expected by app.py.
+    """
+
+    if not images:
+        return []
+
+    results = []
+
+    # Simple sequential execution (SAFE DEFAULT)
+    # Can be parallelized later if needed
+    for img in images:
+        try:
+            res = run_pipeline(
+                img,
+                max_retries=max_retries,
+                debug=debug,
+                use_cache=use_cache,
+            )
+            results.append(res)
+        except Exception as e:
+            results.append(_create_empty_result(str(e)))
+
+    return results
+
+# ============================================================
+# DECISION HELPERS
+# ============================================================
+
+def _should_run_stage2(stage1_fields, missing_fields, stage1_confidence):
+    if not missing_fields:
+        return False  # ← Skip Stage 2 if Stage 1 got everything
+    if stage1_confidence < 0.90:
+        return True  # ← Run if low confidence
+    if len(missing_fields) >= 3:
+        return True  # ← Run if many fields missing
+    return any(f in missing_fields for f in ["policy_number", "insured_name"])
+
+def _should_run_stage3(fields, missing, conf, layout):
+    return bool(STAGE3_AVAILABLE and layout and missing and conf < 0.85)
+    # ← Only run expensive LayoutLM if needed
+
+
+def _calculate_stage_confidence(fields):
+    if not fields:
+        return 0.0
+    return sum(f.get("confidence", 0.5) for f in fields.values()) / len(fields)
+
+
+def _merge_stage_results_hybrid(stage1, stage2, stage3):
+    merged = {}
+    all_fields = set(stage1) | set(stage2) | set(stage3)
+
+    for f in all_fields:
+        candidates = []
+        if f in stage1:
+            candidates.append({**stage1[f], "priority": 3})
+        if f in stage2:
+            candidates.append({**stage2[f], "priority": 2})
+        if f in stage3:
+            candidates.append({**stage3[f], "priority": 1})
+
+        merged[f] = max(
+            candidates,
+            key=lambda c: c.get("confidence", 0) * 0.7 + c.get("priority", 0) * 0.3,
+        )
+
+    return merged
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def _identify_missing_fields(fields):
+    required = [
+        "policy_number",
+        "insured_name",
+        "effective_date",
+        "expiration_date",
+        "mailing_address",
+        "total_premium",
+    ]
+    return [f for f in required if f not in fields]
+
+
+def _identify_ambiguous_regions(layout_elements, extracted_fields):
+    extracted = {v.get("value", "").lower() for v in extracted_fields.values()}
+    return [e for e in layout_elements if e.get("text", "").lower() not in extracted]
+
+
+def _infer_policy_type(fields):
+    text = " ".join(v.get("value", "") for v in fields.values()).lower()
+    if "home" in text:
+        return "HO"
+    if "auto" in text:
+        return "AUTO"
+    if "life" in text:
+        return "LIFE"
+    if "commercial" in text:
+        return "CGL"
+    return "UNK"
+
+
+def _create_empty_result(reason):
+    return {
+        "fields": {},
+        "raw_lines": [],
+        "confidence": 0.0,
+        "metadata": {"error": reason},
+    }
 
 
 def _get_image_hash(image):
-    """Generate hash for image caching"""
     try:
-        # Use first and last rows for speed
-        sample = image[::image.shape[0]//10].tobytes()
-        return hashlib.md5(sample).hexdigest()
-    except:
-        return None
+        import numpy as np
+        if isinstance(image, np.ndarray):
+            return hashlib.md5(image.tobytes()).hexdigest()
+    except Exception:
+        pass
+    return None
+
+
+def get_performance_stats():
+    return _PERFORMANCE_STATS.copy()
 
 
 def clear_cache():
-    """Clear pipeline cache"""
-    global _PIPELINE_CACHE
     _PIPELINE_CACHE.clear()
-
-
-def disable_cache():
-    """Disable caching"""
-    global _CACHE_ENABLED
-    _CACHE_ENABLED = False
-    clear_cache()
-
-
-def enable_cache():
-    """Enable caching"""
-    global _CACHE_ENABLED
-    _CACHE_ENABLED = True
-
-
-# =============================================
-# BATCH PROCESSING (For Multiple Pages)
-# =============================================
-def run_pipeline_batch(images, max_retries=1, debug=False, max_workers=4):
-    """
-    Process multiple images in parallel.
-    3-5x faster than sequential processing.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    results = [None] * len(images)
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(run_pipeline, img, max_retries, debug): idx
-            for idx, img in enumerate(images)
-        }
-        
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                if debug:
-                    print(f"Error processing page {idx}: {e}")
-                results[idx] = {
-                    "document_type": "OTH",
-                    "policy_type": "UNK",
-                    "fields": {},
-                    "raw_lines": [],
-                    "confidence": 0.0,
-                    "ocr_confidence": 0.0,
-                    "retries": 0,
-                    "strategy": "none",
-                    "error": str(e),
-                }
-    
-    return results

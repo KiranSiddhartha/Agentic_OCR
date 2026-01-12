@@ -1,236 +1,265 @@
-# # agents/vision_agent.py
-from api.ocr_engine import OCREngine
+# agents/vision_agent.py - FIXED
+# Proper OCR integration with PP-OCRv3 and LayoutXLM
+from PIL import Image
+import torch
+import numpy as np
 
-_engine = OCREngine()
+# ============================================================
+# VISION AGENT – INTELLIGENT CASCADING HYBRID
+# ============================================================
+class VisionAgent:
+    def __init__(self, use_layoutxlm=True):
+        """
+        Stage-aware Vision Agent
+        Stage 0 : PP-OCRv3
+        Stage 1 : Rule-based layout
+        Stage 2 : LayoutLMv3 (ONLY if needed)
+        """
+        from api.ocr_engine import OCREngine
+        self.ocr_engine = OCREngine()
+        print("[VisionAgent] PP-OCRv3 loaded")
+
+        self.use_layoutxlm = use_layoutxlm
+        self.processor = None
+        self.model = None
+
+        if use_layoutxlm:
+            try:
+                from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
+
+                # IMPORTANT: apply_ocr MUST be False
+                self.processor = LayoutLMv3Processor.from_pretrained(
+                    "microsoft/layoutlmv3-base",
+                    apply_ocr=False
+                )
+
+                self.model = LayoutLMv3ForTokenClassification.from_pretrained(
+                    "microsoft/layoutlmv3-base"
+                )
+                self.model.eval()
+
+                print("[VisionAgent] LayoutLMv3 loaded")
+
+            except Exception as e:
+                print(f"[VisionAgent] LayoutLMv3 unavailable: {e}")
+                self.use_layoutxlm = False
+
+    # --------------------------------------------------------
+    # STAGE 0 – OCR
+    # --------------------------------------------------------
+    def run_vision(self, image):
+        return self.ocr_engine.run(image)
+
+    # --------------------------------------------------------
+    # INTELLIGENT CASCADING LAYOUT ANALYSIS
+    # --------------------------------------------------------
+    def analyze_layout(self, image, ocr_results=None):
+        """
+        INTELLIGENT CASCADE:
+        1. OCR
+        2. Rule-based layout
+        3. LayoutLMv3 ONLY if ambiguity detected
+        """
+
+        if ocr_results is None:
+            try:
+                ocr_results = self.ocr_engine.run_with_boxes(image)
+            except Exception as e:
+                print(f"[VisionAgent] OCR failed: {e}")
+                return []
+
+        if not ocr_results.get("text"):
+            return []
+
+        # ---------- STAGE 1: RULE-BASED (FAST, FREE) ----------
+        basic_layout = self._basic_layout_analysis(image, ocr_results)
+
+        if not self.use_layoutxlm:
+            return basic_layout
+
+        # ---------- DECISION: SHOULD WE RUN LAYOUTLM? ----------
+        if not self._needs_semantic_layout(basic_layout):
+            return basic_layout
+
+        # ---------- STAGE 2: LAYOUTLMv3 (EXPENSIVE) ----------
+        try:
+            return self._layoutlm_analysis(image, ocr_results)
+        except Exception as e:
+            print(f"[VisionAgent] LayoutLM failed: {e}")
+            return basic_layout
+
+    # --------------------------------------------------------
+    # DECISION LOGIC (CRITICAL)
+    # --------------------------------------------------------
+    def _needs_semantic_layout(self, layout_elements):
+        """
+        Run LayoutLM ONLY if:
+        - Labels exist without nearby values
+        - Dense table-like structure
+        """
+        labels = [e for e in layout_elements if e["element_type"] == "label"]
+        values = [e for e in layout_elements if e["element_type"] == "value"]
+
+        if not labels or not values:
+            return False
+
+        # Too many labels with no values → ambiguity
+        orphan_labels = 0
+        for lbl in labels:
+            lx0, ly0, lx1, ly1 = lbl["box"]
+            matched = False
+            for val in values:
+                vx0, vy0, vx1, vy1 = val["box"]
+                if vx0 > lx1 and abs(vy0 - ly0) < 40:
+                    matched = True
+                    break
+            if not matched:
+                orphan_labels += 1
+
+        return orphan_labels >= 2
+
+    # --------------------------------------------------------
+    # STAGE 2 – LAYOUTLMv3 (SAFE)
+    # --------------------------------------------------------
+    def _layoutlm_analysis(self, image, ocr_results):
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image[:, :, ::-1])
+
+        encoding = self.processor(
+            image,
+            ocr_results["text"],
+            boxes=ocr_results["boxes"],
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=512
+        )
+
+        with torch.no_grad():
+            logits = self.model(**encoding).logits
+
+        predictions = logits.argmax(-1)[0]
+        word_ids = encoding.word_ids(batch_index=0)
+
+        return self._parse_layout(predictions, word_ids, ocr_results)
+
+    # --------------------------------------------------------
+    # PARSE LAYOUTLM OUTPUT
+    # --------------------------------------------------------
+    def _parse_layout(self, predictions, word_ids, ocr_results):
+        label_map = {
+            0: "O",
+            1: "B-HEADER",
+            2: "I-HEADER",
+            3: "B-QUESTION",
+            4: "I-QUESTION",
+            5: "B-ANSWER",
+            6: "I-ANSWER",
+        }
+
+        seen = set()
+        layout_elements = []
+
+        for t_idx, w_idx in enumerate(word_ids):
+            if w_idx is None or w_idx in seen:
+                continue
+            if w_idx >= len(ocr_results["text"]):
+                continue
+
+            seen.add(w_idx)
+
+            label = label_map.get(predictions[t_idx].item(), "O")
+            word = ocr_results["text"][w_idx]
+            box = ocr_results["boxes"][w_idx]
+            conf = ocr_results["confidences"][w_idx]
+
+            if "HEADER" in label:
+                etype = "header"
+            elif "QUESTION" in label:
+                etype = "label"
+            elif "ANSWER" in label:
+                etype = "value"
+            else:
+                etype = "text"
+
+            layout_elements.append({
+                "text": word,
+                "box": box,
+                "element_type": etype,
+                "confidence": conf,
+                "layoutlm_label": label
+            })
+
+        return layout_elements
+
+    # --------------------------------------------------------
+    # STAGE 1 – RULE-BASED LAYOUT (FALLBACK)
+    # --------------------------------------------------------
+    def _basic_layout_analysis(self, image, ocr_results):
+        elements = []
+
+        for word, box, conf in zip(
+            ocr_results["text"],
+            ocr_results["boxes"],
+            ocr_results["confidences"]
+        ):
+            word_clean = word.strip()
+            etype = "text"
+
+            if word_clean.endswith(":"):
+                etype = "label"
+            elif word_clean.isupper() and box[1] < 200:
+                etype = "header"
+            elif any(c.isdigit() for c in word_clean):
+                etype = "value"
+
+            elements.append({
+                "text": word,
+                "box": box,
+                "element_type": etype,
+                "confidence": conf
+            })
+
+        return elements
+
+    # --------------------------------------------------------
+    # KEY–VALUE PAIR EXTRACTION
+    # --------------------------------------------------------
+    def extract_key_value_pairs(self, layout_elements):
+        pairs = []
+        labels = [e for e in layout_elements if e["element_type"] in ("label", "header")]
+        values = [e for e in layout_elements if e["element_type"] == "value"]
+
+        for lbl in labels:
+            lx0, ly0, lx1, ly1 = lbl["box"]
+            best, dist = None, 1e9
+
+            for val in values:
+                vx0, vy0, vx1, vy1 = val["box"]
+                if vx0 > lx1 and abs(vy0 - ly0) < 50:
+                    d = vx0 - lx1
+                elif vy0 > ly1 and vy0 - ly1 < 120:
+                    d = vy0 - ly1
+                else:
+                    continue
+
+                if d < dist:
+                    dist = d
+                    best = val
+
+            if best:
+                pairs.append((lbl["text"], best["text"]))
+
+        return pairs
+
+
+# ============================================================
+# BACKWARD-COMPATIBLE SINGLETON
+# ============================================================
+_agent = None
 
 def run_vision(image):
-    return _engine.run(image)
-
-
-# # agents/vision_agent.py
-# # FIXED: Layout-aware OCR that preserves document structure
-# from paddleocr import PaddleOCR
-# import numpy as np
-
-# # Initialize OCR with LAYOUT-AWARE settings
-# ocr = PaddleOCR(
-#     use_angle_cls=True,
-#     lang='en',
-#     use_gpu=False,
-#     show_log=False,
-#     det_db_score_mode='slow',  # Better text detection
-#     det_db_thresh=0.3,         # Lower threshold for better recall
-#     det_db_box_thresh=0.5,     # Box detection threshold
-#     rec_batch_num=6,           # Batch processing
-#     drop_score=0.3,            # Lower drop score to keep more text
-#     use_space_char=True,       # CRITICAL: Preserve spaces
-#     det_limit_side_len=1280,   # Higher resolution support
-#     det_limit_type='max'       # Use max dimension
-# )
-
-
-# def run_vision(image):
-#     """
-#     Layout-aware OCR that preserves document structure.
-#     Returns lines in reading order with proper spacing.
-#     """
-#     if image is None:
-#         return [], 0.0
-    
-#     try:
-#         # Run PaddleOCR
-#         result = ocr.ocr(image, cls=True)
-        
-#         if not result or not result[0]:
-#             return [], 0.0
-        
-#         # Extract boxes, text, and confidence
-#         boxes_and_text = []
-#         total_conf = 0.0
-#         count = 0
-        
-#         for line in result[0]:
-#             box = line[0]  # [top-left, top-right, bottom-right, bottom-left]
-#             text_info = line[1]  # (text, confidence)
-#             text = text_info[0]
-#             conf = text_info[1]
-            
-#             # Get box coordinates
-#             top_left = box[0]
-#             bottom_right = box[2]
-            
-#             y_center = (top_left[1] + bottom_right[1]) / 2
-#             x_left = top_left[0]
-#             x_right = bottom_right[0]
-            
-#             boxes_and_text.append({
-#                 'text': text,
-#                 'confidence': conf,
-#                 'y': y_center,
-#                 'x_left': x_left,
-#                 'x_right': x_right,
-#                 'width': x_right - x_left
-#             })
-            
-#             total_conf += conf
-#             count += 1
-        
-#         avg_confidence = total_conf / count if count > 0 else 0.0
-        
-#         # Sort by Y position (top to bottom), then X position (left to right)
-#         boxes_and_text.sort(key=lambda item: (item['y'], item['x_left']))
-        
-#         # Group into lines based on Y-coordinate proximity
-#         lines = group_into_lines(boxes_and_text)
-        
-#         # Clean and return
-#         cleaned_lines = [line.strip() for line in lines if line.strip()]
-        
-#         return cleaned_lines, avg_confidence
-        
-#     except Exception as e:
-#         print(f"OCR Error: {e}")
-#         return [], 0.0
-
-
-# def group_into_lines(boxes_and_text, y_threshold=15):
-#     """
-#     Group text boxes into lines based on Y-coordinate proximity.
-#     Preserves horizontal spacing for tabular layouts.
-    
-#     Args:
-#         boxes_and_text: List of dicts with text, y, x_left, x_right
-#         y_threshold: Max vertical distance to consider same line (pixels)
-    
-#     Returns:
-#         List of strings (lines of text)
-#     """
-#     if not boxes_and_text:
-#         return []
-    
-#     # Group boxes by line (similar Y coordinate)
-#     line_groups = []
-#     current_line = [boxes_and_text[0]]
-    
-#     for i in range(1, len(boxes_and_text)):
-#         current_box = boxes_and_text[i]
-#         prev_box = boxes_and_text[i-1]
-        
-#         # Check if on same line (Y coordinate close)
-#         if abs(current_box['y'] - prev_box['y']) <= y_threshold:
-#             current_line.append(current_box)
-#         else:
-#             # Start new line
-#             line_groups.append(current_line)
-#             current_line = [current_box]
-    
-#     # Add last line
-#     if current_line:
-#         line_groups.append(current_line)
-    
-#     # Reconstruct lines with proper spacing
-#     lines = []
-    
-#     for line_group in line_groups:
-#         # Sort boxes in line by X coordinate (left to right)
-#         line_group.sort(key=lambda box: box['x_left'])
-        
-#         # Build line with spacing
-#         line_text = reconstruct_line_with_spacing(line_group)
-#         lines.append(line_text)
-    
-#     return lines
-
-
-# def reconstruct_line_with_spacing(line_boxes):
-#     """
-#     Reconstruct a line preserving horizontal spacing between text boxes.
-#     Important for tabular/columnar layouts.
-#     """
-#     if not line_boxes:
-#         return ""
-    
-#     # Calculate average character width for spacing
-#     total_width = sum(box['width'] for box in line_boxes)
-#     total_chars = sum(len(box['text']) for box in line_boxes)
-#     avg_char_width = total_width / total_chars if total_chars > 0 else 10
-    
-#     # Build line with spaces
-#     line_parts = []
-    
-#     for i, box in enumerate(line_boxes):
-#         if i == 0:
-#             # First box - just add text
-#             line_parts.append(box['text'])
-#         else:
-#             # Calculate gap from previous box
-#             prev_box = line_boxes[i-1]
-#             gap = box['x_left'] - prev_box['x_right']
-            
-#             # Convert gap to number of spaces
-#             num_spaces = int(gap / avg_char_width)
-            
-#             # Add appropriate spacing
-#             if num_spaces > 8:
-#                 # Large gap = likely tabular column
-#                 line_parts.append('  ' * 4)  # Use 8 spaces for columns
-#             elif num_spaces > 2:
-#                 # Medium gap = likely separate fields
-#                 line_parts.append('  ')  # Use 2 spaces
-#             else:
-#                 # Small gap = normal word spacing
-#                 line_parts.append(' ')
-            
-#             line_parts.append(box['text'])
-    
-#     return ''.join(line_parts)
-
-
-# # ========================================
-# # ALTERNATIVE: Simple version without spacing preservation
-# # ========================================
-# def run_vision_simple(image):
-#     """
-#     Simpler version that just extracts text in reading order.
-#     Use this if spacing preservation causes issues.
-#     """
-#     if image is None:
-#         return [], 0.0
-    
-#     try:
-#         result = ocr.ocr(image, cls=True)
-        
-#         if not result or not result[0]:
-#             return [], 0.0
-        
-#         # Extract and sort
-#         items = []
-#         total_conf = 0.0
-        
-#         for line in result[0]:
-#             box = line[0]
-#             text, conf = line[1]
-            
-#             y = (box[0][1] + box[2][1]) / 2
-#             x = box[0][0]
-            
-#             items.append({
-#                 'text': text,
-#                 'conf': conf,
-#                 'y': y,
-#                 'x': x
-#             })
-#             total_conf += conf
-        
-#         # Sort top-to-bottom, left-to-right
-#         items.sort(key=lambda item: (item['y'], item['x']))
-        
-#         # Extract lines
-#         lines = [item['text'] for item in items]
-#         avg_conf = total_conf / len(items) if items else 0.0
-        
-#         return lines, avg_conf
-        
-#     except Exception as e:
-#         print(f"OCR Error: {e}")
-#         return [], 0.0
+    global _agent
+    if _agent is None:
+        _agent = VisionAgent(use_layoutxlm=False)
+    return _agent.run_vision(image)
