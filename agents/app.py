@@ -271,8 +271,7 @@
 
 # st.caption("")
 
-# app.py - INTELLIGENT CASCADING HYBRID VISUALIZATION
-# FIX: Proper field merging between cascade and insurance segmentation
+# app.py - INTELLIGENT CASCADING HYBRID VISUALIZATION 
 
 import streamlit as st
 import cv2
@@ -281,6 +280,7 @@ import os
 import time
 import matplotlib.pyplot as plt
 import re
+import numpy as np
 
 # ============================================================
 # PATH FIX
@@ -293,20 +293,10 @@ if PROJECT_ROOT not in sys.path:
 # IMPORTS
 # ============================================================
 from utils.file_loader import expand_uploaded_files, load_input
-from orchestrator import run_pipeline_batch, run_pipeline
-
-# Import classifiers
-try:
-    from agents.insurance_segmentation import segregate_insurance_document
-    from agents.document_classifier import classify_document, get_document_explanation
-    from agents.policy_classifier import classify_policy, get_policy_explanation
-except ImportError:
-    def segregate_insurance_document(lines):
-        return {"document_type": "OTH", "policy_type": "UNK", "fields": {}, "field_errors": []}
-    def classify_document(lines): return "OTH"
-    def classify_policy(lines): return "UNK"
-    def get_document_explanation(doc_type): return ""
-    def get_policy_explanation(policy_type): return ""
+from orchestrator import run_pipeline_batch
+from agents.insurance_segmentation import segregate_insurance_document, FIELD_RULES
+from agents.document_classifier import classify_document
+from agents.policy_classifier import classify_policy
 
 # ============================================================
 # PAGE CONFIG
@@ -319,9 +309,6 @@ st.set_page_config(layout="wide", page_title="Dynamic OCR")
 st.session_state.setdefault("uploaded", False)
 st.session_state.setdefault("files", [])
 
-# ============================================================
-# CONSTANTS
-# ============================================================
 ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".pdf", ".zip")
 
 # ============================================================
@@ -333,129 +320,133 @@ def prettify(name: str) -> str:
 
 def merge_page_results(results: list) -> dict:
     if not results:
-        return {}
+        return {
+            "fields": {},
+            "raw_lines": [],
+            "confidence": 0.0,
+            "page_count": 0,
+            "metadata": {},
+        }
 
-    all_raw_lines = []
-    combined_fields = {}
-    best = max(results, key=lambda x: x.get("confidence", 0.0))
+    all_lines, fields = [], {}
+    best = max(results, key=lambda r: r.get("confidence", 0.0))
 
     for r in results:
-        all_raw_lines.extend(r.get("raw_lines", []))
-        combined_fields.update(r.get("fields", {}))
+        all_lines.extend(r.get("raw_lines", []))
+        fields.update(r.get("fields", {}))
 
     return {
-        "fields": combined_fields,
-        "raw_lines": all_raw_lines,
+        "fields": fields,
+        "raw_lines": all_lines,
         "confidence": best.get("confidence", 0.0),
-        "ocr_confidence": best.get("ocr_confidence", 0.0),
         "page_count": len(results),
-        "metadata": best.get("metadata", {}),  # ← Preserve pipeline metadata
+        "metadata": best.get("metadata", {}),
     }
 
+def merge_fields(current: dict, staged: dict) -> dict:
+    """
+    Merge two field dictionaries safely.
+    Prefers higher-confidence values.
+    Handles None values correctly.
+    """
 
-def merge_cascade_and_segmentation_fields(cascade_fields: dict, seg_fields: dict) -> dict:
-    """
-    INTELLIGENT MERGE:
-    - Cascade fields (Stage 1-3) have priority
-    - Insurance segmentation fills gaps only
-    - Higher confidence wins
-    """
-    merged = {}
-    
-    all_field_names = set(cascade_fields.keys()) | set(seg_fields.keys())
-    
-    for field_name in all_field_names:
-        cascade_data = cascade_fields.get(field_name)
-        seg_data = seg_fields.get(field_name)
-        
-        # Case 1: Only cascade has it
-        if cascade_data and not seg_data:
-            merged[field_name] = cascade_data
-        
-        # Case 2: Only segmentation has it
-        elif seg_data and not cascade_data:
-            # Add source tag
-            if isinstance(seg_data, dict):
-                seg_data["source"] = "insurance_segmentation"
-                merged[field_name] = seg_data
-            else:
-                merged[field_name] = {
-                    "value": seg_data,
-                    "confidence": 0.75,
-                    "source": "insurance_segmentation"
-                }
-        
-        # Case 3: Both have it → pick higher confidence
-        else:
-            cascade_conf = cascade_data.get("confidence", 0.0) if isinstance(cascade_data, dict) else 0.5
-            seg_conf = seg_data.get("confidence", 0.0) if isinstance(seg_data, dict) else 0.5
-            
-            if cascade_conf >= seg_conf:
-                merged[field_name] = cascade_data
-            else:
-                if isinstance(seg_data, dict):
-                    seg_data["source"] = "insurance_segmentation"
-                    merged[field_name] = seg_data
-                else:
-                    merged[field_name] = {
-                        "value": seg_data,
-                        "confidence": seg_conf,
-                        "source": "insurance_segmentation"
-                    }
-    
+    merged = dict(staged)  # start with staged (older)
+
+    for k, c in current.items():
+        if c is None:
+            continue
+
+        s = merged.get(k)
+
+        # If staged value is missing or None → take current
+        if s is None:
+            merged[k] = c
+            continue
+
+        # If either side is malformed → prefer valid dict
+        if not isinstance(c, dict):
+            continue
+        if not isinstance(s, dict):
+            merged[k] = c
+            continue
+
+        # Compare confidence safely
+        c_conf = c.get("confidence", 0)
+        s_conf = s.get("confidence", 0)
+
+        merged[k] = c if c_conf >= s_conf else s
+
     return merged
 
 
-def render_extracted_text(seg_result: dict) -> str:
-    fields = seg_result.get("fields", {})
+# def merge_fields(cascade: dict, seg: dict) -> dict:
+#     merged = {}
+#     for k in set(cascade) | set(seg):
+#         c, s = cascade.get(k), seg.get(k)
+#         if c and not s:
+#             merged[k] = c
+#         elif s and not c:
+#             merged[k] = s if isinstance(s, dict) else {"value": s, "confidence": 0.75}
+#         else:
+#             merged[k] = c if c.get("confidence", 0) >= s.get("confidence", 0) else s
+#     return merged
+
+
+def render_extracted_text(seg: dict) -> str:
+    fields = seg.get("fields", {})
     if not fields:
         return "No fields extracted"
 
     out = []
     for k, v in fields.items():
-        value = v.get("value") if isinstance(v, dict) else v
-        source = v.get("source", "unknown") if isinstance(v, dict) else "unknown"
-        conf = v.get("confidence", 0.0) if isinstance(v, dict) else 0.0
-        
-        if value:
-            # Show source and confidence for debugging
-            out.append(f"{prettify(k)}: {value}")
-            out.append(f"  └─ Source: {source}, Confidence: {conf:.2f}")
-    
+        val = v.get("value") if isinstance(v, dict) else v
+        if val:
+            out.append(f"{prettify(k)}: {val}")
     return "\n".join(out)
 
 # ============================================================
-# FIELD VALIDATION + SUMMARY
+# FIELD VALIDATION (RESTORED)
 # ============================================================
 def is_field_value_valid(field: str, value: str) -> bool:
     if not value:
         return False
+
     v = value.lower().strip()
+
     if field == "insured_name":
-        return not any(x in v for x in ["policy", "insurance"]) and not any(c.isdigit() for c in value)
+        if any(x in v for x in ["policy", "insurance"]):
+            return False
+        if any(c.isdigit() for c in value):
+            return False
+        return True
+
     if field in ("effective_date", "expiration_date"):
         return bool(re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", v))
+
     if field in ("policy_number", "loan_number"):
         return sum(c.isdigit() for c in value) >= 6
+
     return True
 
 
 def classify_extracted_fields(seg_result: dict):
-    from agents.insurance_segmentation import FIELD_RULES
     fields = seg_result.get("fields", {})
     doc_type = seg_result.get("document_type", "OTH")
     required = FIELD_RULES.get(doc_type, [])
 
     perfect, partial, failed = [], [], []
+
     for f in required:
         data = fields.get(f)
         value = data.get("value") if isinstance(data, dict) else data
+
         if not value:
             failed.append(f)
         elif not is_field_value_valid(f, value):
             partial.append(f)
         else:
             perfect.append(f)
+
     return perfect, partial, failed
 
 
@@ -490,48 +481,19 @@ def draw_extraction_summary_tab(seg_result: dict):
                 labels=["Perfect", "Partial", "Failed"],
                 autopct="%1.0f%%",
                 startangle=90,
-                colors=['#00ff00', '#ffff00', '#ff0000']
+                colors=["#00ff00", "#ffff00", "#ff0000"],
             )
             ax.axis("equal")
             st.pyplot(fig)
         else:
             st.info("No fields to display")
 
-
-def draw_pipeline_stats(metadata: dict):
-    """Display cascade pipeline statistics"""
-    if not metadata:
-        return
-    
-    st.markdown("### 🔄 Pipeline Statistics")
-    
-    stage_times = metadata.get("stage_times", {})
-    fields_per_stage = metadata.get("fields_per_stage", {})
-    
-    # Stage timing
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("OCR Time", f"{stage_times.get('ocr', 0):.2f}s")
-    col2.metric("Stage 1 Time", f"{stage_times.get('stage1', 0):.2f}s")
-    col3.metric("Stage 2 Time", f"{stage_times.get('stage2', 0):.3f}s")
-    col4.metric("Stage 3 Time", f"{stage_times.get('stage3', 0):.3f}s")
-    
-    # Fields extracted per stage
-    st.markdown("**Fields Extracted Per Stage:**")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Stage 1", fields_per_stage.get("stage1", 0))
-    col2.metric("Stage 2", fields_per_stage.get("stage2", 0))
-    col3.metric("Stage 3", fields_per_stage.get("stage3", 0))
-    col4.metric("Final", fields_per_stage.get("final", 0))
-    
-    # Total time
-    st.info(f"⚡ **Total Pipeline Time:** {metadata.get('total_time', 0):.2f}s")
-
 # ============================================================
 # HEADER
 # ============================================================
 h1, h2 = st.columns([8, 1])
 with h1:
-    st.markdown("## Dynamic OCR - Intelligent Cascading Hybrid")
+    st.markdown("## Dynamic OCR – Intelligent Cascading Hybrid")
 with h2:
     if st.session_state.uploaded and st.button("⬅ Back"):
         st.session_state.uploaded = False
@@ -544,7 +506,11 @@ st.markdown("---")
 # UPLOAD
 # ============================================================
 if not st.session_state.uploaded:
-    uploaded = st.file_uploader("Upload documents", list(ALLOWED_EXT), accept_multiple_files=True)
+    uploaded = st.file_uploader(
+        "Upload documents",
+        list(ALLOWED_EXT),
+        accept_multiple_files=True,
+    )
     if uploaded:
         st.session_state.files = expand_uploaded_files(uploaded)
         st.session_state.uploaded = True
@@ -557,76 +523,52 @@ if not st.session_state.uploaded:
 for f in st.session_state.files:
     pages = load_input(f.getvalue(), f.type)
     if not pages:
+        st.error("No raster pages produced. Check loader.")
         continue
 
     col_img, col_out = st.columns([1, 1], gap="large")
 
-    # -------- PREVIEW --------
+    # -------- PREVIEW (IMAGE-ONLY, OLD STYLE) --------
     with col_img:
         st.markdown("### 📄 Document Preview")
-
-        image_pages = 0
-
-        for i, page in enumerate(pages):
-            if page.get("type") == "image":
-                image_pages += 1
-
-                rgb = cv2.cvtColor(page["content"], cv2.COLOR_BGR2RGB)
-
-                st.image(
-                    rgb,
-                    caption=f"Page {i + 1}",
-                    use_container_width=True
-                )
-
-                st.markdown("---")
-
-        if image_pages == 0:
-            st.info("📄 PDF contains embedded text only (no raster pages)")
+        for i, img in enumerate(pages, 1):
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            st.image(rgb, caption=f"Page {i}", use_container_width=True)
+            st.markdown("---")
 
     # -------- PROCESSING --------
     with col_out:
-        with st.spinner("Processing document with intelligent cascade..."):
+        with st.spinner("Processing document..."):
             start = time.time()
 
-            image_pages_data = [p["content"] for p in pages if p.get("type") == "image"]
-            results = run_pipeline_batch(image_pages_data) if image_pages_data else []
-
+            results = run_pipeline_batch(pages)
             result = merge_page_results(results)
 
-            # Run insurance segmentation
-            seg = segregate_insurance_document(result.get("raw_lines", []))
-            
-            # ⭐ CRITICAL FIX: Merge fields intelligently
-            cascade_fields = result.get("fields", {})
-            seg_fields = seg.get("fields", {})
-            merged_fields = merge_cascade_and_segmentation_fields(cascade_fields, seg_fields)
-            
-            # Update result with merged fields
-            seg["fields"] = merged_fields
+            doc_type = classify_document(result["raw_lines"])
+            policy_type = classify_policy(result["raw_lines"])
+
+            seg = segregate_insurance_document(result["raw_lines"])
+            seg["document_type"] = doc_type
+            seg["policy_type"] = policy_type
+            seg["fields"] = merge_fields(result["fields"], seg.get("fields", {}))
 
             elapsed = time.time() - start
 
-        # -------- SPEED & ACCURACY --------
-        pages_cnt = result.get("page_count", 0)
-        speed_per_page = (elapsed / pages_cnt) if pages_cnt else 0
-        accuracy = result.get("confidence", 0.0) * 100
+        # -------- METRICS --------
+        acc = result["confidence"] * 100
+        pages_cnt = result["page_count"]
 
         m1, m2, m3 = st.columns(3)
         m1.metric("📄 Pages", pages_cnt)
-        m2.metric("⚡ Speed / Page (s)", f"{speed_per_page:.2f}")
-        m3.metric("🎯 Accuracy (%)", f"{accuracy:.2f}")
-
-        # -------- DOC / POLICY TYPE --------
-        doc_type = seg.get("document_type", "OTH")
-        policy_type = seg.get("policy_type", "UNK")
+        m2.metric("🎯 Accuracy (%)", f"{acc:.2f}")
+        m3.metric("⚡ Time (s)", f"{elapsed:.2f}")
 
         st.info(f"📄 **Document Type:** {doc_type}")
         st.info(f"🔐 **Policy Type:** {policy_type}")
 
         # -------- TABS --------
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["🧾 Extracted Fields", "📊 Extraction Summary", "🔄 Pipeline Stats", "📄 OCR Text"]
+        tab1, tab2, tab3 = st.tabs(
+            ["🧾 Extracted Fields", "📊 Extraction Summary", "📄 OCR Text"]
         )
 
         with tab1:
@@ -634,11 +576,8 @@ for f in st.session_state.files:
 
         with tab2:
             draw_extraction_summary_tab(seg)
-        
-        with tab3:
-            draw_pipeline_stats(result.get("metadata", {}))
 
-        with tab4:
-            st.text_area("OCR Output", "\n".join(result.get("raw_lines", [])), height=500)
+        with tab3:
+            st.text_area("OCR Output", "\n".join(result["raw_lines"]), height=500)
 
 st.caption("")

@@ -1,657 +1,611 @@
-# agents/insurance_segmentation.py
+# # Insurance Document Segmentation with STRICT FIELD-TO-SECTION ROUTING
+# # Hardened for Intelligent Cascading Hybrid extraction
+# # STEP 4 APPLIED: Confidence penalties for fallback extractions
+# # PATCHED: header retention + insured/mail/property hardening (NO REMOVALS)
+
+# import re
+# from typing import List, Dict
+
+# # ============================================================
+# # CONFIDENCE PENALTY HELPER (STEP 4)
+# # ============================================================
+
+# def _penalize_confidence(base: float, reason: str) -> float:
+#     penalties = {
+#         "fallback": 0.30,
+#         "loose": 0.15,
+#         "semantic": 0.20,
+#     }
+#     return max(0.40, base - penalties.get(reason, 0.0))
+
+
+# # ============================================================
+# # SECTION DEFINITIONS (BUSINESS ANCHORS)
+# # ============================================================
+
+# SECTION_HEADERS = {
+#     "insured_section": [
+#         "named insured",
+#         "insured name",
+#         "policyholder",
+#         "named insured and mailing address",
+#         "customer",
+#         "borrower",
+#         "named insured", 
+#     ],
+#     "property_section": [
+#         "location of insured property",
+#         "insured property",
+#         "property address",
+#         "location of property",
+#     ],
+#     "mailing_section": [
+#         "mailing address",
+#         "mail address",
+#     ],
+#     "mortgage_section": [
+#         "other interests",
+#         "mortgage",
+#         "mortgagee",
+#         "loss payee",
+#         "lender",
+#     ],
+#     "coverage_section": [
+#         "coverages and limits",
+#         "section i",
+#         "coverage a",
+#         "dwelling",
+#     ],
+#     "premium_section": [
+#         "total premium",
+#         "base policy premium",
+#         "endorsement premium",
+#         "premium summary",
+#     ],
+#     "agent_section": [
+#         "sales rep",
+#         "agent",
+#         "producer",
+#         "agency",
+#         "broker",
+#     ],
+#     "carrier_section": [
+#         "issued by",
+#         "insurance company",
+#         "carrier",
+#         "underwritten by",
+#     ],
+#     "endorsement_section": [
+#         "forms and endorsements",
+#         "endorsement",
+#         "form number",
+#         "additional forms",
+#     ],
+# }
+
+# # ============================================================
+# # FIELD RULES (UI + SUMMARY)  🔒 PRESERVED
+# # ============================================================
+
+# FIELD_RULES = {
+#     "HO": [
+#         "carrier",
+#         "policy_number",
+#         "insured_name",
+#         "property_address",
+#         "mailing_address",
+#         "loan_number",
+#         "mortgage",
+#         "effective_date",
+#         "expiration_date",
+#         "total_premium",
+#     ],
+#     "OTH": [
+#         "carrier",
+#         "policy_number",
+#         "insured_name",
+#         "property_address",
+#         "loan_number",
+#     ],
+# }
+
+# # ============================================================
+# # SECTION DETECTION (STRICT, NON-LEAKING)
+# # ============================================================
+
+# def detect_sections(lines: List[str]) -> Dict[str, List[str]]:
+#     sections: Dict[str, List[str]] = {}
+#     current = None
+
+#     for line in lines:
+#         l = line.lower().strip()
+#         new_section = None
+
+#         for section, keywords in SECTION_HEADERS.items():
+#             if any(k in l for k in keywords):
+#                 new_section = section
+#                 break
+
+#         if new_section:
+#             current = new_section
+#             # ✅ FIX 1: keep header line instead of discarding
+#             sections[current] = [line]
+#             continue
+
+#         if current and line.strip():
+#             sections[current].append(line)
+
+#     return sections
+
+# # ============================================================
+# # MAIN ENTRYPOINT
+# # ============================================================
+
+# def segregate_insurance_document(lines: List[str]) -> Dict:
+#     sections = detect_sections(lines)
+#     fields = {}
+
+#     carrier_text = " ".join(sections.get("carrier_section", lines[:8]))
+#     carrier = _extract_carrier(carrier_text)
+#     if carrier:
+#         fields["carrier"] = carrier
+
+#     policy = _extract_policy_number(lines)
+#     if policy:
+#         fields["policy_number"] = policy
+
+#     insured = _extract_insured_name(sections.get("insured_section", []))
+#     if insured:
+#         fields["insured_name"] = insured
+
+#     # ✅ FIX 2: property address should NOT be blocked by endorsements
+#     prop_addr = _extract_property_address(sections.get("property_section", []))
+#     if prop_addr:
+#         fields["property_address"] = prop_addr
+
+#     mail_addr = _extract_mailing_address(sections.get("mailing_section", []))
+#     if mail_addr:
+#         fields["mailing_address"] = mail_addr
+
+#     mortgage_text = " ".join(sections.get("mortgage_section", []))
+
+#     loan = _extract_loan_number(mortgage_text)
+#     if loan:
+#         fields["loan_number"] = loan
+
+#     mortgage = _extract_mortgage_name(mortgage_text)
+#     if mortgage:
+#         fields["mortgage"] = mortgage
+
+#     coverage_text = " ".join(sections.get("coverage_section", []))
+#     dwelling = _extract_currency(coverage_text)
+#     if dwelling:
+#         fields["dwelling_coverage"] = dwelling
+
+#     premium_text = " ".join(sections.get("premium_section", []))
+#     premium = _extract_currency(premium_text)
+#     if premium:
+#         fields["total_premium"] = premium
+
+#     return {
+#         "document_type": "OTH",
+#         "policy_type": "UNK",
+#         "fields": fields,
+#         "field_errors": [],
+#     }
+
+# # ============================================================
+# # EXTRACTION HELPERS (STEP 4 HARDENED)
+# # ============================================================
+
+# def _extract_carrier(text: str):
+#     m = re.search(r'(AAA|STATE FARM|ALLSTATE|CSAA|FARMERS|PROGRESSIVE)', text, re.I)
+#     if m:
+#         return {"value": m.group(1).strip(), "confidence": 0.96}
+#     return None
+
+
+# def _extract_policy_number(lines):
+#     for l in lines:
+#         m = re.search(r'policy\s*number[:\s]+([A-Z0-9\-]{6,30})', l, re.I)
+#         if m:
+#             return {"value": m.group(1), "confidence": 0.97}
+#     return None
+
+
+# def _extract_insured_name(lines):
+#     REJECT_WORDS = {
+#         "insurance", "policy", "coverage", "company", "mortgage",
+#         "loan", "address", "property", "endorsement", "section",
+#         "agent", "producer", "broker", "holder", "interest",
+#         "additional", "loss", "payee", "discount", "safe home",
+#         "modernization", "claims", "payment plan", "premium",
+#     }
+
+#     for raw in lines:
+#         raw = raw.strip()
+#         l = raw.lower()
+
+#         # ✅ FIX 3: block header-like lines
+#         if raw.endswith(":") or ":" in raw:
+#             continue
+
+#         if any(w in l for w in REJECT_WORDS):
+#             continue
+
+#         if any(char.isdigit() for char in raw):
+#             continue
+
+#         # ✅ FIX 4: strip trailing date noise
+#         raw = re.split(
+#             r'\b(beginning|effective|since|policy period|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b',
+#             raw,
+#             flags=re.I
+#         )[0].strip()
+
+#         words = raw.split()
+#         if not (2 <= len(words) <= 5):
+#             continue
+
+#         if len(raw) < 6 or len(raw) > 60:
+#             continue
+
+#         # RELAXED: allow mixed case OCR
+#         return {"value": raw, "confidence": 0.95}
+
+#     return None
+
+
+# def _extract_property_address(lines):
+#     STATE_RE = r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WI|WV|WY)\b'
+#     ZIP_RE = r'\b\d{5}\b'
+
+#     REJECT_WORDS = {
+#         "po box", "p.o. box", "mailing", "form",
+#         "endorsement", "section", "coverage",
+#         "policy", "declaration"
+#     }
+
+#     for raw in lines:
+#         raw = raw.strip()
+#         l = raw.lower()
+
+#         if any(w in l for w in REJECT_WORDS):
+#             continue
+
+#         if not any(char.isdigit() for char in raw):
+#             continue
+
+#         if not re.search(STATE_RE, raw):
+#             continue
+
+#         if not re.search(ZIP_RE, raw):
+#             continue
+
+#         if not re.search(r'\d+\s+[A-Za-z]', raw):
+#             continue
+
+#         return {"value": raw, "confidence": 0.95}
+
+#     return None
+
+
+# def _extract_mailing_address(lines):
+#     for l in lines:
+#         ll = l.lower()
+
+#         # ✅ FIX 5: block policy-period contamination
+#         if any(x in ll for x in ["beginning", "through", "effective", "policy period"]):
+#             continue
+
+#         if "po box" in ll or re.search(r'\d+\s+.*\b(st|ave|rd|dr|blvd|ln)\b', ll):
+#             return {
+#                 "value": l.strip(),
+#                 "confidence": _penalize_confidence(0.92, "fallback")
+#             }
+#     return None
+
+
+# def _extract_loan_number(text):
+#     m = re.search(r'loan\s*number[:\s]+([A-Z0-9\-]{5,})', text, re.I)
+#     if m:
+#         return {"value": m.group(1), "confidence": 0.95}
+#     return None
+
+
+# def _extract_mortgage_name(text):
+#     m = re.search(r'(GATEWAY|WELLS FARGO|CHASE|BANK OF AMERICA|MORTGAGE)', text, re.I)
+#     if m:
+#         return {
+#             "value": m.group(1),
+#             "confidence": _penalize_confidence(0.90, "fallback")
+#         }
+#     return None
+
+
+# def _extract_currency(text):
+#     m = re.search(r'\$\s*([\d,]{3,})', text)
+#     if m:
+#         return {
+#             "value": f"${m.group(1)}",
+#             "confidence": _penalize_confidence(0.90, "loose")
+#         }
+#     return None
+
 
 import re
-from difflib import SequenceMatcher
-from agents.document_classifier import classify_document
-from agents.policy_classifier import classify_policy
-from typing import List
-from agents.field_extraction_agent import extract_fields
-from agents.value_normalizer import normalize_extracted_fields
+from typing import List, Dict
 
-# --------------------------------------------------
-# FIELD RULES (Based on official requirements)
-# --------------------------------------------------
+# ============================================================
+# FIELD RULES (REQUIRED BY app.py / orchestrator)
+# ============================================================
+
 FIELD_RULES = {
-    "BIN": [
+    "HO": [
+        "carrier",
         "policy_number",
         "insured_name",
-        "effective_date",
-        "property_address"
-    ],
-    
-    "COI": [
-        "policy_number",
-        "insured_name",
-        "effective_date",
-        "expiration_date",
-        "insurance_company",
-        "property_address"
-    ],
-    
-    "DOI": [
-        "policy_number",
-        "loan_number",
-        "insured_name"
-    ],
-    
-    "INV": [
-        "balance_due",
-        "due_date",
-        "policy_number",
-        "insured_name"
-    ],
-    
-    "RNS": [
-        "policy_number",
-        "insured_name",
-        "effective_date"
-    ],
-    
-    "RNW": [
-        "policy_number",
-        "insured_name",
-        "effective_date",
-        "expiration_date",
-        "balance_due",
-        "invoice_number",
-        "invoice_total"
-    ],
-    
-    "CAN": [
-        "policy_number",
-        "insured_name",
-        "cancellation_date",
-        "effective_date"
-    ],
-    
-    "FPN": [
-        "loan_number",
+        "mailing_address",
         "property_address",
-        "insured_name"
+        "mortgage",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "total_premium",
     ],
-    
-    "OTH": [
+    "FLD": [
+        "carrier",
         "policy_number",
-        "insured_name"
-    ]
+        "insured_name",
+        "property_address",
+        "mortgage",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+    ],
+    "INV": [
+        "carrier",
+        "policy_number",
+        "insured_name",
+        "balance_due",
+        "issue_date",
+        "remit_info",
+    ],
+    "OTH": [
+        "carrier",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "loan_number",
+    ],
 }
 
-# --------------------------------------------------
-# OCR FIXES (Comprehensive)
-# --------------------------------------------------
-OCR_FIXES = {
-    # Policy
-    r"\bpol1cy\b": "policy",
-    r"\bp0licy\b": "policy",
-    r"\bpolicv\b": "policy",
-    r"\bpo1icy\b": "policy",
-    
-    # Insurance
-    r"\blnsurance\b": "insurance",
-    r"\binsuranee\b": "insurance",
-    r"\binsur\s*ance\b": "insurance",
-    
-    # Number variants
-    r"\bnomoer\b": "number",
-    r"\bnumher\b": "number",
-    r"\bnunber\b": "number",
-    r"\bnurnber\b": "number",
-    
-    # Loan
-    r"\bfoan\b": "loan",
-    r"\bf0an\b": "loan",
-    r"\bloam\b": "loan",
-    
-    # Property
-    r"\bpropenty\b": "property",
-    r"\bpropeny\b": "property",
-    r"\bpropertv\b": "property",
-    
-    # Address
-    r"\baddres\b": "address",
-    r"\baddrass\b": "address",
-    r"\baddressS\b": "address",
-    r"\baddressss\b": "address",  # Added - from your doc
-    
-    # Premium
-    r"\bpremiurn\b": "premium",
-    r"\bpremom\b": "premium",
-    r"\bpremlum\b": "premium",
-    
-    # Name
-    r"\bnane\b": "name",
-    r"\bnarne\b": "name",
-    
-    # Description
-    r"\bdese\b": "desc",
-    r"\bdesce\b": "desc",
-    
-    # Company
-    r"\bcompanv\b": "company",
-    
-    # Mortgage
-    r"\bmortqaqee\b": "mortgagee",
-    r"\bmortqaee\b": "mortgagee"
+# ============================================================
+# SECTION DEFINITIONS (OWNERSHIP MODEL)
+# ============================================================
+
+SECTION_HEADERS = {
+    "insured": [
+        "named insured",
+        "insured name",
+        "insured mailing name and address",
+        "policyholder",
+    ],
+    "property": [
+        "location of insured property",
+        "coverage detail for",
+        "property location",
+        "address:",
+    ],
+    "mortgage": [
+        "mortgagee",
+        "other interests",
+        "loss payee",
+        "lender",
+    ],
+    "premium": [
+        "total premium",
+        "base policy premium",
+        "endorsement premium",
+    ],
+    "carrier": [
+        "underwritten by",
+        "insurance company",
+        "issued by",
+    ],
 }
 
-# --------------------------------------------------
-# UTILS
-# --------------------------------------------------
-def normalize_text(text: str) -> str:
-    """Aggressive OCR normalization"""
-    text = text.lower()
-    
-    for wrong_pattern, right in OCR_FIXES.items():
-        text = re.sub(wrong_pattern, right, text, flags=re.I)
-    
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+# ============================================================
+# CONFIDENCE HELPERS
+# ============================================================
 
+def _confidence(base: float, penalty: float = 0.0) -> float:
+    return round(max(0.40, base - penalty), 2)
 
-def fuzzy_match(a: str, b: str, threshold=0.70) -> bool:
-    """Fuzzy string matching for OCR tolerance"""
-    return SequenceMatcher(None, a, b).ratio() >= threshold
+# ============================================================
+# SECTION DETECTION (STRICT)
+# ============================================================
 
+def detect_sections(lines: List[str]) -> Dict[str, List[str]]:
+    sections: Dict[str, List[str]] = {}
+    current = None
 
-# --------------------------------------------------
-# ENHANCED FIELD EXTRACTORS
-# --------------------------------------------------
-
-def extract_carrier(text):
-    """Extract insurance carrier/company name"""
-    patterns = [
-        r"insurance\s*company\s*name?\s*[:\-]?\s*(.+?)(?:\n|customer)",
-        r"insurance\s*provided\s*by\s*[:\-]?\s*(.+?)(?:\n|customer)",
-        r"issued\s*by\s*[:\-]?\s*(.+?)(?:\n|$)",
-        r"carrier\s*name?\s*[:\-]?\s*(.+?)(?:\n|$)"
-    ]
-    
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            company = m.group(1).strip()
-            # Clean up extra info
-            company = re.split(r'\s{2,}|customer|phone', company, flags=re.I)[0].strip()
-            return company
-    
-    return None
-
-
-def extract_policy_number(text, lines):
-    """
-    Enhanced policy number extraction
-    Handles table-based layouts where label and value are separated
-    """
-    
-    # Pattern 1: Label on line, value nearby
-    for i, line in enumerate(lines):
-        if "policy number" in line.lower():
-            # Check same line
-            nums = re.findall(r"\b\d{6,15}\b", line)
-            if nums:
-                return nums[-1]
-            
-            # Check next 3 lines
-            for j in range(i + 1, min(i + 4, len(lines))):
-                nums = re.findall(r"\b\d{6,15}\b", lines[j])
-                if nums:
-                    # Verify not a date
-                    for num in nums:
-                        if not re.match(r"\d{1,2}/\d{1,2}/\d{4}", num):
-                            return num
-    
-    # Pattern 2: Standard labeled format
-    patterns = [
-        r"policy\s*(?:number|no|nunber)\s*[:\-]?\s*([a-z0-9\-\/]{6,25})",
-        r"cert(?:ificate)?\s*[#\.]?\s*[:\-]?\s*([a-z0-9\-\/]{6,25})",
-        r"\b(QSN\d{7,})\b",
-        r"\b(QBE\d{7,})\b",
-        r"\b([A-Z]{2,4}\d{7,})\b"
-    ]
-    
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            return m.group(1) if m.lastindex else m.group(0)
-    
-    # Pattern 3: Standalone 9-digit number (common format)
-    # Look for 9-digit numbers that aren't dates or phones
     for line in lines:
-        if "policy" in line.lower() or "number" in line.lower():
-            nums = re.findall(r"\b(\d{9})\b", line)
-            if nums:
-                return nums[0]
-    
-    return None
+        ll = line.lower().strip()
+        new_section = None
 
+        for section, headers in SECTION_HEADERS.items():
+            if any(h in ll for h in headers):
+                new_section = section
+                break
 
-def extract_loan_number(text):
-    """Extract loan/reference/account number"""
-    patterns = [
-        r"loan\s*(?:number|no|#)?\s*[:\-]?\s*(\d{6,})",
-        r"ln#\s*[:\-]?\s*(\d{6,})",
-        r"reference\s*number\s*[:\-]?\s*(\d{6,})",
-        r"account\s*number\s*[:\-]?\s*(\d{6,})"
-    ]
-    
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            return m.group(1)
-    
-    return None
-
-
-def extract_dates(text, lines):
-    """
-    Enhanced date extraction with context awareness
-    Handles table layouts and various date formats
-    """
-    dates = {}
-    
-    # Pattern 1: Look for date labels
-    date_labels = {
-        "effective_date": [
-            r"effective\s*date\s*[:\-]?\s*(.+?)(?:\n|$)",
-            r"policy\s*effective\s*date\s*[:\-]?\s*(.+?)(?:\n|$)",
-            r"beginning\s+(.+?)(?:\n|through)"
-        ],
-        "expiration_date": [
-            r"expiration\s*date\s*[:\-]?\s*(.+?)(?:\n|$)",
-            r"through\s+(.+?)(?:\n|at\s+\d|$)"
-        ],
-        "cancellation_date": [
-            r"cancellation\s*date\s*[:\-]?\s*(.+?)(?:\n|$)"
-        ]
-    }
-    
-    for date_type, patterns in date_labels.items():
-        for pattern in patterns:
-            m = re.search(pattern, text, re.I)
-            if m:
-                date_str = m.group(1).strip()
-                # Extract actual date from the string
-                date_match = re.search(
-                    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
-                    date_str,
-                    re.I
-                )
-                if date_match:
-                    dates[date_type] = date_match.group(1)
-                    break
-    
-    return dates
-
-
-def extract_balance_due(text):
-    """Extract balance/amount due"""
-    patterns = [
-        r"balance\s*due\s*[:\-]?\s*\$?\s*([0-9,]+\.\d{2})",
-        r"amount\s*due\s*[:\-]?\s*\$?\s*([0-9,]+\.\d{2})",
-        r"minimum\s*due\s*[:\-]?\s*\$?\s*([0-9,]+\.\d{2})",
-        r"total\s*due\s*[:\-]?\s*\$?\s*([0-9,]+\.\d{2})"
-    ]
-    
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            return m.group(1)
-    
-    return None
-
-
-def extract_total_premium(text, lines):
-    """
-    Extract total premium with priority
-    For Encompass-style declarations, look for "Total Residence Premium"
-    """
-    
-    # Priority 1: Total Residence Premium
-    m = re.search(r"total\s*residence\s*premium\s*\$?\s*([0-9,]+\.\d{2})", text, re.I)
-    if m:
-        return m.group(1)
-    
-    # Priority 2: Total Premium
-    m = re.search(r"total\s*premium\s*\$?\s*([0-9,]+\.\d{2})", text, re.I)
-    if m:
-        return m.group(1)
-    
-    # Priority 3: Annual Premium
-    m = re.search(r"annual\s*premium\s*\$?\s*([0-9,]+\.\d{2})", text, re.I)
-    if m:
-        return m.group(1)
-    
-    return None
-
-
-def extract_invoice_number(text):
-    """Extract invoice number"""
-    m = re.search(r"invoice\s*(?:number|no|nunber)\s*[:\-]?\s*(\d{5,})", text, re.I)
-    return m.group(1) if m else None
-
-
-def extract_invoice_total(text):
-    """Extract invoice total"""
-    m = re.search(r"invoice\s*total\s*[:\-]?\s*\$?\s*([0-9,]+\.\d{2})", text, re.I)
-    return m.group(1) if m else None
-
-
-def extract_property_address(lines):
-    """
-    Extract property address (NOT mailing address or PO BOX)
-    Enhanced for table-based layouts
-    """
-    for i, line in enumerate(lines):
-        l = line.lower()
-        
-        # Skip mailing addresses and PO boxes
-        if "mailing" in l or "po box" in l or "p.o. box" in l or "p o box" in l:
+        if new_section:
+            current = new_section
+            sections.setdefault(current, []).append(line)
             continue
-        
-        # Look for "Coverage Detail for" pattern (Encompass-style)
-        if "coverage detail for" in l:
-            # Extract address after "for"
-            m = re.search(r"coverage\s*detail\s*for\s+(.+?)(?:,\s*[A-Z]{2}\s+\d{5})?$", line, re.I)
-            if m:
-                addr = m.group(1).strip()
-                # Look for full address with state/zip on same or next line
-                full_match = re.search(
-                    r"(\d+\s+.+?,\s*[A-Z]{2}\s+\d{5})",
-                    line + " " + (lines[i+1] if i+1 < len(lines) else ""),
-                    re.I
-                )
-                if full_match:
-                    return full_match.group(1)
-                return addr
-        
-        # Look for property address label
-        if "property" in l and ("address" in l or "location" in l):
-            # Check next few lines
-            for j in range(i + 1, min(i + 4, len(lines))):
-                candidate = lines[j].strip()
-                
-                # Must contain digits (street number)
-                if any(c.isdigit() for c in candidate):
-                    # Should contain state abbreviation
-                    if re.search(r'\b[A-Z]{2}\b', candidate):
-                        return candidate
-    
-    # Fallback: look for address pattern
-    for line in lines:
-        if "mailing" not in line.lower() and "po box" not in line.lower():
-            m = re.search(
-                r"\b\d{2,5}\s+[a-z0-9\s\.]+(FL|TX|CA|NY|NJ|NC|SC|GA|AL|AZ|AR|CO|CT|DE|IL|IN|KS|KY|LA|MA|MD|MI|MN|MO|MS|MT|NE|NV|NH|NM|ND|OH|OK|OR|PA|RI|SD|TN|UT|VA|VT|WA|WI|WV|WY)\s*\d{5}",
-                line,
-                re.I
-            )
-            if m:
-                return m.group(0)
-    
+
+        if current and line.strip():
+            sections[current].append(line)
+
+    return sections
+
+# ============================================================
+# MAIN ENTRYPOINT (LOCKING ENABLED)
+# ============================================================
+
+def segregate_insurance_document(lines: List[str]) -> Dict:
+    sections = detect_sections(lines)
+    fields: Dict[str, Dict] = {}
+
+    def lock(name: str, value: Dict):
+        if name not in fields:
+            fields[name] = value
+
+    lock("carrier", extract_carrier(lines))
+    lock("policy_number", extract_policy_number(lines))
+
+    lock("insured_name", extract_insured_name(sections.get("insured", [])))
+    lock("mailing_address", extract_mailing_address(sections.get("insured", [])))
+    lock("property_address", extract_property_address(sections.get("property", [])))
+
+    lock("mortgage", extract_mortgage(sections.get("mortgage", [])))
+    lock("loan_number", extract_loan_number(sections.get("mortgage", [])))
+
+    lock("effective_date", extract_effective_date(lines))
+    lock("expiration_date", extract_expiration_date(lines))
+    lock("issue_date", extract_issue_date(lines))
+    lock("total_premium", extract_total_premium(sections.get("premium", [])))
+    lock("balance_due", extract_balance_due(lines))
+    lock("remit_info", extract_remit_info(lines))
+
+    return {
+        "fields": fields,
+        "errors": [],
+    }
+
+# ============================================================
+# EXTRACTION HELPERS (SECTION-OWNED)
+# ============================================================
+
+def extract_carrier(lines):
+    for l in lines[:12]:
+        m = re.search(r'\b(AAA|ERIE|ENCOMPASS|FARMERS|STATE FARM|ALLSTATE|CSAA)\b', l, re.I)
+        if m:
+            return {"value": m.group(1).upper(), "confidence": _confidence(0.97)}
+    return None
+
+
+def extract_policy_number(lines):
+    for l in lines:
+        m = re.search(r'policy\s*number[:\s]+([A-Z0-9\-]+)', l, re.I)
+        if m:
+            return {"value": m.group(1), "confidence": _confidence(0.97)}
     return None
 
 
 def extract_insured_name(lines):
-    """
-    Enhanced insured name extraction
-    Handles table layouts where label and value are in different positions
-    """
-    
-    for i, line in enumerate(lines):
-        l = line.lower()
-        
-        # Skip lines that are clearly not names
-        if any(x in l for x in ["page", "policy", "claim", "phone", "fax", "email"]):
-            continue
-        
-        # Pattern 1: "Policyholder/Named Insured:" label
-        if "policyholder" in l or "named insured" in l:
-            # Check if name is on same line after colon
-            if ":" in line:
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    # Get text after colon
-                    candidate = parts[1].strip()
-                    # Remove any trailing labels or data
-                    candidate = re.split(r"\s{2,}|policyholder since|policy number", candidate, flags=re.I)[0].strip()
-                    
-                    if candidate and len(candidate) > 3 and len(candidate.split()) >= 2:
-                        # Verify it looks like a name (not a label)
-                        if not any(x in candidate.lower() for x in ["since", "number", "period", "date"]):
-                            return candidate
-            
-            # Check next lines for name
-            for j in range(i + 1, min(i + 5, len(lines))):
-                candidate = lines[j].strip()
-                
-                # Skip non-name content
-                if any(x in candidate.lower() for x in [
-                    "address", "policy", "number", "date", "invoice", "coverage", 
-                    "premium", "since", "period", "mailing"
-                ]):
-                    continue
-                
-                # Check if looks like a name
-                if len(candidate.split()) >= 2 and len(candidate) <= 60:
-                    # Should not be all caps unless it's a real name
-                    if candidate.isupper() or candidate.istitle():
-                        return candidate
-        
-        # Pattern 2: "Customer Name" or "Insured Name"
-        if "customer name" in l or "insured name" in l:
-            parts = re.split(r":", line, maxsplit=1)
-            if len(parts) == 2:
-                candidate = parts[1].strip()
-                candidate = re.split(r"\s{2,}", candidate)[0].strip()
-                if candidate and len(candidate.split()) >= 2:
-                    return candidate
-    
-    # Fallback: Look for name-like patterns (2-3 words, title case or uppercase)
-    for line in lines:
-        # Skip obvious non-name lines
-        if any(x in line.lower() for x in [
-            "policy", "address", "number", "premium", "invoice", "coverage",
-            "page", "claim", "phone", "fax", "email", "company", "agent"
-        ]):
-            continue
-        
-        # Look for 2-3 word sequences that could be names
-        words = line.split()
-        if 2 <= len(words) <= 3 and len(line) <= 60:
-            if line.isupper() or line.istitle():
-                # Additional validation
-                if all(len(w) >= 2 for w in words):
-                    return line.strip()
-    
+    BLOCK = {
+        "policy", "coverage", "summary", "notice",
+        "interest of named insured", "such premises",
+    }
+
+    for i, l in enumerate(lines):
+        for cand in lines[i + 1:i + 4]:
+            name = cand.strip()
+            nl = name.lower()
+
+            if not name or ":" in name:
+                continue
+            if any(b in nl for b in BLOCK):
+                continue
+            if any(c.isdigit() for c in name):
+                continue
+            if name.endswith("."):
+                continue
+            if 2 <= len(name.split()) <= 6:
+                return {"value": name, "confidence": _confidence(0.96)}
     return None
 
 
-def extract_insurance_company(lines):
-    """Extract insurance company name"""
-    for i, line in enumerate(lines):
-        l = line.lower()
-        if "insurance provided by" in l or "insurance company" in l:
-            # Check same line
-            if ":" in line:
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    company = parts[1].strip()
-                    # Clean up extra info
-                    company = re.split(r'\s{2,}|customer|phone', company, flags=re.I)[0].strip()
-                    return company
-            
-            # Check next line
-            if i + 1 < len(lines):
-                candidate = lines[i + 1].strip()
-                # Clean up extra info
-                candidate = re.split(r'\s{2,}|customer|phone', candidate, flags=re.I)[0].strip()
-                if candidate and "company" in candidate.lower():
-                    return candidate
-    
+def extract_mailing_address(lines):
+    for l in lines:
+        ll = l.lower()
+        if "po box" in ll or re.search(r'\d+.*\b[A-Z]{2}\b.*\d{5}', l):
+            return {"value": l.strip(), "confidence": _confidence(0.95)}
     return None
 
-# ============================================================
-# DOCUMENT TYPE DETECTION (Layer 1 – Structural + Keyword)
-# ============================================================
 
-def detect_document_type(lines: List[str]) -> str:
-    """
-    Detect document type using dominant insurance keywords.
-    Returns normalized document codes.
-    """
+def extract_property_address(lines):
+    for l in lines:
+        ll = l.lower()
+        if "po box" in ll:
+            continue
+        if re.search(r'\d+.*\b[A-Z]{2}\b.*\d{5}', l):
+            return {"value": l.strip(), "confidence": _confidence(0.96)}
+    return None
 
-    text = " ".join(lines).lower()
 
-    # ---------------- Cancellation / DOI ----------------
-    if any(k in text for k in [
-        "cancellation notice",
-        "policy cancelled",
-        "policy change",
-        "deleted as loss payee",
-        "notice of cancellation"
-    ]):
-        return "DOI"
+def extract_mortgage(lines):
+    for l in lines:
+        ll = l.lower()
+        if any(k in ll for k in ["mortgage", "bank", "lending", "isaoa", "atima"]):
+            if not l.strip().endswith(".") and len(l.split()) >= 2:
+                return {"value": l.strip(), "confidence": _confidence(0.95, 0.10)}
+    return None
 
-    # ---------------- Renewal ----------------
-    if any(k in text for k in [
-        "renewal",
-        "policy renewal",
-        "renewed policy",
-        "renewal notice"
-    ]):
-        return "RNW"
 
-    # ---------------- Declaration ----------------
-    if any(k in text for k in [
-        "declarations",
-        "policy declarations",
-        "declaration page",
-        "coverage summary"
-    ]):
-        return "DECLARATION"
+def extract_loan_number(lines):
+    for l in lines:
+        m = re.search(r'loan\s*number[:\s]+([A-Z0-9\-]+)', l, re.I)
+        if m:
+            return {"value": m.group(1), "confidence": _confidence(0.95)}
+    return None
 
-    # ---------------- Invoice ----------------
-    if any(k in text for k in [
-        "invoice",
-        "amount due",
-        "total premium",
-        "billing statement"
-    ]):
-        return "INV"
 
-    # ---------------- Certificate ----------------
-    if any(k in text for k in [
-        "certificate of insurance",
-        "certificate holder"
-    ]):
-        return "COI"
+def extract_effective_date(lines):
+    for l in lines:
+        if "policy effective date" in l.lower():
+            return {"value": l.split(":")[-1].strip(), "confidence": _confidence(0.98)}
+    for l in lines:
+        m = re.search(r'policy period.*?(\d{2}/\d{2}/\d{4})', l, re.I)
+        if m:
+            return {"value": m.group(1), "confidence": _confidence(0.96)}
+    return None
 
-    return "OTH"
 
-# --------------------------------------------------
-# MAIN SEGMENTATION
-# --------------------------------------------------
-def segregate_insurance_document(lines):
-    """
-    Main document segmentation with enhanced classification
-    """
-    raw_text = " ".join(lines)
-    clean_text = normalize_text(raw_text)
+def extract_expiration_date(lines):
+    for l in lines:
+        m = re.search(r'policy period.*?to\s*(\d{2}/\d{2}/\d{4})', l, re.I)
+        if m:
+            return {"value": m.group(1), "confidence": _confidence(0.96)}
+    return None
 
-    # Classify using updated classifiers
-    document_type = classify_document(lines)
-    policy_type = classify_policy(lines)
 
-    # ========================================
-    # DOCUMENT-SPECIFIC POLICY RULES
-    # ========================================
-    
-    # Special handling for invoice + renewal
-    if "invoice" in clean_text and "renewal" in clean_text:
-        if document_type in ["INV", "OTH"]:
-            document_type = "RNW"
+def extract_issue_date(lines):
+    for l in lines:
+        if "processed on" in l.lower():
+            return {"value": l.split(":")[-1].strip(), "confidence": _confidence(0.90)}
+    return None
 
-    # 🔥 BUSINESS RULE: Cancellation/DOI/Reinstatement documents
-    # Policy type should be UNK for these document types
-    if document_type in ["CAN", "DOI", "RNS"]:
-        policy_type = "UNK"
-    
-    # Policy inference for FPN (force placed = flood)
-    if policy_type == "UNK" and document_type == "FPN":
-        policy_type = "FLD"
 
-    # Extract fields based on document type
-    extracted = {}
-    errors = []
+def extract_total_premium(lines):
+    for l in lines:
+        m = re.search(r'\$\s*([\d,]{3,})', l)
+        if m:
+            return {"value": f"${m.group(1)}", "confidence": _confidence(0.90, 0.15)}
+    return None
 
-    required_fields = FIELD_RULES.get(document_type, FIELD_RULES["OTH"])
 
-    for field in required_fields:
-        val = None
-        
-        if field == "carrier":
-            val = extract_carrier(clean_text)
-        elif field == "policy_number":
-            val = extract_policy_number(clean_text, lines)
-        elif field == "loan_number":
-            val = extract_loan_number(clean_text)
-        elif field == "insured_name":
-            val = extract_insured_name(lines)
-        elif field == "property_address":
-            val = extract_property_address(lines)
-        elif field == "insurance_company":
-            val = extract_insurance_company(lines)
-        elif field == "balance_due":
-            val = extract_balance_due(clean_text)
-        elif field == "invoice_number":
-            val = extract_invoice_number(clean_text)
-        elif field == "invoice_total":
-            val = extract_invoice_total(clean_text)
-        elif field == "total_premium":
-            val = extract_total_premium(clean_text, lines)
-        elif field in ["effective_date", "expiration_date", "cancellation_date", "due_date", "issue_date"]:
-            dates = extract_dates(clean_text, lines)
-            val = dates.get(field)
-        
-        extracted[field] = val
-        if not val:
-            errors.append(f"{field} missing")
+def extract_balance_due(lines):
+    text = " ".join(lines)
+    m = re.search(r'(amount due|balance due)\s*\$([\d,]+)', text, re.I)
+    if m:
+        return {"value": f"${m.group(2)}", "confidence": _confidence(0.92)}
+    return None
 
-    return {
-        "policy_type": policy_type,
-        "document_type": document_type,
-        "fields": extracted,
-        "field_errors": errors
-    }
 
-# ============================================================
-# ORCHESTRATOR ENTRYPOINT (REQUIRED – DO NOT REMOVE)
-# ============================================================
-
-def segment_and_extract(lines: List[str]) -> dict:
-    """
-    Unified entrypoint required by orchestrator.py
-
-    This function:
-    - Preserves existing segmentation logic
-    - Adapts output to orchestrator/UI contract
-    - Does NOT alter extraction behavior
-    """
-
-    result = segregate_insurance_document(lines)
-
-    # Convert flat fields -> structured format
-    structured = {}
-    for field, value in result.get("fields", {}).items():
-        if value:
-            structured[field] = {
-                "value": value,
-                "confidence": 0.85,   # neutral default (can be boosted later)
-                "source": "insurance_segmentation"
-            }
-
-    return {
-        "structured": structured,
-        "document_type": result.get("document_type", "OTH"),
-        "policy_type": result.get("policy_type", "UNK"),
-        "field_errors": result.get("field_errors", [])
-    }
+def extract_remit_info(lines):
+    for l in lines:
+        if l.lower().startswith("mail to"):
+            return {"value": l.strip(), "confidence": _confidence(0.93)}
+    return None
