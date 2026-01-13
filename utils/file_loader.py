@@ -41,41 +41,31 @@ def expand_uploaded_files(files):
 
 
 # ============================================================
-# INPUT LOADER (OPTIMAL + FAST)
+# INPUT LOADER — OLD PROJECT CONTRACT (STRONG)
 # ============================================================
 def load_input(data: bytes, mime_type: str):
     """
-    Load image or PDF input.
+    STRONG / OLD-PROJECT BEHAVIOR
 
-    Strategy:
-    1) Extract vector text first (fastest)
-    2) OCR only if page is image-only
-    3) Rasterize at 220 DPI (CRNN sweet spot)
+    - ALWAYS rasterize PDF pages
+    - NEVER return text-only pages
+    - OCR decides what is useful
+    - Page 1 can NEVER be skipped
 
     Returns:
-      [
-        { "type": "text",  "content": str },
-        { "type": "image", "content": np.ndarray }
-      ]
+        List[np.ndarray]  # BGR images
     """
     pages = []
 
     if mime_type == "application/pdf":
         doc = fitz.open(stream=data, filetype="pdf")
 
+        # 🔒 ALWAYS rasterize
+        zoom = 300 / 72  # High-quality OCR
+        mat = fitz.Matrix(zoom, zoom)
+
         for page in doc:
-            text = page.get_text("text")
-
-            if text and len(text.strip()) > 100:
-                pages.append({
-                    "type": "text",
-                    "content": text
-                })
-                continue
-
-            # Image-only page → render at 220 DPI
-            zoom = 220 / 72
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img = np.frombuffer(
                 pix.samples, dtype=np.uint8
@@ -86,10 +76,7 @@ def load_input(data: bytes, mime_type: str):
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-            pages.append({
-                "type": "image",
-                "content": img
-            })
+            pages.append(img)
 
     else:
         img = cv2.imdecode(
@@ -97,10 +84,7 @@ def load_input(data: bytes, mime_type: str):
             cv2.IMREAD_COLOR
         )
         if img is not None:
-            pages.append({
-                "type": "image",
-                "content": img
-            })
+            pages.append(img)
 
     return pages
 
