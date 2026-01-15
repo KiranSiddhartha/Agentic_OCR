@@ -1,4 +1,4 @@
-# agents/vision_agent.py - FIXED
+# agents/vision_agent.py - MAXIMUM RECALL MODE
 # Proper OCR integration with PP-OCRv3 and LayoutXLM
 from PIL import Image
 import torch
@@ -45,10 +45,71 @@ class VisionAgent:
                 self.use_layoutxlm = False
 
     # --------------------------------------------------------
-    # STAGE 0 – OCR
+    # STAGE 0 – OCR (STANDARD)
     # --------------------------------------------------------
     def run_vision(self, image):
         return self.ocr_engine.run(image)
+
+    # --------------------------------------------------------
+    # NEW: RAW OCR OUTPUT (100% UNFILTERED)
+    # --------------------------------------------------------
+    def run_vision_raw(self, image):
+        """
+        Return 100% raw OCR text with NO filtering.
+        Use this for debugging missing text.
+        """
+        try:
+            ocr_results = self.ocr_engine.run_with_boxes(image)
+            
+            # Return EVERYTHING - no filtering
+            all_text = []
+            for word, box, conf in zip(
+                ocr_results.get("text", []),
+                ocr_results.get("boxes", []),
+                ocr_results.get("confidences", [])
+            ):
+                all_text.append({
+                    "text": word,
+                    "box": box,
+                    "confidence": conf,
+                    "raw": True  # Flag to indicate unfiltered
+                })
+            
+            print(f"[VisionAgent] Raw OCR extracted {len(all_text)} items")
+            return all_text
+            
+        except Exception as e:
+            print(f"[VisionAgent] Raw OCR failed: {e}")
+            return []
+
+    # --------------------------------------------------------
+    # NEW: EXPORT RAW OCR TO TEXT FILE
+    # --------------------------------------------------------
+    def export_raw_ocr(self, image, output_path="full_ocr_output.txt"):
+        """
+        Export 100% raw OCR to text file for debugging.
+        """
+        raw_ocr = self.run_vision_raw(image)
+        
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("=" * 80 + "\n")
+                f.write("COMPLETE RAW OCR OUTPUT (100% UNFILTERED)\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for idx, item in enumerate(raw_ocr):
+                    f.write(f"{idx:4d} | {item['confidence']:.3f} | {item['text']}\n")
+                
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"TOTAL LINES: {len(raw_ocr)}\n")
+                f.write("=" * 80 + "\n")
+            
+            print(f"[VisionAgent] Raw OCR exported to {output_path}")
+            return output_path
+            
+        except Exception as e:
+            print(f"[VisionAgent] Export failed: {e}")
+            return None
 
     # --------------------------------------------------------
     # INTELLIGENT CASCADING LAYOUT ANALYSIS
@@ -263,3 +324,23 @@ def run_vision(image):
     if _agent is None:
         _agent = VisionAgent(use_layoutxlm=False)
     return _agent.run_vision(image)
+
+
+def run_vision_raw(image):
+    """
+    Global function for 100% raw OCR output.
+    """
+    global _agent
+    if _agent is None:
+        _agent = VisionAgent(use_layoutxlm=False)
+    return _agent.run_vision_raw(image)
+
+
+def export_raw_ocr(image, output_path="full_ocr_output.txt"):
+    """
+    Global function to export raw OCR to file.
+    """
+    global _agent
+    if _agent is None:
+        _agent = VisionAgent(use_layoutxlm=False)
+    return _agent.export_raw_ocr(image, output_path)

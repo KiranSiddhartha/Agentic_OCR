@@ -261,13 +261,10 @@
 
 
 """
-Orchestrator – Intelligent Cascading Hybrid (FLOW CONTROL ONLY)
+Orchestrator – Intelligent Cascading Hybrid
+LEGACY-COMPATIBLE DROP-IN
 
-Responsibilities:
-- Run stages in strict order
-- Control cascading (missing fields only)
-- Merge results safely
-- Never extract, normalize, or interpret values
+Aligned with commented reference implementation.
 """
 
 from typing import Dict, List
@@ -277,15 +274,18 @@ from utils.text_utils import merge_broken_lines
 from agents.vision_agent import VisionAgent
 from agents.correction_agent import correct_lines
 
-# ---------------- STAGES ----------------
+# ================= STAGES =================
 
 from agents.stage1_deterministic_agent import extract_with_regex
-from agents.stage2_semantic_agent import semantic_fill_missing_fields
+
+# 🔴 IMPORTANT: legacy Stage-2 entrypoint (DO NOT CHANGE)
+from agents.stage2_semantic_agent import extract_with_ner
+
 from agents.stage3_layout_agent import extract_with_layoutxlm
 from agents.relation_extraction_agent import RelationExtractionAgent
 from agents.validation_agent import validate_and_arbitrate
 
-# ---------------- CLASSIFICATION ----------------
+# ================= CLASSIFICATION =================
 
 try:
     from agents.document_classifier import classify_document
@@ -295,27 +295,31 @@ except Exception:
     CLASSIFICATION_AVAILABLE = False
 
 # ============================================================
-# FIELD GROUPS (FLOW DECISIONS ONLY)
+# FIELD GROUPS (MATCH LEGACY COMMENTED CODE)
 # ============================================================
 
-CRITICAL_FIELDS = {
+CRITICAL_FIELDS = [
     "carrier",
     "policy_number",
     "insured_name",
     "effective_date",
-}
+    "expiration_date",
+]
 
-IMPORTANT_FIELDS = {
+IMPORTANT_FIELDS = [
     "property_address",
-    "mortgage",
     "loan_number",
-}
+    "mortgage",
+    "total_premium",
+]
 
-OPTIONAL_FIELDS = {
+OPTIONAL_FIELDS = [
     "mailing_address",
     "agent",
     "agent_phone",
-}
+]
+
+ALL_FIELDS = CRITICAL_FIELDS + IMPORTANT_FIELDS + OPTIONAL_FIELDS
 
 # ============================================================
 # PIPELINE STATE
@@ -328,11 +332,9 @@ _vision_agent = None
 # MAIN PIPELINE
 # ============================================================
 
-def run_pipeline(image, debug: bool = False, use_cache: bool = True) -> Dict:
-    """
-    Execute the full Intelligent Cascading Hybrid pipeline.
-    """
+def run_pipeline(image, max_retries=1, debug=False, use_cache=True) -> Dict:
     try:
+        # ---------------- PREPROCESS ----------------
         processed = preprocess(image)
 
         global _vision_agent
@@ -345,13 +347,16 @@ def run_pipeline(image, debug: bool = False, use_cache: bool = True) -> Dict:
         if not ocr or not ocr.get("text"):
             return _empty_result("No OCR text")
 
-        lines = ocr.get("lines") or [" ".join(ocr.get("text", []))]
-        lines = merge_broken_lines([l.strip() for l in lines if l.strip()])
+        # ---------------- OCR → LINES ----------------
+        lines = ocr.get("lines")
+        if not lines:
+            lines = ocr.get("text", [])
 
-        # ✅ OCR CORRECTION (FIX ONLY)
+        lines = [l.strip() for l in lines if l and l.strip()]
+        lines = merge_broken_lines(lines)
         lines = correct_lines(lines, debug=debug)
 
-        layout = []
+        # ---------------- LAYOUT ----------------
         try:
             layout = vision.analyze_layout(processed, ocr)
         except Exception:
@@ -360,49 +365,48 @@ def run_pipeline(image, debug: bool = False, use_cache: bool = True) -> Dict:
         # ================= STAGE 1 =================
         stage1 = extract_with_regex(lines, layout)
 
-        # ================= STAGE 2 =================
-        stage2 = semantic_fill_missing_fields(
-            lines,
-            existing_fields=stage1,
-            sections=None,
-        )
+        # 🔒 LEGACY SAFETY NET (CRITICAL)
+        if not stage1:
+            stage1 = extract_with_regex(lines, [])
+
+        missing1 = _identify_missing_fields(stage1)
+
+        # ================= STAGE 2 (LEGACY CONTRACT) =================
+        stage2 = {}
+        if missing1:
+            raw_stage2 = extract_with_ner(lines, missing1)
+            for f, d in raw_stage2.items():
+                if f not in stage1:
+                    d["confidence"] = max(0.55, d.get("confidence", 0.7))
+                    d["source"] = "semantic_ner"
+                    stage2[f] = d
 
         # ================= STAGE 3 =================
-        combined_12 = _merge_locked(stage1, stage2)
-        missing_after_2 = _missing_fields(combined_12)
+        combined = {**stage1, **stage2}
+        missing2 = _identify_missing_fields(combined)
 
         stage3 = {}
-        if missing_after_2 and layout:
-            relation_agent = RelationExtractionAgent()
-            relations = relation_agent.extract_relations(layout, combined_12)
-            ambiguous_regions = _ambiguous_regions(layout, combined_12)
-
-            stage3 = extract_with_layoutxlm(
-                ambiguous_regions,
-                relations,
-                missing_after_2,
-            )
-
-        # ================= FINAL MERGE =================
-        merged = _merge_by_priority(stage1, stage2, stage3)
+        if missing2 and layout:
+            re_agent = RelationExtractionAgent()
+            relations = re_agent.extract_relations(layout, combined)
+            ambiguous = _identify_ambiguous_regions(layout, combined)
+            stage3 = extract_with_layoutxlm(ambiguous, relations, missing2)
 
         # ================= VALIDATION =================
+        merged = _merge_stage_results(stage1, stage2, stage3)
+
         ocr_conf = ocr.get("avg_confidence", 0.85)
 
-        final_fields, final_confidence = validate_and_arbitrate(
+        final_fields, confidence = validate_and_arbitrate(
             merged,
             ocr_conf,
-            {
-                "stage1": stage1,
-                "stage2": stage2,
-                "stage3": stage3,
-            },
+            {"stage1": stage1, "stage2": stage2, "stage3": stage3},
         )
 
         return {
             "fields": final_fields,
             "raw_lines": lines,
-            "confidence": final_confidence,
+            "confidence": confidence,
             "document_type": classify_document(lines) if CLASSIFICATION_AVAILABLE else "UNK",
             "policy_type": classify_policy(lines) if CLASSIFICATION_AVAILABLE else "UNK",
         }
@@ -412,48 +416,52 @@ def run_pipeline(image, debug: bool = False, use_cache: bool = True) -> Dict:
 
 
 # ============================================================
-# BATCH WRAPPER
+# BATCH WRAPPER (REQUIRED BY app.py)
 # ============================================================
 
-def run_pipeline_batch(images, debug: bool = False, use_cache: bool = True):
-    return [run_pipeline(img, debug=debug, use_cache=use_cache) for img in images]
+def run_pipeline_batch(images, max_retries=1, debug=False, use_cache=True):
+    return [
+        run_pipeline(
+            img,
+            max_retries=max_retries,
+            debug=debug,
+            use_cache=use_cache,
+        )
+        for img in images
+    ]
 
 
 # ============================================================
-# HELPERS (FLOW ONLY)
+# HELPERS (LEGACY-COMPATIBLE)
 # ============================================================
 
-def _missing_fields(fields: Dict[str, Dict]) -> List[str]:
-    required = CRITICAL_FIELDS | IMPORTANT_FIELDS
-    return [f for f in required if f not in fields]
+def _identify_missing_fields(fields):
+    return [f for f in CRITICAL_FIELDS + IMPORTANT_FIELDS if f not in fields]
 
 
-def _merge_locked(primary: Dict, secondary: Dict) -> Dict:
-    merged = dict(primary)
-    for k, v in secondary.items():
-        if k not in merged and v is not None:
-            merged[k] = v
-    return merged
-
-
-def _merge_by_priority(s1: Dict, s2: Dict, s3: Dict) -> Dict:
+def _merge_stage_results(s1, s2, s3):
     merged = {}
-    for field in set(s1) | set(s2) | set(s3):
-        if field in s1:
-            merged[field] = s1[field]
-        elif field in s2:
-            merged[field] = s2[field]
-        elif field in s3:
-            merged[field] = s3[field]
+    for f in set(s1) | set(s2) | set(s3):
+        candidates = []
+        if f in s1:
+            candidates.append({**s1[f], "priority": 3})
+        if f in s2:
+            candidates.append({**s2[f], "priority": 2})
+        if f in s3:
+            candidates.append({**s3[f], "priority": 1})
+        merged[f] = max(
+            candidates,
+            key=lambda c: c.get("confidence", 0) * 0.7 + c["priority"] * 0.3,
+        )
     return merged
 
 
-def _ambiguous_regions(layout: List[Dict], extracted: Dict) -> List[Dict]:
-    used = {v.get("value", "").lower() for v in extracted.values()}
-    return [r for r in layout if r.get("text", "").lower() not in used]
+def _identify_ambiguous_regions(layout, extracted):
+    extracted_vals = {v.get("value", "").lower() for v in extracted.values()}
+    return [e for e in layout if e.get("text", "").lower() not in extracted_vals]
 
 
-def _empty_result(reason: str) -> Dict:
+def _empty_result(reason):
     return {
         "fields": {},
         "raw_lines": [],

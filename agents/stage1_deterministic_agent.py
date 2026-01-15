@@ -274,243 +274,449 @@
 
 #     return None
 
+# #13/01
+# """
+# Stage 1 – Deterministic Extraction (CRITICAL)
+
+# Design goals:
+# - MAXIMUM RECALL
+# - Minimal rejection
+# - OCR-tolerant
+# - No cross-field logic
+# - No arbitration
+# """
+
+# import re
+# from typing import List, Dict, Optional
+
+# # ============================================================
+# # MAIN ENTRYPOINT
+# # ============================================================
+
+# def extract_with_regex(
+#     lines: List[str],
+#     layout_elements: Optional[List[Dict]] = None,
+# ) -> Dict[str, Dict]:
+#     """
+#     Deterministic extraction using regex + loose heuristics.
+#     """
+
+#     text = "\n".join(lines)
+#     fields: Dict[str, Dict] = {}
+
+#     # --------------------------------------------------------
+#     # CARRIER
+#     # --------------------------------------------------------
+
+#     carriers = [
+#         "STATE FARM", "ALLSTATE", "FARMERS", "AAA", "CSAA",
+#         "ENCOMPASS", "ERIE", "TRAVELERS", "NATIONWIDE",
+#         "LIBERTY MUTUAL", "USAA", "PROGRESSIVE",
+#     ]
+
+#     for l in lines[:15]:
+#         for c in carriers:
+#             if c in l.upper():
+#                 fields["carrier"] = _field(l.strip(), 0.98, "carrier_match")
+#                 break
+#         if "carrier" in fields:
+#             break
+
+#     # --------------------------------------------------------
+#     # POLICY NUMBER
+#     # --------------------------------------------------------
+
+#     _regex(
+#         fields,
+#         "policy_number",
+#         text,
+#         [
+#             r'policy\s*(number|no|#)\s*[:\-]?\s*([A-Z0-9\-]{5,30})',
+#             r'certificate\s*number\s*[:\-]?\s*([A-Z0-9\-]{5,30})',
+#         ],
+#         min_digits=3,
+#         confidence=0.98,
+#     )
+
+#     # --------------------------------------------------------
+#     # INSURED NAME
+#     # --------------------------------------------------------
+
+#     for i, l in enumerate(lines):
+#         ll = l.lower()
+
+#         if any(k in ll for k in ["insured", "named insured", "policyholder"]):
+#             val = _next_nonempty(lines, i)
+#             if val and _looks_like_name(val):
+#                 fields["insured_name"] = _field(val, 0.96, "insured_context")
+#                 break
+
+#     # --------------------------------------------------------
+#     # EFFECTIVE / EXPIRATION / ISSUE / NOTICE DATES
+#     # --------------------------------------------------------
+
+#     _date_field(fields, text, "effective_date", ["effective"])
+#     _date_field(fields, text, "expiration_date", ["expiration", "expires"])
+#     _date_field(fields, text, "issue_date", ["issue", "issued"])
+#     _date_field(fields, text, "notice_effective_date", ["notice effective"])
+#     _date_field(fields, text, "cancellation_date", ["cancellation", "cancelled"])
+
+#     # --------------------------------------------------------
+#     # PROPERTY ADDRESS
+#     # --------------------------------------------------------
+
+#     for i, l in enumerate(lines):
+#         if any(k in l.lower() for k in ["property location", "location of insured"]):
+#             val = _next_nonempty(lines, i)
+#             if _looks_like_address(val):
+#                 fields["property_address"] = _field(val, 0.95, "property_context")
+#                 break
+
+#     # --------------------------------------------------------
+#     # MAILING ADDRESS
+#     # --------------------------------------------------------
+
+#     for i, l in enumerate(lines):
+#         if any(k in l.lower() for k in ["mailing address", "insured mailing"]):
+#             val = _next_nonempty(lines, i)
+#             if _looks_like_address(val):
+#                 fields["mailing_address"] = _field(val, 0.94, "mailing_context")
+#                 break
+
+#     # --------------------------------------------------------
+#     # MORTGAGE / PAYEE
+#     # --------------------------------------------------------
+
+#     for i, l in enumerate(lines):
+#         if any(k in l.lower() for k in ["mortgagee", "loss payee", "lender"]):
+#             val = _next_nonempty(lines, i)
+#             if val:
+#                 fields["mortgage"] = _field(val, 0.94, "mortgage_context")
+#                 break
+
+#     # --------------------------------------------------------
+#     # LOAN NUMBER
+#     # --------------------------------------------------------
+
+#     _regex(
+#         fields,
+#         "loan_number",
+#         text,
+#         [r'loan\s*(number|#)\s*[:\-]?\s*([A-Z0-9\-]{5,30})'],
+#         min_digits=4,
+#         confidence=0.97,
+#     )
+
+#     # --------------------------------------------------------
+#     # PREMIUM / BALANCE DUE
+#     # --------------------------------------------------------
+
+#     _money_field(fields, text, "total_premium", ["total premium"])
+#     _money_field(fields, text, "balance_due", ["balance due", "amount due"])
+
+#     # --------------------------------------------------------
+#     # DWELLING COVERAGE
+#     # --------------------------------------------------------
+
+#     _money_field(fields, text, "dwelling_coverage", ["dwelling", "coverage a"])
+
+#     # --------------------------------------------------------
+#     # AGENT INFO
+#     # --------------------------------------------------------
+
+#     _regex(
+#         fields,
+#         "agent_phone",
+#         text,
+#         [r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'],
+#         confidence=0.93,
+#     )
+
+#     # --------------------------------------------------------
+#     # REMIT / PAYEE INFO
+#     # --------------------------------------------------------
+
+#     for l in lines:
+#         if any(k in l.lower() for k in ["remit to", "make payable", "payable to"]):
+#             fields["remit_info"] = _field(l.strip(), 0.92, "remit_context")
+#             break
+
+#     return fields
+
+
+# # ============================================================
+# # HELPERS
+# # ============================================================
+
+# def _field(value: str, confidence: float, source: str) -> Dict:
+#     return {
+#         "value": value.strip(),
+#         "confidence": confidence,
+#         "source": source,
+#     }
+
+
+# def _regex(
+#     fields: Dict,
+#     name: str,
+#     text: str,
+#     patterns: List[str],
+#     min_digits: int = 0,
+#     confidence: float = 0.95,
+# ):
+#     for p in patterns:
+#         m = re.search(p, text, re.I)
+#         if m:
+#             val = m.group(m.lastindex).strip()
+#             if min_digits and sum(c.isdigit() for c in val) < min_digits:
+#                 continue
+#             fields[name] = _field(val, confidence, p)
+#             return
+
+
+# def _date_field(fields: Dict, text: str, name: str, keywords: List[str]):
+#     for k in keywords:
+#         m = re.search(
+#             rf'{k}.*?(\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}|[A-Z][a-z]+ \d{{1,2}}, \d{{4}})',
+#             text,
+#             re.I,
+#         )
+#         if m:
+#             fields[name] = _field(m.group(1), 0.95, k)
+#             return
+
+
+# def _money_field(fields: Dict, text: str, name: str, keywords: List[str]):
+#     for k in keywords:
+#         m = re.search(rf'{k}.*?\$([\d,]+)', text, re.I)
+#         if m:
+#             fields[name] = _field(f"${m.group(1)}", 0.95, k)
+#             return
+
+
+# def _next_nonempty(lines: List[str], idx: int) -> Optional[str]:
+#     for j in range(idx + 1, min(idx + 6, len(lines))):
+#         if lines[j].strip():
+#             return lines[j].strip()
+#     return None
+
+
+# def _looks_like_name(val: str) -> bool:
+#     if any(char.isdigit() for char in val):
+#         return False
+#     words = val.split()
+#     return 1 <= len(words) <= 6
+
+
+# def _looks_like_address(val: str) -> bool:
+#     if not val:
+#         return False
+#     if "po box" in val.lower():
+#         return True
+#     return bool(re.search(r'\d+.*\b[A-Z]{2}\b.*\d{5}', val))
+
 
 """
-Stage 1 – Deterministic Extraction (CRITICAL)
+Stage 1 – Deterministic Extraction (HARDENED)
 
-Design goals:
-- MAXIMUM RECALL
-- Minimal rejection
-- OCR-tolerant
-- No cross-field logic
-- No arbitration
+Purpose:
+- Extract high-confidence fields using regex and layout hints
+- Be STRICT: never guess identifiers
+- Correctly handle multi-line label/value cases
 """
 
 import re
 from typing import List, Dict, Optional
 
+
 # ============================================================
-# MAIN ENTRYPOINT
+# HELPERS – VALIDATION
+# ============================================================
+
+def _is_section_header(text: str) -> bool:
+    text = text.lower().strip()
+    return any(
+        h in text
+        for h in [
+            "summary",
+            "coverage",
+            "limits",
+            "endorsement",
+            "deductible",
+            "premium",
+            "policy effective date",
+            "home protection",
+            "mortgage",
+        ]
+    )
+
+
+def _is_valid_policy_number(value: str) -> bool:
+    if not value:
+        return False
+    value = value.strip()
+    if not value.isdigit():
+        return False
+    return 6 <= len(value) <= 12
+
+
+def _is_valid_date(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}",
+            text,
+            re.I,
+        )
+    )
+
+
+# ============================================================
+# MAIN EXTRACTION
 # ============================================================
 
 def extract_with_regex(
     lines: List[str],
     layout_elements: Optional[List[Dict]] = None,
 ) -> Dict[str, Dict]:
-    """
-    Deterministic extraction using regex + loose heuristics.
-    """
 
-    text = "\n".join(lines)
-    fields: Dict[str, Dict] = {}
+    extracted: Dict[str, Dict] = {}
 
     # --------------------------------------------------------
-    # CARRIER
+    # NORMALIZE LINES
     # --------------------------------------------------------
+    clean_lines = [l.strip() for l in lines if l and l.strip()]
 
-    carriers = [
-        "STATE FARM", "ALLSTATE", "FARMERS", "AAA", "CSAA",
-        "ENCOMPASS", "ERIE", "TRAVELERS", "NATIONWIDE",
-        "LIBERTY MUTUAL", "USAA", "PROGRESSIVE",
-    ]
-
-    for l in lines[:15]:
-        for c in carriers:
-            if c in l.upper():
-                fields["carrier"] = _field(l.strip(), 0.98, "carrier_match")
-                break
-        if "carrier" in fields:
+    # --------------------------------------------------------
+    # POLICY NUMBER – INLINE (STRICT NUMERIC)
+    # --------------------------------------------------------
+    for line in clean_lines:
+        m = re.search(
+            r"\bpolicy\s*number\s*[:\-]?\s*(\d{6,12})\b",
+            line,
+            re.I,
+        )
+        if m:
+            extracted["policy_number"] = {
+                "value": m.group(1),
+                "confidence": 0.98,
+                "source": "regex_inline",
+            }
             break
 
     # --------------------------------------------------------
-    # POLICY NUMBER
+    # POLICY NUMBER – MULTI-LINE (LABEL → NEXT LINE)
     # --------------------------------------------------------
+    if "policy_number" not in extracted:
+        for i, line in enumerate(clean_lines[:-1]):
+            if re.search(r"\bpolicy\s*number\b", line, re.I):
+                nxt = clean_lines[i + 1].strip()
+                if _is_valid_policy_number(nxt):
+                    extracted["policy_number"] = {
+                        "value": nxt,
+                        "confidence": 0.98,
+                        "source": "regex_multiline",
+                    }
+                    break
 
-    _regex(
-        fields,
-        "policy_number",
-        text,
-        [
-            r'policy\s*(number|no|#)\s*[:\-]?\s*([A-Z0-9\-]{5,30})',
-            r'certificate\s*number\s*[:\-]?\s*([A-Z0-9\-]{5,30})',
-        ],
-        min_digits=3,
-        confidence=0.98,
-    )
+    # --------------------------------------------------------
+    # EFFECTIVE DATE
+    # --------------------------------------------------------
+    for line in clean_lines:
+        if "effective date" in line.lower() and _is_valid_date(line):
+            extracted["effective_date"] = {
+                "value": line.split(":", 1)[-1].strip(),
+                "confidence": 0.95,
+                "source": "regex",
+            }
+            break
+
+    # --------------------------------------------------------
+    # EXPIRATION DATE
+    # --------------------------------------------------------
+    for line in clean_lines:
+        if "through" in line.lower() and _is_valid_date(line):
+            extracted["expiration_date"] = {
+                "value": line.split("through", 1)[-1].strip(),
+                "confidence": 0.95,
+                "source": "regex",
+            }
+            break
 
     # --------------------------------------------------------
     # INSURED NAME
     # --------------------------------------------------------
-
-    for i, l in enumerate(lines):
-        ll = l.lower()
-
-        if any(k in ll for k in ["insured", "named insured", "policyholder"]):
-            val = _next_nonempty(lines, i)
-            if val and _looks_like_name(val):
-                fields["insured_name"] = _field(val, 0.96, "insured_context")
-                break
-
-    # --------------------------------------------------------
-    # EFFECTIVE / EXPIRATION / ISSUE / NOTICE DATES
-    # --------------------------------------------------------
-
-    _date_field(fields, text, "effective_date", ["effective"])
-    _date_field(fields, text, "expiration_date", ["expiration", "expires"])
-    _date_field(fields, text, "issue_date", ["issue", "issued"])
-    _date_field(fields, text, "notice_effective_date", ["notice effective"])
-    _date_field(fields, text, "cancellation_date", ["cancellation", "cancelled"])
+    for i, line in enumerate(clean_lines):
+        if "policyholder/named insured" in line.lower():
+            nxt = clean_lines[i + 1].strip()
+            if nxt and not _is_section_header(nxt):
+                extracted["insured_name"] = {
+                    "value": nxt,
+                    "confidence": 0.90,
+                    "source": "regex_multiline",
+                }
+            break
 
     # --------------------------------------------------------
     # PROPERTY ADDRESS
     # --------------------------------------------------------
-
-    for i, l in enumerate(lines):
-        if any(k in l.lower() for k in ["property location", "location of insured"]):
-            val = _next_nonempty(lines, i)
-            if _looks_like_address(val):
-                fields["property_address"] = _field(val, 0.95, "property_context")
-                break
-
-    # --------------------------------------------------------
-    # MAILING ADDRESS
-    # --------------------------------------------------------
-
-    for i, l in enumerate(lines):
-        if any(k in l.lower() for k in ["mailing address", "insured mailing"]):
-            val = _next_nonempty(lines, i)
-            if _looks_like_address(val):
-                fields["mailing_address"] = _field(val, 0.94, "mailing_context")
-                break
-
-    # --------------------------------------------------------
-    # MORTGAGE / PAYEE
-    # --------------------------------------------------------
-
-    for i, l in enumerate(lines):
-        if any(k in l.lower() for k in ["mortgagee", "loss payee", "lender"]):
-            val = _next_nonempty(lines, i)
-            if val:
-                fields["mortgage"] = _field(val, 0.94, "mortgage_context")
-                break
-
-    # --------------------------------------------------------
-    # LOAN NUMBER
-    # --------------------------------------------------------
-
-    _regex(
-        fields,
-        "loan_number",
-        text,
-        [r'loan\s*(number|#)\s*[:\-]?\s*([A-Z0-9\-]{5,30})'],
-        min_digits=4,
-        confidence=0.97,
-    )
-
-    # --------------------------------------------------------
-    # PREMIUM / BALANCE DUE
-    # --------------------------------------------------------
-
-    _money_field(fields, text, "total_premium", ["total premium"])
-    _money_field(fields, text, "balance_due", ["balance due", "amount due"])
-
-    # --------------------------------------------------------
-    # DWELLING COVERAGE
-    # --------------------------------------------------------
-
-    _money_field(fields, text, "dwelling_coverage", ["dwelling", "coverage a"])
-
-    # --------------------------------------------------------
-    # AGENT INFO
-    # --------------------------------------------------------
-
-    _regex(
-        fields,
-        "agent_phone",
-        text,
-        [r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'],
-        confidence=0.93,
-    )
-
-    # --------------------------------------------------------
-    # REMIT / PAYEE INFO
-    # --------------------------------------------------------
-
-    for l in lines:
-        if any(k in l.lower() for k in ["remit to", "make payable", "payable to"]):
-            fields["remit_info"] = _field(l.strip(), 0.92, "remit_context")
+    for line in clean_lines:
+        if re.search(r"\d+\s+.+\b(rd|road|st|street|ave|avenue)\b", line, re.I):
+            extracted["property_address"] = {
+                "value": line.strip(),
+                "confidence": 0.90,
+                "source": "regex",
+            }
             break
 
-    return fields
+    # --------------------------------------------------------
+    # AGENT
+    # --------------------------------------------------------
+    for line in clean_lines:
+        if line.lower().startswith("agent:"):
+            extracted["agent"] = {
+                "value": line.split(":", 1)[-1].strip(),
+                "confidence": 0.95,
+                "source": "regex",
+            }
+            break
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _field(value: str, confidence: float, source: str) -> Dict:
-    return {
-        "value": value.strip(),
-        "confidence": confidence,
-        "source": source,
-    }
-
-
-def _regex(
-    fields: Dict,
-    name: str,
-    text: str,
-    patterns: List[str],
-    min_digits: int = 0,
-    confidence: float = 0.95,
-):
-    for p in patterns:
-        m = re.search(p, text, re.I)
+    # --------------------------------------------------------
+    # AGENT PHONE
+    # --------------------------------------------------------
+    for line in clean_lines:
+        m = re.search(r"\(\d{3}\)\s*\d{3}[-\s]?\d{4}", line)
         if m:
-            val = m.group(m.lastindex).strip()
-            if min_digits and sum(c.isdigit() for c in val) < min_digits:
-                continue
-            fields[name] = _field(val, confidence, p)
-            return
+            extracted["agent_phone"] = {
+                "value": m.group(0),
+                "confidence": 0.90,
+                "source": "regex",
+            }
+            break
 
+    # --------------------------------------------------------
+    # CARRIER
+    # --------------------------------------------------------
+    for line in clean_lines:
+        if "encompass" in line.lower():
+            extracted["carrier"] = {
+                "value": "ENCOMPASS",
+                "confidence": 0.85,
+                "source": "keyword",
+            }
+            break
 
-def _date_field(fields: Dict, text: str, name: str, keywords: List[str]):
-    for k in keywords:
-        m = re.search(
-            rf'{k}.*?(\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}}|[A-Z][a-z]+ \d{{1,2}}, \d{{4}})',
-            text,
-            re.I,
-        )
-        if m:
-            fields[name] = _field(m.group(1), 0.95, k)
-            return
+    # --------------------------------------------------------
+    # MORTGAGEE
+    # --------------------------------------------------------
+    for i, line in enumerate(clean_lines):
+        if "mortgage" in line.lower() and i + 1 < len(clean_lines):
+            nxt = clean_lines[i + 1].strip()
+            if nxt and not _is_section_header(nxt):
+                extracted["mortgage"] = {
+                    "value": nxt,
+                    "confidence": 0.85,
+                    "source": "regex_multiline",
+                }
+                break
 
-
-def _money_field(fields: Dict, text: str, name: str, keywords: List[str]):
-    for k in keywords:
-        m = re.search(rf'{k}.*?\$([\d,]+)', text, re.I)
-        if m:
-            fields[name] = _field(f"${m.group(1)}", 0.95, k)
-            return
-
-
-def _next_nonempty(lines: List[str], idx: int) -> Optional[str]:
-    for j in range(idx + 1, min(idx + 6, len(lines))):
-        if lines[j].strip():
-            return lines[j].strip()
-    return None
-
-
-def _looks_like_name(val: str) -> bool:
-    if any(char.isdigit() for char in val):
-        return False
-    words = val.split()
-    return 1 <= len(words) <= 6
-
-
-def _looks_like_address(val: str) -> bool:
-    if not val:
-        return False
-    if "po box" in val.lower():
-        return True
-    return bool(re.search(r'\d+.*\b[A-Z]{2}\b.*\d{5}', val))
+    return extracted

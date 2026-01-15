@@ -271,7 +271,10 @@
 
 # st.caption("")
 
-# app.py - INTELLIGENT CASCADING HYBRID VISUALIZATION 
+# app.py - INTELLIGENT CASCADING HYBRID VISUALIZATION  
+# ======================================================================
+# ACTIVE APP (EXECUTED)
+# ======================================================================
 
 import streamlit as st
 import cv2
@@ -294,7 +297,10 @@ if PROJECT_ROOT not in sys.path:
 # ============================================================
 from utils.file_loader import expand_uploaded_files, load_input
 from orchestrator import run_pipeline_batch
-from agents.insurance_segmentation import segregate_insurance_document, FIELD_RULES
+from agents.insurance_segmentation import (
+    segregate_insurance_document,
+    FIELD_RULES,
+)
 from agents.document_classifier import classify_document
 from agents.policy_classifier import classify_policy
 
@@ -314,6 +320,7 @@ ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".pdf", ".zip")
 # ============================================================
 # HELPERS
 # ============================================================
+
 def prettify(name: str) -> str:
     return name.replace("_", " ").title()
 
@@ -325,7 +332,6 @@ def merge_page_results(results: list) -> dict:
             "raw_lines": [],
             "confidence": 0.0,
             "page_count": 0,
-            "metadata": {},
         }
 
     all_lines, fields = [], {}
@@ -340,56 +346,7 @@ def merge_page_results(results: list) -> dict:
         "raw_lines": all_lines,
         "confidence": best.get("confidence", 0.0),
         "page_count": len(results),
-        "metadata": best.get("metadata", {}),
     }
-
-def merge_fields(current: dict, staged: dict) -> dict:
-    """
-    Merge two field dictionaries safely.
-    Prefers higher-confidence values.
-    Handles None values correctly.
-    """
-
-    merged = dict(staged)  # start with staged (older)
-
-    for k, c in current.items():
-        if c is None:
-            continue
-
-        s = merged.get(k)
-
-        # If staged value is missing or None → take current
-        if s is None:
-            merged[k] = c
-            continue
-
-        # If either side is malformed → prefer valid dict
-        if not isinstance(c, dict):
-            continue
-        if not isinstance(s, dict):
-            merged[k] = c
-            continue
-
-        # Compare confidence safely
-        c_conf = c.get("confidence", 0)
-        s_conf = s.get("confidence", 0)
-
-        merged[k] = c if c_conf >= s_conf else s
-
-    return merged
-
-
-# def merge_fields(cascade: dict, seg: dict) -> dict:
-#     merged = {}
-#     for k in set(cascade) | set(seg):
-#         c, s = cascade.get(k), seg.get(k)
-#         if c and not s:
-#             merged[k] = c
-#         elif s and not c:
-#             merged[k] = s if isinstance(s, dict) else {"value": s, "confidence": 0.75}
-#         else:
-#             merged[k] = c if c.get("confidence", 0) >= s.get("confidence", 0) else s
-#     return merged
 
 
 def render_extracted_text(seg: dict) -> str:
@@ -404,52 +361,31 @@ def render_extracted_text(seg: dict) -> str:
             out.append(f"{prettify(k)}: {val}")
     return "\n".join(out)
 
-# ============================================================
-# FIELD VALIDATION (RESTORED)
-# ============================================================
-def is_field_value_valid(field: str, value: str) -> bool:
-    if not value:
-        return False
-
-    v = value.lower().strip()
-
-    if field == "insured_name":
-        if any(x in v for x in ["policy", "insurance"]):
-            return False
-        if any(c.isdigit() for c in value):
-            return False
-        return True
-
-    if field in ("effective_date", "expiration_date"):
-        return bool(re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", v))
-
-    if field in ("policy_number", "loan_number"):
-        return sum(c.isdigit() for c in value) >= 6
-
-    return True
-
 
 def classify_extracted_fields(seg_result: dict):
     fields = seg_result.get("fields", {})
     doc_type = seg_result.get("document_type", "OTH")
-    required = FIELD_RULES.get(doc_type, [])
+
+    # 🔁 FALLBACK LOGIC (RESTORES EARLIER BEHAVIOR)
+    required = FIELD_RULES.get(doc_type)
+    if not required:
+        required = list(fields.keys())
 
     perfect, partial, failed = [], [], []
 
     for f in required:
         data = fields.get(f)
-        value = data.get("value") if isinstance(data, dict) else data
+        value = data.get("value") if isinstance(data, dict) else None
 
         if not value:
             failed.append(f)
-        elif not is_field_value_valid(f, value):
+        elif isinstance(value, str) and not value.strip():
             partial.append(f)
         else:
             perfect.append(f)
 
     return perfect, partial, failed
-
-
+ 
 def draw_extraction_summary_tab(seg_result: dict):
     perfect, partial, failed = classify_extracted_fields(seg_result)
 
@@ -461,7 +397,9 @@ def draw_extraction_summary_tab(seg_result: dict):
     c3.metric("Failed", len(failed))
 
     total = len(perfect) + len(partial) + len(failed)
-    st.progress((len(perfect) + 0.5 * len(partial)) / total if total else 0)
+    st.progress(
+        (len(perfect) + 0.5 * len(partial)) / total if total else 0
+    )
 
     left, right = st.columns([1.2, 1])
 
@@ -481,12 +419,12 @@ def draw_extraction_summary_tab(seg_result: dict):
                 labels=["Perfect", "Partial", "Failed"],
                 autopct="%1.0f%%",
                 startangle=90,
-                colors=["#00ff00", "#ffff00", "#ff0000"],
             )
             ax.axis("equal")
             st.pyplot(fig)
         else:
             st.info("No fields to display")
+
 
 # ============================================================
 # HEADER
@@ -528,7 +466,7 @@ for f in st.session_state.files:
 
     col_img, col_out = st.columns([1, 1], gap="large")
 
-    # -------- PREVIEW (IMAGE-ONLY, OLD STYLE) --------
+    # -------- PREVIEW --------
     with col_img:
         st.markdown("### 📄 Document Preview")
         for i, img in enumerate(pages, 1):
@@ -544,40 +482,48 @@ for f in st.session_state.files:
             results = run_pipeline_batch(pages)
             result = merge_page_results(results)
 
-            doc_type = classify_document(result["raw_lines"])
-            policy_type = classify_policy(result["raw_lines"])
-
             seg = segregate_insurance_document(result["raw_lines"])
-            seg["document_type"] = doc_type
-            seg["policy_type"] = policy_type
-            seg["fields"] = merge_fields(result["fields"], seg.get("fields", {}))
+            seg["fields"] = result["fields"]
+            seg["document_type"] = classify_document(result["raw_lines"])
+            seg["policy_type"] = classify_policy(result["raw_lines"])
 
             elapsed = time.time() - start
 
         # -------- METRICS --------
-        acc = result["confidence"] * 100
-        pages_cnt = result["page_count"]
-
         m1, m2, m3 = st.columns(3)
-        m1.metric("📄 Pages", pages_cnt)
-        m2.metric("🎯 Accuracy (%)", f"{acc:.2f}")
+        m1.metric("📄 Pages", result["page_count"])
+        m2.metric("🎯 Accuracy (%)", f"{result['confidence']*100:.2f}")
         m3.metric("⚡ Time (s)", f"{elapsed:.2f}")
 
-        st.info(f"📄 **Document Type:** {doc_type}")
-        st.info(f"🔐 **Policy Type:** {policy_type}")
+        st.info(f"📄 **Document Type:** {seg['document_type']}")
+        st.info(f"🔐 **Policy Type:** {seg['policy_type']}")
 
-        # -------- TABS --------
+        # ======================================================
+        # ✅ REQUIRED TABS (THIS IS WHAT YOU ASKED FOR)
+        # ======================================================
         tab1, tab2, tab3 = st.tabs(
-            ["🧾 Extracted Fields", "📊 Extraction Summary", "📄 OCR Text"]
+            [
+                "🧾 Extracted Fields",
+                "📊 Extraction Summary",
+                "📄 OCR Text",
+            ]
         )
 
         with tab1:
-            st.text_area("Extracted Output", render_extracted_text(seg), height=500)
+            st.text_area(
+                "Extracted Output",
+                render_extracted_text(seg),
+                height=500,
+            )
 
         with tab2:
             draw_extraction_summary_tab(seg)
 
         with tab3:
-            st.text_area("OCR Output", "\n".join(result["raw_lines"]), height=500)
+            st.text_area(
+                "OCR Output",
+                "\n".join(result["raw_lines"]),
+                height=500,
+            )
 
 st.caption("")
