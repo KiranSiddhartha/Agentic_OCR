@@ -301,12 +301,13 @@
     
 #     return True
 
-
+##13/01/26
 """
-OCR Correction Agent
+OCR Correction Agent - MAXIMUM RECALL MODE
 Purpose:
 - Improve OCR quality BEFORE extraction
-- Remove obvious noise without destroying insurance content
+- PRESERVE ALL NUMBERS, AMOUNTS, CODES
+- Remove only extreme garbage
 - Fix common OCR mistakes (insurance-specific)
 - Preserve lines critical for downstream extraction
 
@@ -331,7 +332,7 @@ _ENABLE_LOGGING = False
 
 def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
     """
-    Main OCR correction entrypoint.
+    Main OCR correction entrypoint - MAXIMUM RECALL MODE.
     """
     global _ENABLE_LOGGING
     _ENABLE_LOGGING = debug
@@ -349,7 +350,7 @@ def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
         original = raw
         text = raw
 
-        # Stage 1 – remove obvious garbage
+        # Stage 1 – remove obvious garbage (RELAXED)
         text = _remove_garbled_text(text)
 
         # Stage 2 – dictionary-based OCR fixes
@@ -361,7 +362,7 @@ def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
         # Stage 4 – spacing cleanup
         text = re.sub(r"\s+", " ", text).strip()
 
-        # Stage 5 – line quality validation
+        # Stage 5 – line quality validation (VERY RELAXED)
         if _is_valid_line(text):
             corrected.append(text)
             _log(idx, original, text, "kept")
@@ -372,7 +373,7 @@ def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
 
 
 # ============================================================
-# NOISE REMOVAL (CAREFUL)
+# NOISE REMOVAL (MAXIMUM PRESERVATION)
 # ============================================================
 
 def _remove_garbled_text(text: str) -> str:
@@ -386,27 +387,55 @@ def _remove_garbled_text(text: str) -> str:
     clean_words = []
 
     for w in words:
+        # CRITICAL: PRESERVE ALL NUMBERS AND AMOUNTS
+        if any(c.isdigit() for c in w):
+            clean_words.append(w)
+            continue
+        
+        # PRESERVE PHONE NUMBERS
+        if re.match(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', w):
+            clean_words.append(w)
+            continue
+        
+        # PRESERVE POLICY/LOAN NUMBERS (6+ chars with 3+ digits)
+        if len(w) >= 6 and sum(c.isdigit() for c in w) >= 3:
+            clean_words.append(w)
+            continue
+        
+        # PRESERVE ZIP CODES
+        if re.match(r'^\d{5}(-\d{4})?$', w):
+            clean_words.append(w)
+            continue
+        
+        # PRESERVE AMOUNTS WITH $ OR ,
+        if '$' in w or ',' in w:
+            clean_words.append(w)
+            continue
+        
+        # Short words - always keep
         if len(w) <= 4:
             clean_words.append(w)
             continue
 
-        vowels = sum(1 for c in w.lower() if c in "aeiou")
-        ratio = vowels / max(len(w), 1)
+        # Check vowel ratio ONLY for long words (7+ chars)
+        if len(w) > 7:
+            vowels = sum(1 for c in w.lower() if c in "aeiou")
+            ratio = vowels / max(len(w), 1)
 
-        # RELAXED: remove only extreme garbage
-        if len(w) > 6 and ratio < 0.15:
-            _log_word(w, ratio)
-            continue
+            # VERY RELAXED: remove only if < 10% vowels AND no numbers
+            if ratio < 0.10 and not any(c.isdigit() for c in w):
+                _log_word(w, ratio)
+                continue
 
         clean_words.append(w)
 
     text = " ".join(clean_words)
 
-    # Character spam
-    text = re.sub(r'\b([a-z])\1{4,}\b', '', text, flags=re.I)
-    text = re.sub(r'[|]{2,}', '', text)
-    text = re.sub(r'_{3,}', '', text)
-    text = re.sub(r'\s[-]{2,}\s', ' ', text)
+    # Character spam (only extreme cases)
+    text = re.sub(r'\b([a-z])\1{5,}\b', '', text, flags=re.I)  # 5+ repeats
+    text = re.sub(r'[|]{3,}', '', text)  # 3+ pipes
+    text = re.sub(r'_{4,}', '', text)    # 4+ underscores
+    text = re.sub(r'\s[-]{3,}\s', ' ', text)  # 3+ dashes
 
     return text
 
@@ -420,7 +449,7 @@ def _apply_dictionary_fixes(text: str) -> str:
     for err, fix in OCR_FIXES.items():
         text = re.sub(rf"\b{re.escape(err)}\b", fix, text, flags=re.I)
 
-    # Insurance-specific fixes
+    # Insurance-specific fixes (ENCODING FIXED)
     INSURANCE_FIXES = {
         "po1icy": "policy",
         "po|icy": "policy",
@@ -430,7 +459,6 @@ def _apply_dictionary_fixes(text: str) -> str:
         "eoverage": "coverage",
         "covergae": "coverage",
         "premiurn": "premium",
-        "premíum": "premium",
         "dwe11ing": "dwelling",
         "dweliing": "dwelling",
         "mortage": "mortgage",
@@ -465,7 +493,7 @@ def _fix_char_confusions(text: str) -> str:
 
 
 # ============================================================
-# LINE QUALITY (RELAXED)
+# LINE QUALITY (MAXIMUM RELAXATION)
 # ============================================================
 
 def _is_valid_line(text: str) -> bool:
@@ -475,26 +503,33 @@ def _is_valid_line(text: str) -> bool:
     total = len(text)
     alnum = sum(c.isalnum() for c in text)
 
-    # RELAXED: allow low density lines
-    if alnum < total * 0.25:
+    # VERY RELAXED: allow ultra-low density lines
+    if alnum < total * 0.15:
         return False
 
+    # VERY RELAXED: allow high punctuation
     punct = sum(1 for c in text if c in ".,;:-_|/")
-    if punct > total * 0.60:
+    if punct > total * 0.75:
         return False
 
-    # Preserve insurance semantics
+    # ALWAYS PRESERVE lines with insurance keywords
     INSURANCE_KEYWORDS = [
         "policy", "insurance", "coverage", "premium", "deductible",
         "dwelling", "mortgage", "insured", "borrower", "loan",
         "effective", "expiration", "certificate", "carrier",
-        "property", "address", "amount", "number", "date"
+        "property", "address", "amount", "number", "date", "phone",
+        "agent", "producer", "code", "claim", "customer", "assistance"
     ]
 
     tl = text.lower()
     if any(k in tl for k in INSURANCE_KEYWORDS):
         return True
 
+    # ALWAYS PRESERVE lines with numbers (amounts, dates, codes)
+    if sum(c.isdigit() for c in text) >= 3:
+        return True
+
+    # Default: KEEP IT
     return True
 
 
@@ -532,7 +567,7 @@ def clear_correction_log():
 
 
 # ============================================================
-# FIELD-LEVEL HELPERS (OPTIONAL)
+# FIELD-LEVEL HELPERS
 # ============================================================
 
 def clean_field_value(value: str) -> str:

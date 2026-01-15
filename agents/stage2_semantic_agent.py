@@ -344,6 +344,20 @@ except Exception:
     _NLP = None
     SPACY_AVAILABLE = False
 
+# ============================================================
+# BACKWARD-COMPATIBILITY ALIAS (DO NOT REMOVE)
+# ============================================================
+
+def extract_with_ner(lines, missing_fields=None):
+    """
+    Legacy alias for older orchestrator imports.
+    Delegates to semantic_fill_missing_fields.
+    """
+    return semantic_fill_missing_fields(
+        lines=lines,
+        existing_fields={},
+        sections=None,
+    )
 
 # ============================================================
 # MAIN ENTRYPOINT
