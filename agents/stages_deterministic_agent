@@ -1,0 +1,367 @@
+
+# ============================================================ 
+##Deterministic Block-Based Extraction with Fallback Heuristics
+ 
+# import re
+# from typing import List, Dict, Optional
+
+# BLOCK_SCAN_LIMIT = 8
+
+# SECTION_HEADERS = {
+#     "coverage","coverages","limits","endorsement","endorsements",
+#     "forms","form number","deductible","premium","discount",
+#     "policy conditions","section"
+# }
+
+# POLICY_LABEL_RE = re.compile(r"\bpolicy\s*(no\.?|number|#)\b", re.I)
+
+# STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s*\d{5}(-\d{4})?\b")
+# STREET_RE = re.compile(
+#     r"\d+\s+.+\b(st|street|ave|avenue|rd|road|blvd|ln|lane|ct|court|dr|drive)\b",
+#     re.I,
+# )
+
+# # ============================================================
+# # HELPERS
+# # ============================================================
+
+# def _is_section_header(line: str) -> bool:
+#     return any(h in line.lower() for h in SECTION_HEADERS)
+
+# def _looks_like_address(line: str) -> bool:
+#     return "po box" in line.lower() or bool(STREET_RE.search(line) or STATE_ZIP_RE.search(line))
+
+# def _looks_like_name(line: str) -> bool:
+#     line = re.sub(r"\b(19|20)\d{2}\b", "", line).strip()
+#     if any(c.isdigit() for c in line):
+#         return False
+#     return 2 <= len(line.split()) <= 6
+
+# def _clean_policy_number(val: str) -> Optional[str]: 
+#     if not val:
+#         return None
+
+#     token = val.strip().split()[0]
+ 
+#     if re.match(r"\d{1,2}[/-]\d{1,2}[/-]\d{4}", token):
+#         return None
+ 
+#     if re.match(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}", token):
+#         return None
+ 
+#     if token.isdigit() and len(token) > 12:
+#         return None
+ 
+#     if 6 <= len(token) <= 15 and sum(c.isdigit() for c in token) >= 5:
+#         return token
+
+#     return None
+
+
+# # ============================================================
+# # BLOCK PARSERS
+# # ============================================================
+
+# def _parse_policy_block(lines: List[str], idx: int) -> Dict[str, Dict]:
+#     """
+#     FIX: scan FORWARD within block to find policy number
+#     """
+#     out = {}
+
+#     for j in range(idx, min(idx + BLOCK_SCAN_LIMIT, len(lines))):
+#         line = lines[j]
+
+#         # inline
+#         m = re.search(r"policy\s*(no\.?|number|#)\s*[:\-]?\s*(.+)", line, re.I)
+#         if m:
+#             val = _clean_policy_number(m.group(2))
+#             if val:
+#                 out["policy_number"] = {
+#                     "value": val,
+#                     "confidence": 0.99,
+#                     "source": "policy_block_scan",
+#                 }
+#                 return out
+#             continue
+
+#         # standalone numeric line
+#         val = _clean_policy_number(line)
+#         if val:
+#             out["policy_number"] = {
+#                 "value": val,
+#                 "confidence": 0.97,
+#                 "source": "policy_block_scan",
+#             }
+#             return out
+
+#     return out
+
+# def _parse_insured_block(lines: List[str], idx: int) -> Dict[str, Dict]:
+#     name, addr = [], []
+
+#     for j in range(idx + 1, min(idx + BLOCK_SCAN_LIMIT, len(lines))):
+#         line = lines[j].strip()
+#         if not line or _is_section_header(line):
+#             break
+#         if not addr and _looks_like_name(line):
+#             name.append(re.sub(r"\b(19|20)\d{2}\b", "", line).strip())
+#         elif _looks_like_address(line):
+#             addr.append(line)
+
+#     out = {}
+#     if name:
+#         out["insured_name"] = {"value": " ".join(name), "confidence": 0.94, "source": "insured_block"}
+#     if addr:
+#         out["mailing_address"] = {"value": " ".join(addr), "confidence": 0.92, "source": "insured_block"}
+#     return out
+
+# def _parse_property_address(lines: List[str], idx: int) -> Optional[Dict]:
+#     for j in range(idx + 1, min(idx + BLOCK_SCAN_LIMIT, len(lines))):
+#         if _looks_like_address(lines[j]):
+#             return {"value": lines[j], "confidence": 0.95, "source": "property_block"}
+#     return None
+
+# # ============================================================
+# # ENTRYPOINT
+# # ============================================================
+
+# def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
+#     clean = [l.strip() for l in lines if l.strip()]
+#     fields = {}
+
+#     for i, line in enumerate(clean):
+#         ll = line.lower()
+
+#         if POLICY_LABEL_RE.search(line):
+#             fields.update(_parse_policy_block(clean, i))
+
+#         if any(k in ll for k in ["named insured", "policyholder"]):
+#             fields.update(_parse_insured_block(clean, i))
+
+#         if "location of insured property" in ll or "property address" in ll:
+#             pa = _parse_property_address(clean, i)
+#             if pa:
+#                 fields["property_address"] = pa
+
+#     return fields
+
+
+# ============================================================
+###Keyword-Anchored Segmentation
+##with Constraint-Driven Validation and Optional Classical Layout Signals executed via a Stateful Role-Anchored Extractor
+"""
+Stage 1 – Stateful, Role-Anchored Deterministic Extraction
+=========================================================
+
+Sole authoritative extraction layer.
+
+Approach:
+- Keyword-anchored segmentation (header-only)
+- Stateful role tracking
+- Constraint-driven validation
+- Deterministic extraction only
+- Layout explicitly ignored
+"""
+
+import re
+from typing import List, Dict
+from enum import Enum, auto
+
+
+# ============================================================
+# ROLES (DOCUMENT STATES)
+# ============================================================
+
+class Role(Enum):
+    NONE = auto()
+    POLICY_HEADER = auto()
+    INSURED_BLOCK = auto()
+    MAILING_BLOCK = auto()
+    PROPERTY_BLOCK = auto()
+    MORTGAGE_BLOCK = auto()
+
+
+# ============================================================
+# HARD CONSTRAINT REGEX
+# ============================================================
+
+POLICY_RE = re.compile(r"\b[A-Z0-9\-]{6,15}\b")
+PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+DATE_RE = re.compile(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}")
+CURRENCY_RE = re.compile(r"\$\d")
+
+STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s*\d{5}(-\d{4})?\b")
+STREET_RE = re.compile(
+    r"\d+\s+.+\b(st|street|ave|avenue|rd|road|blvd|lane|ln|drive|dr|ct|court)\b",
+    re.I,
+)
+
+SECTION_BREAKERS = {
+    "coverage", "coverages", "limits", "endorsement",
+    "deductible", "premium", "forms", "conditions", "section"
+}
+
+HEADER_RE = re.compile(r"^[A-Z][A-Z\s/&\-]{3,}$|:$", re.I)
+
+
+# ============================================================
+# VALIDATORS
+# ============================================================
+
+def valid_policy(val: str) -> bool:
+    if PHONE_RE.search(val) or DATE_RE.search(val) or CURRENCY_RE.search(val):
+        return False
+    digits = sum(c.isdigit() for c in val)
+    return 6 <= len(val) <= 15 and digits >= 4
+
+
+def valid_name(line: str) -> bool:
+    if any(c.isdigit() for c in line):
+        return False
+    words = line.split()
+    return 2 <= len(words) <= 6
+
+
+def valid_address(line: str) -> bool:
+    return bool(
+        STREET_RE.search(line)
+        or STATE_ZIP_RE.search(line)
+        or "po box" in line.lower()
+    )
+
+
+def looks_like_header(line: str) -> bool:
+    return bool(HEADER_RE.search(line.strip()))
+
+
+# ============================================================
+# STATEFUL EXTRACTOR
+# ============================================================
+
+class StatefulExtractor:
+    def __init__(self):
+        self.role = Role.NONE
+        self.fields: Dict[str, Dict] = {}
+        self._buffer: List[str] = []
+
+    # ----------------------------
+    # ROLE TRANSITIONS (HEADER-ONLY)
+    # ----------------------------
+
+    def update_role(self, line: str):
+        ll = line.lower().strip()
+
+        if "policy number" in ll and looks_like_header(line):
+            self._flush_buffer()
+            self.role = Role.POLICY_HEADER
+
+        elif ("named insured" in ll or "policyholder" in ll) and looks_like_header(line):
+            self._flush_buffer()
+            self.role = Role.INSURED_BLOCK
+
+        elif "mailing address" in ll and looks_like_header(line):
+            self._flush_buffer()
+            self.role = Role.MAILING_BLOCK
+
+        elif (
+            ("location of insured property" in ll or "property address" in ll)
+            and looks_like_header(line)
+        ):
+            self._flush_buffer()
+            self.role = Role.PROPERTY_BLOCK
+
+        elif ("mortgage" in ll or "loss payee" in ll) and looks_like_header(line):
+            self._flush_buffer()
+            self.role = Role.MORTGAGE_BLOCK
+
+        elif any(h in ll for h in SECTION_BREAKERS) and looks_like_header(line):
+            self._flush_buffer()
+            self.role = Role.NONE
+
+    # ----------------------------
+    # EXTRACTION BY ROLE
+    # ----------------------------
+
+    def extract(self, line: str):
+        if self.role == Role.POLICY_HEADER:
+            self._extract_policy(line)
+
+        elif self.role == Role.INSURED_BLOCK:
+            self._extract_insured(line)
+
+        elif self.role in {Role.MAILING_BLOCK, Role.PROPERTY_BLOCK}:
+            self._buffer.append(line)
+
+    # ----------------------------
+    # FIELD EXTRACTORS
+    # ----------------------------
+
+    def _extract_policy(self, line: str):
+        if "policy_number" in self.fields:
+            return
+
+        for t in re.findall(POLICY_RE, line):
+            if valid_policy(t):
+                self.fields["policy_number"] = {
+                    "value": t,
+                    "confidence": 0.99,
+                    "source": "policy_header",
+                }
+                return
+
+    def _extract_insured(self, line: str):
+        if "insured_name" in self.fields:
+            return
+        if valid_name(line):
+            self.fields["insured_name"] = {
+                "value": line,
+                "confidence": 0.95,
+                "source": "insured_block",
+            }
+
+    def _flush_buffer(self):
+        if not self._buffer:
+            return
+
+        combined = " ".join(self._buffer).strip()
+
+        if self.role == Role.MAILING_BLOCK and "mailing_address" not in self.fields:
+            if valid_address(combined):
+                self.fields["mailing_address"] = {
+                    "value": combined,
+                    "confidence": 0.93,
+                    "source": "mailing_block",
+                }
+
+        elif self.role == Role.PROPERTY_BLOCK and "property_address" not in self.fields:
+            if valid_address(combined):
+                self.fields["property_address"] = {
+                    "value": combined,
+                    "confidence": 0.96,
+                    "source": "property_block",
+                }
+
+        self._buffer.clear()
+
+
+# ============================================================
+# PUBLIC ENTRY POINT
+# ============================================================
+
+def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
+    """
+    SINGLE authoritative extraction entry point.
+    Layout is intentionally ignored.
+    """
+    extractor = StatefulExtractor()
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        extractor.update_role(line)
+        extractor.extract(line)
+
+    extractor._flush_buffer()
+    return extractor.fields

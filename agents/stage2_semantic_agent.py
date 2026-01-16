@@ -304,175 +304,202 @@
 #     return None
 
  
+"""
+Stage 2 – Semantic Gap Filler (NON-AUTHORITATIVE)
+================================================
+
+Purpose:
+- Fill ONLY fields missing after Stage 1
+- Semantic assistance only (NER / heuristics)
+- NEVER override Stage-1 output
+- Penalized confidence
+- Stateless
+
+Stage 1 owns truth.
+Stage 2 proposes candidates only.
+"""
+
+from typing import List, Dict
 import re
-from typing import Dict, List, Optional
-
-#  """
-# Stage 2 – Semantic Agent
-# Purpose: Fill ONLY missing fields with low-confidence semantic hints.
-
-# Rules:
-# - Never override existing fields
-# - Never act as authority
-# - Never normalize values
-# - Validation agent decides final acceptance
-# """
 
 # ============================================================
-# ALLOWED FIELDS (STRICT)
-# ============================================================
-
-ALLOWED_FIELDS = {
-    "insured_name",
-    "mailing_address",
-    "property_address",
-    "mortgage",
-    "loan_number",
-    "effective_date",
-    "expiration_date",
-}
-
-# ============================================================
-# OPTIONAL SPACY SUPPORT
+# OPTIONAL SPACY SUPPORT (LAZY)
 # ============================================================
 
 try:
     import spacy
-    _NLP = spacy.load("en_core_web_sm")
+    _NLP = None
     SPACY_AVAILABLE = True
 except Exception:
-    _NLP = None
     SPACY_AVAILABLE = False
+    _NLP = None
+
 
 # ============================================================
-# BACKWARD-COMPATIBILITY ALIAS (DO NOT REMOVE)
+# HARD CONSTRAINT VALIDATORS (REUSED LOGIC)
 # ============================================================
 
-def extract_with_ner(lines, missing_fields=None):
-    """
-    Legacy alias for older orchestrator imports.
-    Delegates to semantic_fill_missing_fields.
-    """
-    return semantic_fill_missing_fields(
-        lines=lines,
-        existing_fields={},
-        sections=None,
+def _valid_name(text: str) -> bool:
+    if not text:
+        return False
+    if any(c.isdigit() for c in text):
+        return False
+    words = text.split()
+    return 2 <= len(words) <= 6
+
+
+def _valid_address(text: str) -> bool:
+    if not text:
+        return False
+    if not any(c.isdigit() for c in text):
+        return False
+    if len(text) < 10:
+        return False
+    return True
+
+
+def _valid_currency(text: str) -> bool:
+    return bool(re.search(r"\$\s?\d", text))
+
+
+def _valid_date(text: str) -> bool:
+    return bool(
+        re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", text)
+        or re.search(r"[A-Z][a-z]+ \d{1,2}, \d{4}", text)
     )
 
+
 # ============================================================
-# MAIN ENTRYPOINT
+# PUBLIC ENTRY POINT (USED BY ORCHESTRATOR)
 # ============================================================
 
-def semantic_fill_missing_fields(
+def extract_with_ner(
     lines: List[str],
-    existing_fields: Dict[str, Dict],
-    sections: Optional[Dict[str, List[str]]] = None,
+    missing_fields: List[str],
 ) -> Dict[str, Dict]:
     """
-    Fill missing fields using semantic heuristics.
-    Never overrides existing_fields.
+    Extract semantic candidates for MISSING fields ONLY.
     """
+    if not lines or not missing_fields:
+        return {}
 
     results: Dict[str, Dict] = {}
 
-    missing = ALLOWED_FIELDS - set(existing_fields.keys())
-    if not missing:
-        return results
+    nlp = _load_spacy() if SPACY_AVAILABLE else None
 
-    # Prefer section-scoped lines when available
-    insured_lines = (sections or {}).get("insured", lines)
-    property_lines = (sections or {}).get("property", lines)
-    mortgage_lines = (sections or {}).get("mortgage", lines)
-
-    if "insured_name" in missing:
-        val = _semantic_insured_name(insured_lines)
-        if val:
-            results["insured_name"] = val
-
-    if "mailing_address" in missing:
-        val = _semantic_address(insured_lines)
-        if val:
-            results["mailing_address"] = val
-
-    if "property_address" in missing:
-        val = _semantic_address(property_lines)
-        if val:
-            results["property_address"] = val
-
-    if "mortgage" in missing:
-        val = _semantic_mortgage(mortgage_lines)
-        if val:
-            results["mortgage"] = val
-
-    if "loan_number" in missing:
-        val = _semantic_loan_number(mortgage_lines)
-        if val:
-            results["loan_number"] = val
-
-    if "effective_date" in missing:
-        val = _semantic_date(lines, keyword="effective")
-        if val:
-            results["effective_date"] = val
-
-    if "expiration_date" in missing:
-        val = _semantic_date(lines, keyword="expiration")
-        if val:
-            results["expiration_date"] = val
+    if nlp:
+        results.update(_extract_with_spacy(lines, missing_fields, nlp))
+    else:
+        results.update(_extract_with_rules(lines, missing_fields))
 
     return results
 
 
 # ============================================================
-# SEMANTIC HELPERS (LOW CONFIDENCE)
+# SPACY-BASED EXTRACTION
 # ============================================================
 
-def _semantic_insured_name(lines: List[str]) -> Optional[Dict]:
-    for l in lines:
-        if ":" in l or l.endswith("."):
+def _load_spacy():
+    global _NLP
+    if _NLP is None:
+        try:
+            _NLP = spacy.load("en_core_web_sm")
+        except Exception:
+            return None
+    return _NLP
+
+
+def _extract_with_spacy(
+    lines: List[str],
+    missing_fields: List[str],
+    nlp,
+) -> Dict[str, Dict]:
+
+    text = "\n".join(lines)
+    doc = nlp(text)
+    out: Dict[str, Dict] = {}
+
+    for ent in doc.ents:
+        # -------- INSURED NAME --------
+        if ent.label_ in {"PERSON", "ORG"} and "insured_name" in missing_fields:
+            if _valid_name(ent.text):
+                out["insured_name"] = _candidate(ent.text, "semantic_ner", 0.75)
+                break
+
+        # -------- ADDRESS --------
+        if ent.label_ in {"GPE", "LOC"}:
+            if "mailing_address" in missing_fields or "property_address" in missing_fields:
+                if _valid_address(ent.text):
+                    field = (
+                        "mailing_address"
+                        if "mailing_address" in missing_fields
+                        else "property_address"
+                    )
+                    out[field] = _candidate(ent.text, "semantic_ner", 0.72)
+                    break
+
+        # -------- DATES --------
+        if ent.label_ == "DATE":
+            if "effective_date" in missing_fields and _valid_date(ent.text):
+                out["effective_date"] = _candidate(ent.text, "semantic_ner", 0.70)
+            elif "expiration_date" in missing_fields and _valid_date(ent.text):
+                out["expiration_date"] = _candidate(ent.text, "semantic_ner", 0.70)
+
+        # -------- MONEY --------
+        if ent.label_ == "MONEY" and "total_premium" in missing_fields:
+            if _valid_currency(ent.text):
+                out["total_premium"] = _candidate(ent.text, "semantic_ner", 0.75)
+
+    return out
+
+
+# ============================================================
+# RULE-BASED FALLBACK (NO NER)
+# ============================================================
+
+def _extract_with_rules(
+    lines: List[str],
+    missing_fields: List[str],
+) -> Dict[str, Dict]:
+
+    out: Dict[str, Dict] = {}
+
+    for line in lines:
+        # -------- INSURED NAME --------
+        if "insured_name" in missing_fields and _valid_name(line):
+            out["insured_name"] = _candidate(line, "semantic_rules", 0.70)
             continue
-        if any(char.isdigit() for char in l):
-            continue
-        words = l.strip().split()
-        if 2 <= len(words) <= 6:
-            return {"value": l.strip(), "confidence": 0.72}
-    return None
 
-
-def _semantic_address(lines: List[str]) -> Optional[Dict]:
-    for l in lines:
-        ll = l.lower()
-        if "po box" in ll:
-            return {"value": l.strip(), "confidence": 0.70}
-        if re.search(r"\d+.*\b[A-Z]{2}\b.*\d{5}", l):
-            return {"value": l.strip(), "confidence": 0.72}
-    return None
-
-
-def _semantic_mortgage(lines: List[str]) -> Optional[Dict]:
-    for l in lines:
-        ll = l.lower()
-        if any(k in ll for k in ["mortgage", "lender", "bank", "isaoa", "atima"]):
-            if len(l.split()) >= 2 and not l.endswith("."):
-                return {"value": l.strip(), "confidence": 0.70}
-    return None
-
-
-def _semantic_loan_number(lines: List[str]) -> Optional[Dict]:
-    for l in lines:
-        m = re.search(r"\b\d{5,}\b", l)
-        if m:
-            return {"value": m.group(0), "confidence": 0.68}
-    return None
-
-
-def _semantic_date(lines: List[str], keyword: str) -> Optional[Dict]:
-    for l in lines:
-        ll = l.lower()
-        if keyword in ll and "date" in ll:
-            matches = re.findall(
-                r"\b(?:\d{1,2}/\d{1,2}/\d{4}|[A-Z][a-z]+ \d{1,2}, \d{4})\b",
-                l,
+        # -------- ADDRESS --------
+        if (
+            ("mailing_address" in missing_fields or "property_address" in missing_fields)
+            and _valid_address(line)
+        ):
+            field = (
+                "mailing_address"
+                if "mailing_address" in missing_fields
+                else "property_address"
             )
-            if matches:
-                return {"value": matches[0], "confidence": 0.70}
-    return None
+            out[field] = _candidate(line, "semantic_rules", 0.68)
+            continue
+
+        # -------- PREMIUM --------
+        if "total_premium" in missing_fields and _valid_currency(line):
+            out["total_premium"] = _candidate(line, "semantic_rules", 0.72)
+
+    return out
+
+
+# ============================================================
+# CANDIDATE BUILDER (CONFIDENCE CAPPED)
+# ============================================================
+
+def _candidate(value: str, source: str, confidence: float) -> Dict:
+    """
+    Build a semantic candidate with enforced confidence ceiling.
+    """
+    return {
+        "value": value.strip(),
+        "confidence": min(confidence, 0.80),
+        "source": source,
+    }
