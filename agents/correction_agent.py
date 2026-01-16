@@ -301,15 +301,16 @@
     
 #     return True
 
-##13/01/26
 """
-OCR Correction Agent - MAXIMUM RECALL MODE
+OCR Correction Agent – MAXIMUM RECALL MODE
+========================================
+
 Purpose:
-- Improve OCR quality BEFORE extraction
-- PRESERVE ALL NUMBERS, AMOUNTS, CODES
+- Improve OCR quality BEFORE deterministic extraction
+- Preserve ALL keyword anchors required by Stage 1
+- Preserve line order
 - Remove only extreme garbage
-- Fix common OCR mistakes (insurance-specific)
-- Preserve lines critical for downstream extraction
+- Never infer, normalize meaning, or extract fields
 
 This agent MUST run before stage1_deterministic_agent.
 """
@@ -330,9 +331,13 @@ _CORRECTION_LOG: List[Dict] = []
 _ENABLE_LOGGING = False
 
 
+# ============================================================
+# PUBLIC ENTRYPOINT
+# ============================================================
+
 def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
     """
-    Main OCR correction entrypoint - MAXIMUM RECALL MODE.
+    Main OCR correction entrypoint – Stage-1 SAFE.
     """
     global _ENABLE_LOGGING
     _ENABLE_LOGGING = debug
@@ -347,95 +352,102 @@ def correct_lines(lines: List[str], debug: bool = False) -> List[str]:
         if not raw or not raw.strip():
             continue
 
-        original = raw
-        text = raw
+        original = raw.rstrip()
+        text = original
 
-        # Stage 1 – remove obvious garbage (RELAXED)
+        # --- Stage 1: extreme garbage removal only ---
         text = _remove_garbled_text(text)
 
-        # Stage 2 – dictionary-based OCR fixes
+        # --- Stage 2: dictionary OCR fixes (insurance-safe) ---
         text = _apply_dictionary_fixes(text)
 
-        # Stage 3 – character-level corrections
+        # --- Stage 3: character confusions ---
         text = _fix_char_confusions(text)
 
-        # Stage 4 – spacing cleanup
-        text = re.sub(r"\s+", " ", text).strip()
+        # --- Stage 4: spacing (DO NOT REMOVE COLONS) ---
+        text = re.sub(r"[ \t]+", " ", text).strip()
 
-        # Stage 5 – line quality validation (VERY RELAXED)
-        if _is_valid_line(text):
-            corrected.append(text)
-            _log(idx, original, text, "kept")
+        # --- Stage 5: line retention decision ---
+        final = _choose_best(original, text)
+
+        if _is_valid_line(final):
+            corrected.append(final)
+            _log(idx, original, final, "kept")
         else:
-            _log(idx, original, text, "removed_noise")
+            _log(idx, original, final, "removed_noise")
 
     return corrected
 
 
 # ============================================================
-# NOISE REMOVAL (MAXIMUM PRESERVATION)
+# SAFETY: KEEP BEST VERSION
+# ============================================================
+
+def _choose_best(original: str, cleaned: str) -> str:
+    """
+    Preserve anchors: if cleaning removed digits, colons,
+    or insurance keywords, keep original.
+    """
+    if ":" in original and ":" not in cleaned:
+        return original
+
+    if sum(c.isdigit() for c in cleaned) < sum(c.isdigit() for c in original):
+        return original
+
+    KEYWORDS = (
+        "policy", "insured", "property", "mailing", "address",
+        "mortgage", "premium", "coverage", "effective", "expiration"
+    )
+
+    ol = original.lower()
+    cl = cleaned.lower()
+
+    if any(k in ol and k not in cl for k in KEYWORDS):
+        return original
+
+    return cleaned
+
+
+# ============================================================
+# NOISE REMOVAL (EXTREME ONLY)
 # ============================================================
 
 def _remove_garbled_text(text: str) -> str:
     if not text:
         return ""
 
-    # Repeated nonsense tokens (aen aen aen)
+    # repeated nonsense tokens (aen aen aen)
     text = re.sub(r'\b([a-z]{2,3})\s+\1\s+\1\b', '', text, flags=re.I)
 
     words = text.split()
-    clean_words = []
+    kept = []
 
     for w in words:
-        # CRITICAL: PRESERVE ALL NUMBERS AND AMOUNTS
+        # ALWAYS preserve anything with digits
         if any(c.isdigit() for c in w):
-            clean_words.append(w)
-            continue
-        
-        # PRESERVE PHONE NUMBERS
-        if re.match(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', w):
-            clean_words.append(w)
-            continue
-        
-        # PRESERVE POLICY/LOAN NUMBERS (6+ chars with 3+ digits)
-        if len(w) >= 6 and sum(c.isdigit() for c in w) >= 3:
-            clean_words.append(w)
-            continue
-        
-        # PRESERVE ZIP CODES
-        if re.match(r'^\d{5}(-\d{4})?$', w):
-            clean_words.append(w)
-            continue
-        
-        # PRESERVE AMOUNTS WITH $ OR ,
-        if '$' in w or ',' in w:
-            clean_words.append(w)
-            continue
-        
-        # Short words - always keep
-        if len(w) <= 4:
-            clean_words.append(w)
+            kept.append(w)
             continue
 
-        # Check vowel ratio ONLY for long words (7+ chars)
+        # ALWAYS preserve short words
+        if len(w) <= 4:
+            kept.append(w)
+            continue
+
+        # Long nonsense words only
         if len(w) > 7:
             vowels = sum(1 for c in w.lower() if c in "aeiou")
-            ratio = vowels / max(len(w), 1)
-
-            # VERY RELAXED: remove only if < 10% vowels AND no numbers
-            if ratio < 0.10 and not any(c.isdigit() for c in w):
-                _log_word(w, ratio)
+            if vowels / len(w) < 0.10:
+                _log_word(w)
                 continue
 
-        clean_words.append(w)
+        kept.append(w)
 
-    text = " ".join(clean_words)
+    text = " ".join(kept)
 
-    # Character spam (only extreme cases)
-    text = re.sub(r'\b([a-z])\1{5,}\b', '', text, flags=re.I)  # 5+ repeats
-    text = re.sub(r'[|]{3,}', '', text)  # 3+ pipes
-    text = re.sub(r'_{4,}', '', text)    # 4+ underscores
-    text = re.sub(r'\s[-]{3,}\s', ' ', text)  # 3+ dashes
+    # Extreme spam only
+    text = re.sub(r'\b([a-z])\1{5,}\b', '', text, flags=re.I)
+    text = re.sub(r'[|]{3,}', '', text)
+    text = re.sub(r'_{4,}', '', text)
 
     return text
 
@@ -445,29 +457,19 @@ def _remove_garbled_text(text: str) -> str:
 # ============================================================
 
 def _apply_dictionary_fixes(text: str) -> str:
-    # Generic OCR dictionary
     for err, fix in OCR_FIXES.items():
         text = re.sub(rf"\b{re.escape(err)}\b", fix, text, flags=re.I)
 
-    # Insurance-specific fixes (ENCODING FIXED)
     INSURANCE_FIXES = {
         "po1icy": "policy",
-        "po|icy": "policy",
         "pollcy": "policy",
         "insuranee": "insurance",
-        "insuronce": "insurance",
-        "eoverage": "coverage",
         "covergae": "coverage",
         "premiurn": "premium",
-        "dwe11ing": "dwelling",
-        "dweliing": "dwelling",
         "mortage": "mortgage",
-        "mortgagee": "mortgage",
         "efective": "effective",
         "expriration": "expiration",
         "deductib1e": "deductible",
-        "deductibie": "deductible",
-        "certificat": "certificate",
     }
 
     for err, fix in INSURANCE_FIXES.items():
@@ -477,59 +479,31 @@ def _apply_dictionary_fixes(text: str) -> str:
 
 
 def _fix_char_confusions(text: str) -> str:
-    # Digits inside numbers
     text = re.sub(r'(?<=\d)[Oo](?=\d)', '0', text)
     text = re.sub(r'(?<=\d)[Il](?=\d)', '1', text)
-
-    # Letters inside words
     text = re.sub(r'(?<=[A-Za-z])0(?=[A-Za-z])', 'o', text)
     text = re.sub(r'(?<=[A-Za-z])1(?=[A-Za-z])', 'l', text)
-
-    # Punctuation spam
-    text = re.sub(r',,+', ',', text)
-    text = re.sub(r'\.\.+', '.', text)
-
     return text
 
 
 # ============================================================
-# LINE QUALITY (MAXIMUM RELAXATION)
+# LINE QUALITY (STAGE-1 SAFE)
 # ============================================================
 
 def _is_valid_line(text: str) -> bool:
     if not text or len(text) < 2:
         return False
 
+    # ALWAYS keep headers
+    if text.endswith(":") or text.isupper():
+        return True
+
     total = len(text)
     alnum = sum(c.isalnum() for c in text)
 
-    # VERY RELAXED: allow ultra-low density lines
     if alnum < total * 0.15:
         return False
 
-    # VERY RELAXED: allow high punctuation
-    punct = sum(1 for c in text if c in ".,;:-_|/")
-    if punct > total * 0.75:
-        return False
-
-    # ALWAYS PRESERVE lines with insurance keywords
-    INSURANCE_KEYWORDS = [
-        "policy", "insurance", "coverage", "premium", "deductible",
-        "dwelling", "mortgage", "insured", "borrower", "loan",
-        "effective", "expiration", "certificate", "carrier",
-        "property", "address", "amount", "number", "date", "phone",
-        "agent", "producer", "code", "claim", "customer", "assistance"
-    ]
-
-    tl = text.lower()
-    if any(k in tl for k in INSURANCE_KEYWORDS):
-        return True
-
-    # ALWAYS PRESERVE lines with numbers (amounts, dates, codes)
-    if sum(c.isdigit() for c in text) >= 3:
-        return True
-
-    # Default: KEEP IT
     return True
 
 
@@ -538,24 +512,21 @@ def _is_valid_line(text: str) -> bool:
 # ============================================================
 
 def _log(idx, original, corrected, action):
-    if not _ENABLE_LOGGING:
-        return
-    _CORRECTION_LOG.append({
-        "line": idx,
-        "original": original,
-        "corrected": corrected,
-        "action": action,
-    })
+    if _ENABLE_LOGGING:
+        _CORRECTION_LOG.append({
+            "line": idx,
+            "original": original,
+            "corrected": corrected,
+            "action": action,
+        })
 
 
-def _log_word(word, ratio):
-    if not _ENABLE_LOGGING:
-        return
-    _CORRECTION_LOG.append({
-        "word": word,
-        "vowel_ratio": round(ratio, 3),
-        "action": "removed_low_vowels",
-    })
+def _log_word(word):
+    if _ENABLE_LOGGING:
+        _CORRECTION_LOG.append({
+            "word": word,
+            "action": "removed_noise",
+        })
 
 
 def get_correction_log() -> List[Dict]:
@@ -564,38 +535,3 @@ def get_correction_log() -> List[Dict]:
 
 def clear_correction_log():
     _CORRECTION_LOG.clear()
-
-
-# ============================================================
-# FIELD-LEVEL HELPERS
-# ============================================================
-
-def clean_field_value(value: str) -> str:
-    if not value:
-        return ""
-    value = value.strip().strip("|_-").rstrip(".,;:")
-    value = re.sub(r"\s+", " ", value)
-    return value
-
-
-def validate_extracted_value(field: str, value: str) -> bool:
-    if not value or len(value) < 2:
-        return False
-
-    if field == "policy_number":
-        return sum(c.isdigit() for c in value) >= 3
-
-    if field in {"insured_name", "carrier", "agent"}:
-        return not any(c.isdigit() for c in value)
-
-    if "date" in field:
-        return bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', value)
-                    or re.search(r'[A-Z][a-z]+ \d{1,2}, \d{4}', value))
-
-    if "address" in field:
-        return any(c.isdigit() for c in value)
-
-    if field in {"total_premium", "balance_due", "deductible", "dwelling_coverage"}:
-        return sum(c.isdigit() for c in value) >= 1
-
-    return True
