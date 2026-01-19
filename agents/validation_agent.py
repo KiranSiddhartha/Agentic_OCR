@@ -1,7 +1,6 @@
 """
-Stage 4 – Validation & Normalization Agent (FINAL AUTHORITY)
-===========================================================
-
+Stage 4 – Validation & Arbitration Agent (FINAL AUTHORITY)
+=========================================================
 Responsibilities:
 - Value sanity (reject headers / junk / placeholders)
 - Field-specific normalization
@@ -12,6 +11,7 @@ Responsibilities:
 import re
 from datetime import datetime
 from typing import Dict, Tuple
+
 
 # ============================================================
 # CONFIDENCE FLOORS (BUSINESS RULES)
@@ -34,6 +34,7 @@ CONFIDENCE_FLOORS = {
 }
 
 DEFAULT_FLOOR = 0.75
+
 
 # ============================================================
 # GLOBAL BLOCK LISTS
@@ -78,6 +79,7 @@ PREFIX_STRIP = [
     "name:",
 ]
 
+
 # ============================================================
 # HEADER / LABEL DETECTION
 # ============================================================
@@ -98,7 +100,8 @@ def _is_section_header_value(value: str) -> bool:
     if l.endswith(":") and len(l.split()) <= 5:
         return True
 
-    return False 
+    return False
+
 
 # ============================================================
 # NORMALIZATION HELPERS
@@ -127,15 +130,28 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
         return False, v, 0.0
     return True, v.upper(), 0.95
 
+POLICY_RE = re.compile(r"\b[A-Z0-9][A-Z0-9\- ]{5,20}\b")
+PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+DATE_RE = re.compile(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}")
+CURRENCY_RE = re.compile(r"\$\s?\d")
+ZIP_RE = re.compile(r"\b\d{5}(-\d{4})?\b")
 
-def validate_policy_number(value: str) -> Tuple[bool, str, float]:
+def validate_policy_number(value: str):
     v = value.strip()
-    if _is_section_header_value(v) or v.lower() in JUNK_VALUES:
-        return False, v, 0.0
-    if sum(c.isdigit() for c in v) < 5:
-        return False, v, 0.0
-    return True, v, 0.95
 
+    if _is_section_header_value(v):
+        return False, v, 0.0
+
+    if PHONE_RE.search(v):
+        return False, v, 0.0
+
+    if ZIP_RE.search(v):
+        return False, v, 0.0
+
+    if sum(c.isdigit() for c in v) < 6:
+        return False, v, 0.0
+
+    return True, v, 0.95  
 
 def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     v = value.strip()
@@ -149,32 +165,46 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
 def validate_name(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(value)
 
-    # NEW: header / label rejection
     if _is_section_header_value(v):
         return False, v, 0.0
 
-    if any(w in v.lower() for w in ["named insured", "insured name", "mailing address"]):
+    if ":" in v:
+        return False, v, 0.0
+
+    if any(w in v.lower() for w in (
+        "named insured",
+        "insured name",
+        "mailing address",
+        "policy type",
+        "coverage",
+        "deductible",
+    )):
         return False, v, 0.0
 
     if any(c.isdigit() for c in v) or len(v.split()) < 2:
         return False, v, 0.0
 
     return True, v, 0.95
-    
+
 
 def validate_address(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
+
     if _is_section_header_value(v) or v.lower() in JUNK_VALUES:
         return False, v, 0.0
+
     if not re.search(r"\d+.*\b[A-Z]{2}\b.*\d{5}", v):
         return False, v, 0.0
+
     return True, v, 0.95
 
 
 def validate_date(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
+
     if _is_section_header_value(v):
         return False, v, 0.0
+
     for fmt in ("%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m-%d-%Y"):
         try:
             dt = datetime.strptime(v, fmt)
@@ -182,6 +212,7 @@ def validate_date(value: str) -> Tuple[bool, str, float]:
                 return True, v, 0.95
         except ValueError:
             continue
+
     return False, v, 0.0
 
 
@@ -264,7 +295,7 @@ def validate_and_arbitrate(
         3,
     )
 
-    return validated, final_confidence 
+    return validated, final_confidence
 
 # ============================================================
 # BACKWARD COMPATIBILITY
