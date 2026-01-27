@@ -10,6 +10,7 @@ import time
 import matplotlib.pyplot as plt
 import re
 import numpy as np
+import time
 
 # ============================================================
 # PATH FIX
@@ -286,7 +287,8 @@ for f in st.session_state.files:
                 "Extracted Output",
                 render_extracted_text(seg),
                 height=500,
-                key=f"extracted_output_{ f.name }"
+                # key=f"extracted_output_{ f.name }"
+                key=f"extracted_output_{f.name}_{i}_{int(time.time()*1000)}"
             )
 
         with tab2:

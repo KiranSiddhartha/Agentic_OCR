@@ -1,1271 +1,14 @@
-# # stage1_deterministic_agent.py
-# """
-# Stage 1 – Stateful, Role-Anchored Deterministic Extraction
-# Authoritative extraction layer with multi-line carrier support
-# ENHANCED VERSION with mortgage, loan, and better validation
-# """
-# import re
-# from typing import Dict, List
-# from enum import Enum, auto
-
-# # ============================================================
-# # ROLES
-# # ============================================================
-
-# class Role(Enum):
-#     NONE = auto()
-#     POLICY_HEADER = auto()
-#     INSURED_BLOCK = auto()
-#     PROPERTY_BLOCK = auto()
-#     MORTGAGE_BLOCK = auto()  # NEW
-
-# # ============================================================
-# # REGEX PATTERNS (ENHANCED)
-# # ============================================================
-
-# POLICY_RE = re.compile(r'\b[A-Z0-9]{2}[A-Z0-9\-]{5,28}\b')  # More strict
-# DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
-# LOAN_RE = re.compile(r"\b\d{8,15}\b")
-# PHONE_RE = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')  # NEW
-
-# STREET_RE = re.compile(
-#     r"\b\d{1,6}\s+.+?\b("
-#     r"st|street|ave|avenue|rd|road|blvd|boulevard|"
-#     r"ln|lane|dr|drive|ct|court|cir|circle|way|pkwy|ridge"
-#     r")\b",
-#     re.I,
-# )
-
-# # ============================================================
-# # BLOCKLISTS
-# # ============================================================
-
-# BAD_NAME_PHRASES = {
-#     "our duties", "policy conditions", "building owner", "coverage",
-#     "mortgagee", "loss payment", "appraisal", "endorsement",
-#     "conditions", "deductible", "liability", "policy type",
-# }
-# BAD_NAME_PHRASES.update({
-#     "property protection",
-#     "coverage",
-#     "form number",
-#     "endorsement",
-#     "policy conditions",
-#     "deductible",
-# })
-
-# # ============================================================
-# # HELPER FUNCTIONS (ENHANCED)
-# # ============================================================
-
-# def _clean(v: str) -> str:
-#     return re.sub(r"\s+", " ", v).strip(" ,.;:")
-
-# def _normalize_name(v: str) -> str:
-#     v = v.replace("0", "O")  # OCR fix
-#     v = v.strip()
-#     if "," in v:
-#         parts = [p.strip() for p in v.split(",") if p.strip()]
-#         if len(parts) == 2:
-#             return f"{parts[1]} {parts[0]}"
-#     return v
-
-# def _is_phone_number(v: str) -> bool:
-#     """Check if value is a phone number - CRITICAL NEW FUNCTION"""
-#     digits_only = ''.join(c for c in v if c.isdigit())
-    
-#     # Exactly 10 digits = phone number
-#     if len(digits_only) == 10:
-#         return True
-    
-#     # Exactly 7 digits = phone number (last 7)
-#     if len(digits_only) == 7:
-#         return True
-    
-#     # Has phone formatting
-#     if PHONE_RE.search(v):
-#         return True
-    
-#     return False
-
-# def _looks_like_name(text: str) -> bool:
-#     if not text:
-#         return False
-    
-#     t = text.strip()
-#     ll = t.lower()
-    
-#     if any(b in ll for b in BAD_NAME_PHRASES):
-#         return False
-    
-#     # Allow entities with digits (LLC, Corp)
-#     has_entity = any(w in ll for w in ["llc", "inc", "corp", "company", "trust", "ltd"])
-#     if not has_entity and any(c.isdigit() for c in t):
-#         return False
-    
-#     words = t.replace(",", "").split()
-#     if has_entity:
-#         if not (2 <= len(words) <= 10):
-#             return False
-#     else:
-#         if not (2 <= len(words) <= 8):
-#             return False
-    
-#     caps = sum(1 for w in words if w and w[0].isupper())
-#     if caps < 2:
-#         return False
-    
-#     return True
-
-# def _looks_like_policy(v: str) -> bool:
-#     """Enhanced policy number validation - COMPLETELY REWRITTEN"""
-#     v_clean = v.replace(" ", "").replace("-", "")
-    
-#     # CRITICAL: BLOCK phone numbers FIRST
-#     if _is_phone_number(v):
-#         return False
-    
-#     # BLOCK dates
-#     if DATE_RE.search(v):
-#         return False
-    
-#     # BLOCK pure year references
-#     if v_clean.isdigit() and len(v_clean) == 4 and v_clean.startswith(('19', '20')):
-#         return False
-    
-#     # BLOCK ZIP codes
-#     if v_clean.isdigit() and len(v_clean) == 5:
-#         return False
-    
-#     # Allow pure numeric if 8-12 digits (common format)
-#     if v_clean.isdigit() and 8 <= len(v_clean) <= 12:
-#         return True
-    
-#     # Must have mix of letters and numbers
-#     has_letters = any(c.isalpha() for c in v_clean)
-#     has_digits = any(c.isdigit() for c in v_clean)
-    
-#     if not (has_letters and has_digits):
-#         return False
-    
-#     # Length check
-#     if not (7 <= len(v_clean) <= 30):
-#         return False
-    
-#     # Must have substantial digits (at least 5)
-#     digit_count = sum(c.isdigit() for c in v_clean)
-#     if digit_count < 5:
-#         return False
-    
-#     return bool(POLICY_RE.fullmatch(v_clean))
-
-# def _looks_like_carrier_part(line: str) -> bool:
-#     """Check if line could be part of carrier name"""
-#     t = line.upper().replace("*", "").strip()
-    
-#     if not t or len(t) < 4:
-#         return False
-    
-#     # Block agencies FIRST
-#     if any(w in t for w in ("AGENCY", "AGENT", "CENTER", "LLC", "INC", "SERVICES")):
-#         return False
-    
-#     # Direct insurance keywords
-#     if any(w in t for w in ("INSURANCE", "EXCHANGE", "COMPANY", "CORPORATION", "GROUP", "MUTUAL")):
-#         return True
-    
-#     # All-caps word (like ADIRONDACK)
-#     if t.isupper() and not any(c.isdigit() for c in t):
-#         noise = {"PAGE", "DATE", "POLICY", "NUMBER", "INSURED", "ADDRESS", "NOTICE", "LOCATED", "DESCRIPTION"}
-#         if not any(w in t for w in noise):
-#             words = t.split()
-#             if 1 <= len(words) <= 3 and all(len(w) >= 3 for w in words):
-#                 return True
-    
-#     return False
-
-# def _looks_like_carrier(line: str) -> bool:
-#     """Check if complete line is a carrier name"""
-#     t = line.upper()
-    
-#     if "INSURANCE" not in t:
-#         return False
-    
-#     if not any(w in t for w in ("COMPANY", "EXCHANGE", "GROUP", "CORPORATION", "MUTUAL")):
-#         return False
-    
-#     # Block agencies
-#     if any(w in t for w in ("AGENCY", "AGENT", "CENTER", "LLC", "INC")):
-#         return False
-    
-#     return 2 <= len(t.split()) <= 10
-
-# def _is_skippable_line_for_carrier(line: str) -> bool:
-#     """Lines to skip during carrier accumulation (PO Box, addresses)"""
-#     ll = line.lower().strip()
-    
-#     if "po box" in ll or "p.o. box" in ll:
-#         return True
-    
-#     # City/state/zip pattern
-#     if re.match(r"^[a-zA-Z\s,]+,?\s*[A-Z]{2}\s*\d{5}(-\d{4})?$", line.strip()):
-#         return True
-    
-#     return False
-
-# def _looks_like_address(line: str) -> bool:
-#     if "po box" in line.lower():
-#         return False
-#     return bool(STREET_RE.search(line))
-
-# # ============================================================
-# # STATEFUL EXTRACTOR (ENHANCED)
-# # ============================================================
-
-# class StatefulExtractor:
-#     def __init__(self):
-#         self.role = Role.NONE
-#         self.window = 0
-#         self.fields: Dict[str, Dict] = {}
-#         self.carrier_parts: List[str] = []
-
-#     def update_role(self, line: str):
-#         ll = line.lower().strip()
-
-#         # Policy header
-#         if any(k in ll for k in (
-#                 "policy number",
-#                 "policy no",
-#                 "dwelling policy number",
-#             )):
-#             self.role = Role.POLICY_HEADER
-#             self.window = 6
-#             return
-
-#         # Insured block
-#         if any(k in ll for k in (
-#             "insured",
-#             "named insured",
-#             "policyholder/named insured",
-#             "insured mailing",
-#             "insured mailing name",
-#             "insured mailing name and address",
-#             "policyholder/insured",
-#         )):
-#             self.role = Role.INSURED_BLOCK
-#             self.window = 10
-#             return
-
-
-#         # Property block
-#         if any(k in ll for k in (
-#             "property address",
-#             "property insured",
-#             "location of insured property",
-#             "description of property",
-#             "coverage detail for",
-#         )):
-#             self.role = Role.PROPERTY_BLOCK
-#             self.window = 6
-#             return
-
-        
-#         # Mortgage block (NEW)
-#         if any(k in ll for k in ("mortgagee", "loss payee", "lender", 
-#                                  "mortgage company", "other interested parties")):
-#             self.role = Role.MORTGAGE_BLOCK
-#             self.window = 8
-#             return
-
-#     def extract(self, line: str):
-#         if not line:
-#             return
-
-#         # ALWAYS check for carrier parts (multi-line support)
-#         self._capture_carrier_part(line)
-
-#         # Inline extraction (high priority)
-#         self._inline(line)
-
-#         # Role-based extraction
-#         if self.window > 0:
-#             if self.role == Role.POLICY_HEADER:
-#                 self._policy(line)
-#             elif self.role == Role.INSURED_BLOCK:
-#                 self._insured(line)
-#             elif self.role == Role.PROPERTY_BLOCK:
-#                 self._property(line)
-#             elif self.role == Role.MORTGAGE_BLOCK:  # NEW
-#                 self._mortgage(line)
-
-#             self.window -= 1
-#             if self.window == 0:
-#                 self.role = Role.NONE
-
-#     def _capture_carrier_part(self, line: str):
-#         """Accumulate carrier name parts across lines"""
-#         if "carrier_name" in self.fields:
-#             return
-
-#         clean = line.replace("*", "").strip()
-        
-#         if _looks_like_carrier_part(clean):
-#             self.carrier_parts.append(clean)
-            
-#             # Check if we have complete carrier
-#             combined = " ".join(self.carrier_parts)
-#             if _looks_like_carrier(combined):
-#                 self.fields["carrier_name"] = {
-#                     "value": combined.upper(),
-#                     "confidence": 0.99,
-#                     "source": "stage1_carrier_multiline",
-#                 }
-#                 self.carrier_parts = []
-#         else:
-#             # Skip PO Box lines without resetting
-#             if _is_skippable_line_for_carrier(clean):
-#                 return
-#             # Reset if we hit non-carrier, non-skippable line
-#             if self.carrier_parts and not _looks_like_carrier_part(clean):
-#                 self._finalize_carrier()
-
-#     def _finalize_carrier(self):
-#         """Finalize accumulated carrier parts"""
-#         if self.carrier_parts and "carrier_name" not in self.fields:
-#             combined = " ".join(self.carrier_parts)
-#             if "INSURANCE" in combined.upper():
-#                 self.fields["carrier_name"] = {
-#                     "value": combined.upper(),
-#                     "confidence": 0.95,
-#                     "source": "stage1_carrier_accumulated",
-#                 }
-#         self.carrier_parts = []
-
-#     def _inline(self, line: str):
-#         """Extract from inline patterns (Label: Value) - ENHANCED"""
-#         ll = line.lower()
-
-#         # Policy Underwritten By: ADIRONDACK INSURANCE EXCHANGE
-#         if "carrier_name" not in self.fields and "underwritten by" in ll and ":" in line:
-#             _, _, v = line.partition(":")
-#             v = v.strip()
-#             if v and "INSURANCE" in v.upper():
-#                 self.fields["carrier_name"] = {
-#                     "value": v.upper(),
-#                     "confidence": 0.99,
-#                     "source": "stage1_carrier_underwritten_by",
-#                 }
-
-#         # Policy Number: 2004939477
-#         if "policy_number" not in self.fields and any(k in ll for k in ("policy number", "policy no")): 
-#             _, _, v = line.partition(":")
-#             # v = _clean(v).replace(" ", "")
-#             v = _clean(v)
-#             v = re.sub(r"\s+(\d)$", r"-\1", v)  # Fix split suffix
-#             v = v.replace(" ", "")
-
-#             if _looks_like_policy(v):
-#                 self.fields["policy_number"] = {
-#                     "value": v,
-#                     "confidence": 0.99,
-#                     "source": "stage1_policy_inline",
-#                 }
-
-#         # Named insured: Heather A Babcock
-#         if "insured_name" not in self.fields and ":" in line:
-#             label, _, value = line.partition(":")
-#             label_lower = label.lower().strip()
-#             if label_lower in ("insured", "named insured"):
-#                 v = _normalize_name(value)
-#                 if _looks_like_name(v):
-#                     self.fields["insured_name"] = {
-#                         "value": v,
-#                         "confidence": 0.99,
-#                         "source": "stage1_insured_inline",
-#                     }
-
-#         # Loan Number (CRITICAL - NEW)
-#         if "loan_number" not in self.fields:
-#             # Pattern 1: "Loan Number: 12345678"
-#             if "loan" in ll and "number" in ll and ":" in line:
-#                 _, _, v = line.partition(":")
-#                 v_clean = ''.join(c for c in v if c.isdigit())
-#                 if LOAN_RE.fullmatch(v_clean):
-#                     self.fields["loan_number"] = {
-#                         "value": v_clean,
-#                         "confidence": 0.96,
-#                         "source": "stage1_loan_inline",
-#                     }
-            
-#             # Pattern 2: Scan for 8-15 digit sequences in loan context
-#             # elif "loan" in ll:
-#             #     for token in line.split():
-#             #         digits = ''.join(c for c in token if c.isdigit())
-#             #         if LOAN_RE.fullmatch(digits) and not _is_phone_number(token):
-#             #             self.fields["loan_number"] = {
-#             #                 "value": digits,
-#             #                 "confidence": 0.93,
-#             #                 "source": "stage1_loan_context",
-#             #             }
-#             #             break
-
-#     def _policy(self, line: str):
-#         if "policy_number" in self.fields:
-#             return
-        
-#         for token in line.split():
-#             if _looks_like_policy(token):
-#                 self.fields["policy_number"] = {
-#                     "value": token,
-#                     "confidence": 0.96,
-#                     "source": "stage1_policy_block",
-#                 }
-#                 return
-
-#     def _insured(self, line: str):
-#         """Extract insured name from INSURED block"""
-#         ll = line.lower().strip()
-
-#         # Skip obvious non-name lines
-#         if any(x in ll for x in ("po box", "policy period", "loan number", 
-#                                   "policy type", "description", "coverage")):
-#             return
-
-#         # Try to extract name
-#         if "insured_name" not in self.fields:
-#             candidate = _normalize_name(line)
-#             if _looks_like_name(candidate):
-#                 self.fields["insured_name"] = {
-#                     "value": candidate,
-#                     "confidence": 0.98,
-#                     "source": "stage1_insured_block",
-#                 }
-#                 return
-
-#         # Also capture property address if found
-#         if "property_address" not in self.fields and _looks_like_address(line):
-#             self.fields["property_address"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.97,
-#                 "source": "stage1_property_from_insured",
-#             }
-
-#     def _property(self, line: str):
-#         if "property_address" in self.fields:
-#             return
-        
-#         if _looks_like_address(line):
-#             self.fields["property_address"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.98,
-#                 "source": "stage1_property_block",
-#             }
-    
-#     def _mortgage(self, line: str):
-#         """Extract mortgage company and loan number in MORTGAGE block"""
-#         ll = line.lower().strip()
-
-#         # Skip junk / structural lines
-#         if any(k in ll for k in (
-#             "type of interest",
-#             "interest:",
-#             "mortgagee certificate",
-#             "this is not a bill",
-#             "policy conditions",
-#             "coverage",
-#         )):
-#             return
-
-#         # =========================
-#         # Mortgage Company
-#         # =========================
-#         if "mortgage_company" not in self.fields:
-#             clean = line.strip()
-
-#             # Strip common prefixes
-#             for prefix in (
-#                 "1.", "2.", "first mortgage:", "second mortgage:",
-#                 "mortgagee:", "mortgagee full name:"
-#             ):
-#                 if clean.lower().startswith(prefix.lower()):
-#                     clean = clean[len(prefix):].strip()
-
-#             cl = clean.lower()
-
-#             # HARD BLOCK insurers & noise
-#             if any(w in cl for w in (
-#                 "insurance", "exchange", "group", "policy", "endorsement",
-#                 "isaoa", "atima", "loan number", "p.o. box", "po box"
-#             )):
-#                 pass
-#             elif _looks_like_name(clean):
-#                 self.fields["mortgage_company"] = {
-#                     "value": clean,
-#                     "confidence": 0.92,
-#                     "source": "stage1_mortgage_block",
-#                 }
-
-#         # =========================
-#         # Loan Number (STRICT)
-#         # =========================
-#         if "loan_number" not in self.fields:
-#             for token in line.split():
-#                 digits = ''.join(c for c in token if c.isdigit())
-#                 if (
-#                     LOAN_RE.fullmatch(digits)
-#                     and not _is_phone_number(token)
-#                     and len(digits) >= 8
-#                 ):
-#                     self.fields["loan_number"] = {
-#                         "value": digits,
-#                         "confidence": 0.94,
-#                         "source": "stage1_loan_mortgage_block",
-#                     }
-#                     break
-
-
-# # ============================================================
-# # SAFE SWEEP (Fallback extraction) - ENHANCED
-# # ============================================================
-
-# def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
-#     """Final pass to catch missed fields"""
-#     REQUIRED_FIELDS = {"policy_number", "insured_name", "property_address"}
-
-#     if REQUIRED_FIELDS.issubset(fields.keys()):
-#         return
-#     for i, line in enumerate(lines):
-#         ll = line.lower().strip()
-
-#         # =========================================================
-#         # Carrier name (multi-line)
-#         # =========================================================
-#         if "carrier_name" not in fields:
-#             clean = line.replace("*", "").strip()
-#             if _looks_like_carrier_part(clean):
-#                 parts = [clean]
-#                 for j in range(i + 1, min(i + 6, len(lines))):
-#                     next_clean = lines[j].replace("*", "").strip()
-#                     if _looks_like_carrier_part(next_clean):
-#                         parts.append(next_clean)
-#                         combined = " ".join(parts)
-#                         if _looks_like_carrier(combined):
-#                             fields["carrier_name"] = {
-#                                 "value": combined.upper(),
-#                                 "confidence": 0.93,
-#                                 "source": "stage1_sweep_carrier",
-#                             }
-#                             break
-#                     elif _is_skippable_line_for_carrier(next_clean):
-#                         continue
-#                     else:
-#                         break
-
-#         # =========================================================
-#         # Insured name (label → next line)
-#         # =========================================================
-#         if "insured_name" not in fields:
-#             if ll in (
-#                 "insured",
-#                 "named insured",
-#                 "insured name",
-#                 "insured mailing",
-#                 "insured mailing name",
-#                 "insured name and address",
-#                 "policyholder/named insured",
-#             ):
-#                 if i + 1 < len(lines):
-#                     v = _normalize_name(lines[i + 1])
-#                     if _looks_like_name(v):
-#                         fields["insured_name"] = {
-#                             "value": v,
-#                             "confidence": 0.88,
-#                             "source": "stage1_sweep_insured",
-#                         }
-
-#         # =========================================================
-#         # Policy number
-#         # =========================================================
-#         if "policy_number" not in fields and "policy number" in ll and ":" in line:
-#             _, _, v = line.partition(":")
-#             v = v.replace(" ", "").strip()
-#             if _looks_like_policy(v):
-#                 fields["policy_number"] = {
-#                     "value": v,
-#                     "confidence": 0.88,
-#                     "source": "stage1_sweep_policy",
-#                 }
-
-#         # =========================================================
-#         # Property address (triggered block-based)
-#         # =========================================================
-#         if "property_address" not in fields:
-#             if any(k in ll for k in (
-#                 "coverage detail for",
-#                 "location",
-#                 "described location",
-#                 "residence premises",
-#             )):
-#                 for j in range(i + 1, min(i + 4, len(lines))):
-#                     if _looks_like_address(lines[j]):
-#                         fields["property_address"] = {
-#                             "value": lines[j].strip(),
-#                             "confidence": 0.83,
-#                             "source": "stage1_sweep_property_block",
-#                         }
-#                         break
-
-# # ============================================================
-# # MAIN ENTRY POINT
-# # ============================================================
-
-# def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     """
-#     Main extraction entry point
-    
-#     Args:
-#         lines: List of text lines from OCR
-#         layout_elements: Optional layout information (unused)
-    
-#     Returns:
-#         Dictionary of extracted fields with confidence scores
-#     """
-#     if not lines:
-#         return {}
-    
-#     extractor = StatefulExtractor()
-
-#     # Process each line
-#     for raw in lines:
-#         line = raw.strip()
-#         if line:
-#             extractor.update_role(line)
-#             extractor.extract(line)
-
-#     # Finalize any accumulated carrier parts
-#     extractor._finalize_carrier()
-    
-#     # Final sweep for missed fields
-#     _safe_sweep(lines, extractor.fields)
-    
-#     return extractor.fields
-
-# # Backward compatibility
-# def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     """Legacy function name for backward compatibility"""
-#     return extract_fields(lines, layout_elements)
-
-#2nd
-# # stage1_deterministic_agent.py
-# """
-# Stage 1 – Stateful, Role-Anchored Deterministic Extraction
-# Authoritative extraction layer with multi-line carrier support
-# ENHANCED VERSION with mortgage, loan, and better validation
-# """
-# import re
-# from typing import Dict, List
-# from enum import Enum, auto
-
-# # ============================================================
-# # ROLES
-# # ============================================================
-
-# class Role(Enum):
-#     NONE = auto()
-#     POLICY_HEADER = auto()
-#     INSURED_BLOCK = auto()
-#     PROPERTY_BLOCK = auto()
-#     MORTGAGE_BLOCK = auto()
-
-# # ============================================================
-# # REGEX PATTERNS
-# # ============================================================
-
-# POLICY_RE = re.compile(r'\b[A-Z0-9]{2}[A-Z0-9\-]{5,28}\b')
-# DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
-# LOAN_RE = re.compile(r"\b\d{8,15}\b")
-# PHONE_RE = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
-
-# STREET_RE = re.compile(
-#     r"\b\d{1,6}\s+.+?\b("
-#     r"st|street|ave|avenue|rd|road|blvd|boulevard|"
-#     r"ln|lane|dr|drive|ct|court|cir|circle|way|pkwy|ridge"
-#     r")\b",
-#     re.I,
-# )
-
-# # ============================================================
-# # BLOCKLISTS
-# # ============================================================
-
-# BAD_NAME_PHRASES = {
-#     "our duties", "policy conditions", "building owner", "coverage",
-#     "mortgagee", "loss payment", "appraisal", "endorsement",
-#     "conditions", "deductible", "liability", "policy type",
-#     "property protection", "form number",
-# }
-
-# BAD_MORTGAGE_PRODUCTS = {
-#     "ultrapack", "package", "homeowners", "dwelling", "policy"
-# }
-
-# # ============================================================
-# # HELPERS
-# # ============================================================
-
-# def _clean(v: str) -> str:
-#     return re.sub(r"\s+", " ", v).strip(" ,.;:")
-
-# def _normalize_name(v: str) -> str:
-#     v = v.replace("0", "O").strip()
-#     if "," in v:
-#         parts = [p.strip() for p in v.split(",") if p.strip()]
-#         if len(parts) == 2:
-#             return f"{parts[1]} {parts[0]}"
-#     return v
-
-# def _is_phone_number(v: str) -> bool:
-#     digits = ''.join(c for c in v if c.isdigit())
-#     return len(digits) in (7, 10) or bool(PHONE_RE.search(v))
-
-# def _looks_like_name(text: str) -> bool:
-#     if not text:
-#         return False
-#     t = text.strip()
-#     ll = t.lower()
-#     if any(b in ll for b in BAD_NAME_PHRASES):
-#         return False
-#     has_entity = any(w in ll for w in ("llc", "inc", "corp", "company", "trust", "ltd"))
-#     if not has_entity and any(c.isdigit() for c in t):
-#         return False
-#     words = t.replace(",", "").split()
-#     caps = sum(1 for w in words if w and w[0].isupper())
-#     return 2 <= len(words) <= 10 and caps >= 2
-
-# def _looks_like_policy(v: str) -> bool:
-#     v = v.replace(" ", "").replace("-", "")
-#     if _is_phone_number(v):
-#         return False
-#     if DATE_RE.search(v):
-#         return False
-#     if v.isdigit() and len(v) in (4, 5):
-#         return False
-#     if v.isdigit() and 8 <= len(v) <= 12:
-#         return True
-#     return bool(POLICY_RE.fullmatch(v))
-
-# def _looks_like_carrier_part(line: str) -> bool:
-#     t = line.upper().strip("* ").strip()
-#     if len(t) < 4:
-#         return False
-#     if any(w in t for w in ("AGENCY", "AGENT", "CENTER", "LLC", "INC", "SERVICES")):
-#         return False
-#     return any(w in t for w in ("INSURANCE", "EXCHANGE", "COMPANY", "GROUP", "MUTUAL")) or t.isupper()
-
-# def _looks_like_carrier(line: str) -> bool:
-#     t = line.upper()
-#     return "INSURANCE" in t and not any(w in t for w in ("AGENCY", "AGENT", "CENTER"))
-
-# def _is_skippable_line_for_carrier(line: str) -> bool:
-#     ll = line.lower()
-#     return "po box" in ll or bool(re.match(r".+,\s*[A-Z]{2}\s*\d{5}", line))
-
-# def _looks_like_address(line: str) -> bool:
-#     return "po box" not in line.lower() and bool(STREET_RE.search(line))
-
-# # ============================================================
-# # STATEFUL EXTRACTOR
-# # ============================================================
-
-# class StatefulExtractor:
-#     def __init__(self):
-#         self.role = Role.NONE
-#         self.window = 0
-#         self.fields: Dict[str, Dict] = {}
-#         self.carrier_parts: List[str] = []
-
-#     def update_role(self, line: str):
-#         ll = line.lower()
-#         if "policy number" in ll:
-#             self.role, self.window = Role.POLICY_HEADER, 6
-#         elif "insured" in ll:
-#             self.role, self.window = Role.INSURED_BLOCK, 10
-#         elif "coverage detail for" in ll or "location" in ll:
-#             self.role, self.window = Role.PROPERTY_BLOCK, 6
-#         elif any(k in ll for k in ("mortgagee", "loss payee", "lender")):
-#             self.role, self.window = Role.MORTGAGE_BLOCK, 8
-
-#     def extract(self, line: str):
-#         self._capture_carrier_part(line)
-#         self._inline(line)
-#         if self.window > 0:
-#             if self.role == Role.POLICY_HEADER:
-#                 self._policy(line)
-#             elif self.role == Role.INSURED_BLOCK:
-#                 self._insured(line)
-#             elif self.role == Role.PROPERTY_BLOCK:
-#                 self._property(line)
-#             elif self.role == Role.MORTGAGE_BLOCK:
-#                 self._mortgage(line)
-#             self.window -= 1
-
-#     def _capture_carrier_part(self, line: str):
-#         if "carrier_name" in self.fields:
-#             return
-#         clean = line.strip("* ").strip()
-#         if _looks_like_carrier_part(clean):
-#             self.carrier_parts.append(clean)
-#             combined = " ".join(self.carrier_parts)
-#             if _looks_like_carrier(combined):
-#                 self.fields["carrier_name"] = {
-#                     "value": combined.upper(),
-#                     "confidence": 0.99,
-#                     "source": "stage1_carrier_multiline",
-#                 }
-#                 self.carrier_parts.clear()
-#         elif self.carrier_parts and not _is_skippable_line_for_carrier(clean):
-#             self.carrier_parts.clear()
-
-#     def _inline(self, line: str):
-#         ll = line.lower()
-
-#         if "policy number" in ll and ":" in line and "policy_number" not in self.fields:
-#             v = _clean(line.split(":", 1)[1])
-#             if _looks_like_policy(v):
-#                 self.fields["policy_number"] = {"value": v, "confidence": 0.99, "source": "inline"}
-
-#         if "insured" in ll and ":" in line and "insured_name" not in self.fields:
-#             v = _normalize_name(line.split(":", 1)[1])
-#             if _looks_like_name(v):
-#                 self.fields["insured_name"] = {"value": v, "confidence": 0.99, "source": "inline"}
-
-#         if "loan number" in ll and ":" in line and "loan_number" not in self.fields:
-#             digits = ''.join(c for c in line if c.isdigit())
-#             if LOAN_RE.fullmatch(digits):
-#                 self.fields["loan_number"] = {"value": digits, "confidence": 0.96, "source": "inline"}
-
-#     def _policy(self, line: str):
-#         for t in line.split():
-#             if _looks_like_policy(t):
-#                 self.fields.setdefault("policy_number", {
-#                     "value": t, "confidence": 0.96, "source": "block"
-#                 })
-
-#     def _insured(self, line: str):
-#         if "insured_name" not in self.fields:
-#             v = _normalize_name(line)
-#             if _looks_like_name(v):
-#                 self.fields["insured_name"] = {"value": v, "confidence": 0.98, "source": "block"}
-
-#     def _property(self, line: str):
-#         if "property_address" not in self.fields and _looks_like_address(line):
-#             self.fields["property_address"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.98,
-#                 "source": "block",
-#             }
-
-#     def _mortgage(self, line: str):
-#         cl = line.lower()
-
-#         if any(x in cl for x in BAD_MORTGAGE_PRODUCTS):
-#             return
-
-#         if "mortgage_company" not in self.fields and _looks_like_name(line):
-#             self.fields["mortgage_company"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.92,
-#                 "source": "block",
-#             }
-
-#         if "loan_number" not in self.fields:
-#             for t in line.split():
-#                 d = ''.join(c for c in t if c.isdigit())
-#                 if LOAN_RE.fullmatch(d) and not _is_phone_number(t):
-#                     self.fields["loan_number"] = {
-#                         "value": d,
-#                         "confidence": 0.94,
-#                         "source": "block",
-#                     }
-
-# # ============================================================
-# # SAFE SWEEP
-# # ============================================================
-
-# def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
-#     for i, line in enumerate(lines):
-#         ll = line.lower()
-
-#         if "insured_name" not in fields and ":" in line and "insured" in ll:
-#             v = _normalize_name(line.split(":", 1)[1])
-#             if _looks_like_name(v):
-#                 fields["insured_name"] = {"value": v, "confidence": 0.88, "source": "sweep"}
-
-#         if "property_address" not in fields and any(k in ll for k in (
-#             "coverage detail for", "location", "described location"
-#         )):
-#             tail = ll.split("for", 1)[-1]
-#             if _looks_like_address(tail):
-#                 fields["property_address"] = {
-#                     "value": tail.strip(),
-#                     "confidence": 0.86,
-#                     "source": "sweep",
-#                 }
-
-# # ============================================================
-# # ENTRY POINT
-# # ============================================================
-
-# def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     extractor = StatefulExtractor()
-#     for line in lines:
-#         line = line.strip()
-#         if line:
-#             extractor.update_role(line)
-#             extractor.extract(line)
-#     _safe_sweep(lines, extractor.fields)
-#     return extractor.fields
-
-# def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     return extract_fields(lines, layout_elements)
-
-# #3rd
-# # stage1_deterministic_agent.py
-# """
-# Stage 1 – Stateful, Role-Anchored Deterministic Extraction
-# Supports RNW / CAN / INV / DOI / PQ / COI / HO / HO6 / HAZ / FIR / FLD / LL / WIND
-# """
-
-# import re
-# from typing import Dict, List
-# from enum import Enum, auto
-
-# # ============================================================
-# # ROLES
-# # ============================================================
-
-# class Role(Enum):
-#     NONE = auto()
-#     POLICY_HEADER = auto()
-#     INSURED_BLOCK = auto()
-#     PROPERTY_BLOCK = auto()
-#     MORTGAGE_BLOCK = auto()
-
-# # ============================================================
-# # REGEX
-# # ============================================================
-
-# POLICY_RE = re.compile(r"\b[A-Z0-9]{2}[A-Z0-9\-]{5,28}\b")
-# DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
-# LOAN_RE = re.compile(r"\b\d{8,15}\b")
-# PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-
-# POLICY_REGEX_VARIANTS = [
-#     re.compile(r"\b[A-Z]{1,4}[-\s]?\d{6,12}\b"),
-#     re.compile(r"\b[A-Z]{2,6}\s?\d{7,12}[-]?\d?\b"),
-#     re.compile(r"\b\d{8,12}\b"),
-#     POLICY_RE,
-# ]
-
-# STREET_RE = re.compile(
-#     r"\b\d{1,6}\s+.+?\b("
-#     r"st|street|ave|avenue|rd|road|blvd|boulevard|"
-#     r"ln|lane|dr|drive|ct|court|cir|circle|way|pkwy|ridge"
-#     r")\b",
-#     re.I,
-# )
-
-# # ============================================================
-# # MASTER KEYWORD LISTS (ALL TEMPLATES)
-# # ============================================================
-
-# POLICY_LABELS = {
-#     "policy number", "policy no", "policy #", "policy id",
-#     "dwelling policy number", "dwelling fire policy number",
-#     "homeowners policy number", "amended policy number",
-#     "renewal policy number", "previous policy number",
-#     "policy declarations",
-# }
-
-# INSURED_LABELS = {
-#     "insured", "named insured", "insured name",
-#     "insured name and address",
-#     "insured mailing", "insured mailing name",
-#     "insured mailing name and address",
-#     "policyholder", "policyholder/insured",
-#     "policyholder/named insured",
-# }
-
-# PROPERTY_TRIGGERS = {
-#     "property address",
-#     "property insured",
-#     "location of insured property",
-#     "coverage detail for",
-#     "described location",
-#     "location id described location",
-#     "residence premises",
-#     "located at",
-#     "address:",
-# }
-
-# MORTGAGE_TRIGGERS = {
-#     "mortgagee",
-#     "mortgagee full name",
-#     "mortgagee mailing name and address",
-#     "loss payee",
-#     "loss payee, mortgagee or other interest",
-#     "other interest",
-#     "other interested parties",
-#     "lender",
-#     "mortgage company",
-#     "mortgagee copy",
-# }
-
-# LOAN_LABELS = {
-#     "loan number", "loan no", "loan #",
-#     "mortgage loan number", "account number",
-# }
-
-# BAD_NAME_PHRASES = {
-#     "our duties", "policy conditions", "coverage", "endorsement",
-#     "deductible", "liability", "property protection",
-#     "form number", "loss payment", "mortgagee certificate",
-#     "policy period", "coverage limits", "forms and endorsements",
-# }
-
-# BAD_MORTGAGE_PRODUCTS = {
-#     "ultrapack", "package", "homeowners", "dwelling",
-#     "special package", "policy", "endorsement", "insurance",
-# }
-
-# # ============================================================
-# # HELPERS
-# # ============================================================
-
-# def _clean(v: str) -> str:
-#     return re.sub(r"\s+", " ", v).strip(" ,.;:")
-
-# def _normalize_name(v: str) -> str:
-#     v = v.replace("0", "O").strip()
-#     if "," in v:
-#         p = [x.strip() for x in v.split(",") if x.strip()]
-#         if len(p) == 2:
-#             return f"{p[1]} {p[0]}"
-#     return v
-
-# def _is_phone_number(v: str) -> bool:
-#     digits = ''.join(c for c in v if c.isdigit())
-#     return len(digits) in (7, 10) or bool(PHONE_RE.search(v))
-
-# def _looks_like_name(text: str) -> bool:
-#     if not text:
-#         return False
-#     ll = text.lower()
-#     if any(b in ll for b in BAD_NAME_PHRASES):
-#         return False
-#     if any(c.isdigit() for c in text) and not any(
-#         w in ll for w in ("llc", "inc", "corp", "company", "trust", "ltd")
-#     ):
-#         return False
-#     words = text.replace(",", "").split()
-#     caps = sum(1 for w in words if w and w[0].isupper())
-#     return 2 <= len(words) <= 10 and caps >= 2
-
-# def _looks_like_policy(v: str) -> bool:
-#     v = v.replace(" ", "").replace("-", "")
-#     if _is_phone_number(v) or DATE_RE.search(v):
-#         return False
-#     if v.isdigit() and len(v) in (4, 5):
-#         return False
-#     for rx in POLICY_REGEX_VARIANTS:
-#         if rx.fullmatch(v):
-#             return True
-#     return False
-
-# def _looks_like_address(line: str) -> bool:
-#     return "po box" not in line.lower() and bool(STREET_RE.search(line))
-
-# # ============================================================
-# # STATEFUL EXTRACTOR
-# # ============================================================
-
-# class StatefulExtractor:
-#     def __init__(self):
-#         self.role = Role.NONE
-#         self.window = 0
-#         self.fields: Dict[str, Dict] = {}
-
-#     def update_role(self, line: str):
-#         ll = line.lower()
-
-#         if any(k in ll for k in POLICY_LABELS):
-#             self.role, self.window = Role.POLICY_HEADER, 6
-#         elif any(k in ll for k in INSURED_LABELS):
-#             self.role, self.window = Role.INSURED_BLOCK, 10
-#         elif any(k in ll for k in PROPERTY_TRIGGERS):
-#             self.role, self.window = Role.PROPERTY_BLOCK, 6
-#         elif any(k in ll for k in MORTGAGE_TRIGGERS):
-#             self.role, self.window = Role.MORTGAGE_BLOCK, 8
-
-#     def extract(self, line: str):
-#         self._inline(line)
-
-#         if self.window > 0:
-#             if self.role == Role.POLICY_HEADER:
-#                 self._policy(line)
-#             elif self.role == Role.INSURED_BLOCK:
-#                 self._insured(line)
-#             elif self.role == Role.PROPERTY_BLOCK:
-#                 self._property(line)
-#             elif self.role == Role.MORTGAGE_BLOCK:
-#                 self._mortgage(line)
-
-#             self.window -= 1
-#             if self.window == 0:
-#                 self.role = Role.NONE
-
-#     # --------------------------------------------------------
-
-#     def _inline(self, line: str):
-#         ll = line.lower()
-
-#         if "policy_number" not in self.fields and ":" in line and any(k in ll for k in POLICY_LABELS):
-#             v = _clean(line.split(":", 1)[1])
-#             if _looks_like_policy(v):
-#                 self.fields["policy_number"] = {
-#                     "value": v, "confidence": 0.99, "source": "inline"
-#                 }
-
-#         if "insured_name" not in self.fields and ":" in line:
-#             label, _, val = line.partition(":")
-#             if label.lower().strip() in INSURED_LABELS:
-#                 v = _normalize_name(val)
-#                 if _looks_like_name(v):
-#                     self.fields["insured_name"] = {
-#                         "value": v, "confidence": 0.99, "source": "inline"
-#                     }
-
-#         if "loan_number" not in self.fields and any(k in ll for k in LOAN_LABELS):
-#             digits = ''.join(c for c in line if c.isdigit())
-#             if LOAN_RE.fullmatch(digits) and not _is_phone_number(digits):
-#                 self.fields["loan_number"] = {
-#                     "value": digits, "confidence": 0.96, "source": "inline"
-#                 }
-
-#     # --------------------------------------------------------
-
-#     def _policy(self, line: str):
-#         for t in line.split():
-#             if _looks_like_policy(t):
-#                 self.fields.setdefault(
-#                     "policy_number",
-#                     {"value": t, "confidence": 0.96, "source": "block"},
-#                 )
-
-#     def _insured(self, line: str):
-#         if "insured_name" not in self.fields:
-#             v = _normalize_name(line)
-#             if _looks_like_name(v):
-#                 self.fields["insured_name"] = {
-#                     "value": v, "confidence": 0.98, "source": "block"
-#                 }
-
-#     def _property(self, line: str):
-#         if "property_address" not in self.fields and _looks_like_address(line):
-#             self.fields["property_address"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.98,
-#                 "source": "block",
-#             }
-
-#     def _mortgage(self, line: str):
-#         ll = line.lower()
-
-#         if any(p in ll for p in BAD_MORTGAGE_PRODUCTS):
-#             return
-
-#         if "mortgage_company" not in self.fields and _looks_like_name(line):
-#             self.fields["mortgage_company"] = {
-#                 "value": line.strip(),
-#                 "confidence": 0.92,
-#                 "source": "block",
-#             }
-
-#         if "loan_number" not in self.fields:
-#             for t in line.split():
-#                 d = ''.join(c for c in t if c.isdigit())
-#                 if LOAN_RE.fullmatch(d) and not _is_phone_number(t):
-#                     self.fields["loan_number"] = {
-#                         "value": d,
-#                         "confidence": 0.94,
-#                         "source": "block",
-#                     }
-
-# # ============================================================
-# # SAFE SWEEP
-# # ============================================================
-
-# def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
-#     for i, line in enumerate(lines):
-#         ll = line.lower()
-
-#         if "insured_name" not in fields and ":" in line and any(k in ll for k in INSURED_LABELS):
-#             v = _normalize_name(line.split(":", 1)[1])
-#             if _looks_like_name(v):
-#                 fields["insured_name"] = {
-#                     "value": v, "confidence": 0.88, "source": "sweep"
-#                 }
-
-#         if "property_address" not in fields and any(k in ll for k in PROPERTY_TRIGGERS):
-#             for j in range(i + 1, min(i + 4, len(lines))):
-#                 if _looks_like_address(lines[j]):
-#                     fields["property_address"] = {
-#                         "value": lines[j].strip(),
-#                         "confidence": 0.86,
-#                         "source": "sweep",
-#                     }
-#                     break
-
-# # ============================================================
-# # ENTRY
-# # ============================================================
-
-# def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     extractor = StatefulExtractor()
-#     for raw in lines:
-#         line = raw.strip()
-#         if line:
-#             extractor.update_role(line)
-#             extractor.extract(line)
-#     _safe_sweep(lines, extractor.fields)
-#     return extractor.fields
-
-# def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
-#     return extract_fields(lines, layout_elements)
-
-
-#Claude Version (1st)
+# stage1_deterministic_agent.py
 """
-Stage 1 – Stateful, Role-Anchored Deterministic Extraction (FIXED VERSION)
-==========================================================================
-FIXES APPLIED:
-1. Policy Number - More flexible regex, better inline extraction
-2. Insured Name - Relaxed validation, multi-line support, better cleanup
-3. Property Address - PO Box support, multi-line accumulation, state/ZIP detection
-
-Key Changes:
-- Added mailing_address extraction (was missing entirely)
-- Fixed _looks_like_name() being too strict (caps requirement)
-- Fixed _looks_like_policy() rejecting valid formats
-- Fixed _looks_like_address() rejecting PO Boxes
-- Added carrier extraction
-- Added date extraction
-- Increased role windows for better capture
-- Added fallback patterns in _safe_sweep
+Stage 1 – Stateful, Role-Anchored Deterministic Extraction
+IMPROVED VERSION - Fixes for:
+1. Insured name extraction (blocking mortgagee terms, product names)
+2. Carrier name extraction (multi-line support)
+3. Loan number extraction (blocking document references)
+4. Policy number extraction (better patterns)
 """
-
 import re
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 from enum import Enum, auto
 
 
@@ -1278,156 +21,251 @@ class Role(Enum):
     POLICY_HEADER = auto()
     INSURED_BLOCK = auto()
     PROPERTY_BLOCK = auto()
-    MAILING_BLOCK = auto()  # NEW
+    MAILING_BLOCK = auto()
     MORTGAGE_BLOCK = auto()
-    CARRIER_BLOCK = auto()  # NEW
+    CARRIER_BLOCK = auto()
+    PRODUCER_BLOCK = auto()  # NEW: Skip names in producer/agent sections
 
 
 # ============================================================
-# REGEX PATTERNS (ENHANCED)
+# REGEX PATTERNS
 # ============================================================
 
-# Policy number patterns - MORE FLEXIBLE
-POLICY_REGEX_VARIANTS = [
-    re.compile(r"[A-Z]{1,4}[-\s]?\d{6,12}"),           # OKH3-109194373
-    re.compile(r"[A-Z]{2,6}\s?\d{7,12}[-]?\d?"),       # DPC 0076173896-1
-    re.compile(r"\d{8,14}"),                            # Pure numeric (8-14 digits)
-    re.compile(r"[A-Z0-9]{2}[A-Z0-9\-]{5,25}"),        # Generic alphanumeric
-    re.compile(r"[A-Z]{2,3}\d{2}[A-Z]?\d{5,10}"),      # HO3A12345678
-]
-
+PHONE_RE = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
 DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 DATE_WRITTEN_RE = re.compile(
-    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}",
     re.I
 )
-LOAN_RE = re.compile(r"\d{8,18}")
-PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-ZIP_RE = re.compile(r"\b\d{5}(-\d{4})?\b")
-
-# Address patterns - ENHANCED
+PO_BOX_RE = re.compile(r"p\.?o\.?\s*box", re.I)
 STREET_RE = re.compile(
-    r"\d{1,6}\s+.+?\b("
+    r"\b\d{1,6}\s+.+?\b("
     r"st|street|ave|avenue|rd|road|blvd|boulevard|"
-    r"ln|lane|dr|drive|ct|court|cir|circle|way|pkwy|"
-    r"ridge|place|pl|terrace|ter|trail|trl|highway|hwy"
+    r"ln|lane|dr|drive|ct|court|cir|circle|way|pkwy|ridge|pl|place"
     r")\b",
-    re.I,
+    re.I
 )
 
-PO_BOX_RE = re.compile(r"p\.?o\.?\s*box\s+\d+", re.I)
+# Policy number patterns - multiple variants
+POLICY_REGEX_VARIANTS = [
+    re.compile(r"^[A-Z]{2,4}[-\s]?\d{7,12}[-\s]?\d{0,2}$", re.I),  # DPC0076173896-1
+    re.compile(r"^\d{9,12}$"),  # 2004939477
+    re.compile(r"^\d{9}\s*\d{3}\s*\d{1}$"),  # 602732135 664 1
+    re.compile(r"^[A-Z]{2,4}\d{1,2}[-]?\d{9,12}$", re.I),  # OKH3-109194373
+    re.compile(r"^\d{8,12}[-\s]?\d{1,2}$"),  # 04038598 - 1
+]
 
 STATE_ABBREV = {
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
     "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
     "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
     "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC", "PR", "VI"
 }
 
 
 # ============================================================
-# MASTER KEYWORD LISTS (COMPREHENSIVE)
+# LABELS / TRIGGERS
 # ============================================================
 
 POLICY_LABELS = {
-    "policy number", "policy no", "policy #", "policy id",
-    "policy number:", "policy no:", "policy #:",
-    "dwelling policy number", "dwelling fire policy number",
-    "homeowners policy number", "amended policy number",
-    "renewal policy number", "previous policy number",
-    "policy declarations", "nfip policy number",
-    "flood policy number", "policy num",
+    "policy number", "policy no", "policy #",
+    "your policy number", "policynumber",
+    "dwelling policy number",
+    "account number", "your account number",
 }
 
 INSURED_LABELS = {
-    "insured", "named insured", "insured name",
-    "insured name and address", "name and address",
+    "insured", "named insured",
+    "insured name", "insured name and address",
     "insured mailing", "insured mailing name",
     "insured mailing name and address",
-    "policyholder", "policyholder/insured",
-    "policyholder/named insured", "policy holder",
-    "insured:", "named insured:",
+    "policyholder", "policy holder",
+    "policyholder(s)",  # ADDED for "Policyholder(s) TIM RASK"
+    "policyholders",
+    "policyholder/insured", "policyholder/named insured",
+    "first named insured",
+    "named insured and address",
+    "name and address of insured",  # ADDED
+}
+
+# CRITICAL: Terms that should NOT be captured as insured names
+BAD_INSURED_TERMS = {
+    # Mortgagee-related (most common error)
+    "mortgagee", "first mortgagee", "second mortgagee", "third mortgagee",
+    "1st mortgagee", "2nd mortgagee", "3rd mortgagee",
+    "loss payee", "lienholder", "lender",
+    "isaoa", "atima", "isaoa atima", "isaoa/atima",
+    "lien holder", "1st mortgagee copy",
+    
+    # Product names
+    "homesaver policy", "homesaver polcy", "homeowners policy",
+    "dwelling policy", "special form", "wind only policy",
+    "ultrapack plus", "mobilehome policy", "condominium owners",
+    "mobilehome", "house & home",
+    
+    # Insurance company fragments
+    "insurance exchange", "insurance company", "insurance group",
+    "insurance corp", "insurance mutual",
+    
+    # Document structure
+    "policy period", "policy type", "coverage",
+    "endorsement", "declarations", "summary",
+    "premium", "deductible", "page", "continued",
+    "information as of",
+    
+    # Agencies/agents/producers (CRITICAL - fixes Michael Ames issue)
+    "agency", "agent", "services", "producer",
+    "goosehead", "goosehead insurance",
+    
+    # Service centers (CRITICAL - fixes Mortgagee Relations Center)
+    "relations center", "mortgagee relations", "lender relations",
+    "customer service", "service center",
+    "claims center", "billing center",
+    
+    # Website/online instructions (CRITICAL - fixes aegisinsurance.com)
+    "website", ".com", "online", "go to", "simply go",
+    "click here", "select", "menu bar", "policyholders",
+    "make a payment", "pay online",
+    
+    # Marketing slogans (CRITICAL - fixes "You're in good hands")
+    "you're in good hands", "good hands",
+    "like a good neighbor", "on your side",
+    "we know a thing or two", "because we've seen",
+    
+    # Other noise
+    "other interest", "interested parties", "certificate holder",
+    "office use", "message", "messages",
+    "risk management", "department",
+    "third party notice", "notice of",
+}
+
+BAD_NAME_PHRASES = {
+    # Sections
+    "coverage", "endorsement", "deductible",
+    "policy conditions", "forms and endorsements",
+    "policy period", "premium", "billing",
+    "invoice", "notice", "summary", "schedule",
+    "page", "continued", "section",
+    
+    # Mortgagee related (CRITICAL)
+    "mortgagee", "loss payee", "lienholder",
+    "first mortgagee", "second mortgagee",
+    "isaoa", "atima", "lien holder",
+    
+    # Products / carriers
+    "homeowners", "dwelling", "ultrapack",
+    "insurance company", "insurance exchange",
+    "insurance group", "homesaver",
+    "mobilehome",
+    
+    # Agencies/producers (CRITICAL - fixes Michael Ames)
+    "agency", "agent", "services", "producer",
+    "goosehead", "insurance agency",
+    
+    # Service centers (CRITICAL - fixes Mortgagee Relations Center)
+    "relations center", "mortgagee relations", "lender relations",
+    "customer service", "service center",
+    "claims center", "billing center",
+    "risk management", "department",
+    
+    # Website/online (CRITICAL - fixes aegisinsurance.com)
+    "website", ".com", "online", "go to", "simply go",
+    "click here", "select", "menu bar",
+    "make a payment", "pay online",
+    
+    # Marketing slogans (CRITICAL - fixes "You're in good hands")
+    "you're in good hands", "good hands",
+    "like a good neighbor", "on your side",
+    "we know a thing or two",
+    
+    # Noise / instructions
+    "detach this", "return with",
+    "third party notice", "notice of",
+    
+    # Other
+    "your insurer", "insurer:", "office use",
+    "information as of", "page 1 of", "page 2 of",
 }
 
 PROPERTY_TRIGGERS = {
     "property address", "property insured",
-    "location of insured property", "insured property",
-    "coverage detail for", "described location",
-    "location id described location", "residence premises",
-    "located at", "property location", "risk location",
-    "insured location", "premises address",
-    "location of property", "property:",
+    "location of insured property", "residence premises",
+    "described location", "risk location",
+    "insured location", "location of property",
+    "premises address", "located at",
+}
+
+# Property labels for inline extraction (Label: Value format)
+PROPERTY_INLINE_LABELS = {
+    "property address", "risk location",
+    "location of insured property",
+    "premises address", "property location",
+    "property insured",  # ADDED for "Property Insured: 4616 HERITAGE RD"
 }
 
 MAILING_TRIGGERS = {
-    "mailing address", "mail address", "mailing:",
-    "insured mailing name and address",
-    "send mail to", "correspondence address",
+    "mailing address", "mail address",
+    "insured mailing", "correspondence address",
+    "send mail to", "applicant address",
 }
 
 MORTGAGE_TRIGGERS = {
-    "mortgagee", "mortgagee full name",
-    "mortgagee mailing name and address",
-    "loss payee", "loss payee, mortgagee or other interest",
-    "other interest", "other interested parties",
-    "lender", "mortgage company", "mortgagee copy",
-    "lienholder", "additional interest",
+    "mortgagee", "loss payee",
+    "lienholder", "other interest",
+    "other interested parties", "certificate holder",
+    "mortgagee full name", "lien holder",
+    "1st mortgagee", "2nd mortgagee", "first mortgagee", "second mortgagee",
+    # Note: Removed "lender" as it can trigger on "Lender Relations Center"
+}
+
+# Patterns that look like mortgage triggers but are actually service centers
+MORTGAGE_FALSE_POSITIVES = {
+    "lender relations center",
+    "mortgagee relations center",
+    "mortgage relations center",
+}
+
+# NEW: Producer/Agent triggers - names after these should NOT be captured as insured
+PRODUCER_TRIGGERS = {
+    "producer", "agent", "agency",
+    "your agent", "insurance agent",
+    "sales rep", "representative",
 }
 
 CARRIER_TRIGGERS = {
-    "underwritten by", "insurance company",
-    "issued by", "carrier", "insurer",
-    "this policy is issued by",
+    "insurance company", "insurance exchange",
+    "insurance group", "insurance provided by",
+    "issued by", "underwritten by", "insurer",
+    "policy underwritten by", "your insurer",
 }
 
 LOAN_LABELS = {
-    "loan number", "loan no", "loan #",
-    "mortgage loan number", "account number",
-    "loan number:", "loan #:", "reference number",
+    "loan number", "loan no", "loan #", "loan id",
+    "mortgage loan number", "ln #",
 }
 
 DATE_LABELS_EFFECTIVE = {
     "effective date", "policy effective date",
-    "effective", "coverage begins", "from",
-    "policy period", "term",
+    "coverage begins", "term start date",
+    "change effective date",
 }
 
 DATE_LABELS_EXPIRATION = {
     "expiration date", "policy expiration date",
-    "expiration", "expires", "coverage ends", "to",
-}
-
-# ============================================================
-# BLOCKLISTS (ENHANCED)
-# ============================================================
-
-BAD_NAME_PHRASES = {
-    "our duties", "policy conditions", "coverage", "endorsement",
-    "deductible", "liability", "property protection",
-    "form number", "loss payment", "mortgagee certificate",
-    "policy period", "coverage limits", "forms and endorsements",
-    "premium", "billing", "payment", "invoice", "notice",
-    "important", "please", "thank you", "declaration",
-    "summary", "schedule", "total", "amount",
+    "coverage ends", "term end date", "expires",
 }
 
 BAD_ADDRESS_PHRASES = {
-    "coverage", "premium", "deductible", "endorsement",
-    "policy period", "effective", "expiration", "billing",
-    "payment", "invoice", "notice", "important",
-    "forms and endorsements", "summary", "schedule",
-}
-
-BAD_MORTGAGE_PRODUCTS = {
-    "ultrapack", "package", "homeowners", "dwelling",
-    "special package", "policy", "endorsement", "insurance",
-    "coverage", "premium",
+    "coverage", "premium", "deductible",
+    "policy period", "effective", "expiration",
+    "billing", "payment", "invoice", "notice",
 }
 
 
 # ============================================================
-# HELPERS (FIXED)
+# HELPERS
 # ============================================================
 
 def _clean(v: str) -> str:
@@ -1448,28 +286,75 @@ def _normalize_name(v: str) -> str:
     v = re.sub(r"^(named insured|insured|policyholder)[:\s]*", "", v, flags=re.I)
     v = re.sub(r"\s*(beginning|effective|since|policy period).*$", "", v, flags=re.I)
     
-    # Handle "LASTNAME, FIRSTNAME" format
+    # Handle "LASTNAME, FIRSTNAME" format BUT NOT company names with comma
+    # Don't swap if it contains entity suffixes
     if "," in v and v.count(",") == 1:
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        if len(parts) == 2 and not any(c.isdigit() for c in v):
-            # Only swap if both parts look like names (not addresses)
-            if not any(w in parts[1].lower() for w in STATE_ABBREV):
-                return f"{parts[1]} {parts[0]}"
+        has_entity = any(w in v.lower() for w in ("llc", "inc", "corp", "company", "trust", "ltd"))
+        if not has_entity:
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            if len(parts) == 2 and not any(c.isdigit() for c in v):
+                # Only swap if both parts look like names (not addresses)
+                if not any(w.upper() in STATE_ABBREV for w in parts[1].split()):
+                    return f"{parts[1]} {parts[0]}"
     
     return v.strip()
 
 
 def _is_phone_number(v: str) -> bool:
-    """Check if value is a phone number"""
+    """
+    Check if value is a phone number
+    CONSERVATIVE: Returns True only for values that are CLEARLY phone numbers
+    """
+    # If the original value has letters, it's likely not a phone number
+    if any(c.isalpha() for c in v):
+        return False
+    
+    # Extract only digits
     digits = ''.join(c for c in v if c.isdigit())
     
-    # Exactly 10 or 7 digits = likely phone
-    if len(digits) in (7, 10):
+    # Phone numbers are exactly 7, 10, or 11 digits
+    # If longer than 11, it's definitely not a phone number
+    if len(digits) > 11:
+        return False
+    
+    # Check if it has phone formatting (parentheses, dashes in right places)
+    # Only flag as phone if it has ACTUAL phone formatting
+    if re.fullmatch(r'\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}', v.strip()):
         return True
     
-    # Has phone formatting
-    if PHONE_RE.search(v):
+    # Only 7 digits with dash: xxx-xxxx format
+    if re.fullmatch(r'\d{3}[-.\s]\d{4}', v.strip()):
         return True
+    
+    # For pure numeric strings, DON'T assume they're phone numbers
+    # because policy numbers are often 10 digits too
+    # Only flag as phone if it has formatting
+    
+    return False
+
+
+def _is_document_reference(v: str) -> bool:
+    """Check if value looks like a document reference code, not real data"""
+    v_clean = v.strip()
+    
+    # Pattern: digits_digits_digits (e.g., 19660_859561_6)
+    if re.match(r'^\d+_\d+(_\d+)?$', v_clean):
+        return True
+    
+    # Page references
+    if re.match(r'^page\s*\d+', v_clean, re.I):
+        return True
+    
+    # Very long numeric strings with many zeros
+    digits = ''.join(c for c in v_clean if c.isdigit())
+    if len(digits) > 15:
+        return True
+    
+    # More than 50% zeros in long number
+    if len(digits) > 10:
+        zero_count = digits.count('0')
+        if zero_count > len(digits) * 0.5:
+            return True
     
     return False
 
@@ -1477,13 +362,18 @@ def _is_phone_number(v: str) -> bool:
 def _looks_like_name(text: str) -> bool:
     """
     Check if text looks like a person/company name
-    FIXED: More relaxed validation
+    IMPROVED: Better filtering of mortgagee terms and noise
     """
     if not text or len(text) < 3:
         return False
     
     text = text.strip()
     ll = text.lower()
+    
+    # CRITICAL: Block mortgagee-related terms
+    for bad_term in BAD_INSURED_TERMS:
+        if bad_term in ll:
+            return False
     
     # Block known bad phrases
     if any(b in ll for b in BAD_NAME_PHRASES):
@@ -1498,8 +388,30 @@ def _looks_like_name(text: str) -> bool:
     if special > 2:
         return False
     
+    # Block if starts with certain bad patterns
+    bad_starts = (
+        "policy", "coverage", "premium", "page", "section",
+        "effective", "expiration", "the ", "this ", "your ",
+        "or ", "for ", "to ", "from ", "with ",
+    )
+    # NOTE: removed "and " from bad_starts to allow "ROBERT and MARY" style names
+    if any(ll.startswith(w) for w in bad_starts):
+        return False
+    
+    # Block if ends with label-like patterns (but not if it's a person's name)
+    bad_ends = (
+        " address", " information", " number",
+        " period", " type", " date", " copy", " notice",
+    )
+    # Note: removed " name" because "NAME" can be a valid surname (e.g., "JOHN NAME", "DUMMY NAME")
+    if any(ll.endswith(w) for w in bad_ends):
+        return False
+    
     # Allow entities with digits (LLC, Corp, etc.)
-    has_entity = any(w in ll for w in ("llc", "inc", "corp", "company", "trust", "ltd", "bank", "mortgage"))
+    has_entity = any(w in ll for w in ("llc", "inc", "corp", "company", "trust", "ltd", "bank"))
+    
+    # Check if it's a multi-person name (contains "and" between name parts)
+    has_and_connector = bool(re.search(r'\b(and|&)\b', ll))
     
     # Block digits unless it's an entity
     if any(c.isdigit() for c in text) and not has_entity:
@@ -1508,15 +420,19 @@ def _looks_like_name(text: str) -> bool:
     words = text.replace(",", " ").split()
     word_count = len(words)
     
-    # Entity names can be longer
+    # Entity names can be longer; multi-person names can be longer too
     if has_entity:
         if not (2 <= word_count <= 12):
+            return False
+    elif has_and_connector:
+        # Multi-person names like "ROBERT J BARRON and DANIEL PRYCE" can have 6-8 words
+        if not (4 <= word_count <= 10):
             return False
     else:
         if not (2 <= word_count <= 6):
             return False
     
-    # RELAXED: At least 1 word should start with uppercase (was 2)
+    # At least 1 word should start with uppercase
     caps = sum(1 for w in words if w and w[0].isupper())
     if caps < 1:
         return False
@@ -1535,7 +451,7 @@ def _looks_like_name(text: str) -> bool:
 def _looks_like_policy(v: str) -> bool:
     """
     Check if value looks like a policy number
-    FIXED: More flexible patterns, better blocking
+    IMPROVED: Better blocking of bad patterns
     """
     if not v:
         return False
@@ -1547,8 +463,19 @@ def _looks_like_policy(v: str) -> bool:
     if _is_phone_number(v_original):
         return False
     
-    # Block dates
+    # Block document references
+    if _is_document_reference(v_original):
+        return False
+    
+    # Block dates - numeric and written
     if DATE_RE.search(v_original) or DATE_WRITTEN_RE.search(v_original):
+        return False
+    
+    # Block if contains date-like words
+    date_words = ('january', 'february', 'march', 'april', 'may', 'june',
+                  'july', 'august', 'september', 'october', 'november', 'december',
+                  'effective', 'expiration')
+    if any(w in v_original.lower() for w in date_words):
         return False
     
     # Block pure year references (2023, 2024, etc.)
@@ -1557,6 +484,10 @@ def _looks_like_policy(v: str) -> bool:
     
     # Block ZIP codes (5 or 9 digits)
     if re.fullmatch(r"\d{5}(-\d{4})?", v_clean):
+        return False
+    
+    # Block state+number patterns (NC27102, MI48007)
+    if re.match(r'^[A-Z]{2}\d{5,}$', v_clean):
         return False
     
     # Block very short values
@@ -1575,9 +506,9 @@ def _looks_like_policy(v: str) -> bool:
     if digits < 5:
         return False
     
-    # Pure numeric: 8-14 digits is OK
+    # Pure numeric: 6-14 digits is OK
     if v_clean.isdigit():
-        return 8 <= len(v_clean) <= 14
+        return 6 <= len(v_clean) <= 14
     
     # Mixed: check against patterns
     for rx in POLICY_REGEX_VARIANTS:
@@ -1591,11 +522,49 @@ def _looks_like_policy(v: str) -> bool:
     return False
 
 
+def _looks_like_loan_number(v: str) -> bool:
+    """
+    Check if value looks like a loan number
+    IMPROVED: Better filtering, stricter for short numbers
+    """
+    if not v:
+        return False
+    
+    # Block document references
+    if _is_document_reference(v):
+        return False
+    
+    # Block phone numbers (including formatted ones)
+    if _is_phone_number(v):
+        return False
+    
+    # Extract digits
+    digits = ''.join(c for c in v if c.isdigit())
+    
+    # Loan numbers are typically 8-15 digits (raised minimum from 7)
+    # 7-digit numbers are too likely to be phone number fragments
+    if len(digits) < 8 or len(digits) > 15:
+        return False
+    
+    # Block if too many consecutive zeros (padding patterns)
+    if '000000' in digits:
+        return False
+    
+    # Block if more than 50% zeros in longer numbers
+    if len(digits) > 10:
+        zero_count = digits.count('0')
+        if zero_count > len(digits) * 0.5:
+            return False
+    
+    # Block dates
+    if DATE_RE.search(v):
+        return False
+    
+    return True
+
+
 def _looks_like_address(line: str) -> bool:
-    """
-    Check if line looks like an address
-    FIXED: Support PO Box, state/ZIP patterns
-    """
+    """Check if line looks like an address"""
     if not line or len(line) < 5:
         return False
     
@@ -1623,7 +592,6 @@ def _looks_like_address(line: str) -> bool:
     
     # Has state abbreviation + ZIP (city, state zip format)
     if re.search(r"\b[A-Z]{2}\s+\d{5}", line):
-        # Make sure it has some address-like content before the state
         parts = re.split(r"\b[A-Z]{2}\s+\d{5}", line)
         if parts and len(parts[0].strip()) > 5:
             return True
@@ -1635,6 +603,30 @@ def _looks_like_address(line: str) -> bool:
         return True
     
     return False
+
+
+def _looks_like_carrier(line: str) -> bool:
+    """Check if line looks like an insurance carrier name"""
+    ll = line.lower()
+    
+    # Must have "insurance" somewhere
+    if 'insurance' not in ll and ' ins ' not in ll and not ll.endswith(' ins'):
+        return False
+    
+    # Should have company type
+    if not any(w in ll for w in ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')):
+        return False
+    
+    # Block agencies
+    if any(w in ll for w in ('agency', 'agent', 'services', 'producer')):
+        return False
+    
+    # Reasonable length
+    words = line.split()
+    if not (2 <= len(words) <= 10):
+        return False
+    
+    return True
 
 
 def _extract_date(line: str, label_set: set) -> str:
@@ -1666,7 +658,7 @@ def _extract_date(line: str, label_set: set) -> str:
 
 
 # ============================================================
-# STATEFUL EXTRACTOR (ENHANCED)
+# STATEFUL EXTRACTOR
 # ============================================================
 
 class StatefulExtractor:
@@ -1674,8 +666,9 @@ class StatefulExtractor:
         self.role = Role.NONE
         self.window = 0
         self.fields: Dict[str, Dict] = {}
-        self.address_accumulator: List[str] = []  # For multi-line addresses
-        self.insured_accumulator: List[str] = []  # For multi-line names
+        self.carrier_accumulator: List[str] = []  # For multi-line carrier names
+        self.address_accumulator: List[str] = []
+        self._partial_insured: str = ""  # For multi-line insured names
     
     def update_role(self, line: str):
         """Update current parsing role based on section headers"""
@@ -1683,46 +676,64 @@ class StatefulExtractor:
         
         # Check for role triggers (order matters - more specific first)
         if any(k in ll for k in POLICY_LABELS):
+            self._flush_accumulators()
             self.role, self.window = Role.POLICY_HEADER, 8
-            self._flush_accumulators()
         elif any(k in ll for k in MAILING_TRIGGERS):
+            self._flush_accumulators()
             self.role, self.window = Role.MAILING_BLOCK, 8
-            self._flush_accumulators()
         elif any(k in ll for k in INSURED_LABELS):
+            self._flush_accumulators()
             self.role, self.window = Role.INSURED_BLOCK, 12
-            self._flush_accumulators()
         elif any(k in ll for k in PROPERTY_TRIGGERS):
+            self._flush_accumulators()
             self.role, self.window = Role.PROPERTY_BLOCK, 8
-            self._flush_accumulators()
         elif any(k in ll for k in MORTGAGE_TRIGGERS):
-            self.role, self.window = Role.MORTGAGE_BLOCK, 10
+            # Check if it's a false positive (service center header)
+            if not any(fp in ll for fp in MORTGAGE_FALSE_POSITIVES):
+                self._flush_accumulators()
+                self.role, self.window = Role.MORTGAGE_BLOCK, 10
+        elif any(k in ll for k in PRODUCER_TRIGGERS):
+            # Producer/agent section - skip names here
             self._flush_accumulators()
+            self.role, self.window = Role.PRODUCER_BLOCK, 6
         elif any(k in ll for k in CARRIER_TRIGGERS):
+            # DON'T flush carrier accumulator - we might need to combine
+            self._flush_accumulators(entering_carrier_block=True)
             self.role, self.window = Role.CARRIER_BLOCK, 6
-            self._flush_accumulators()
     
-    def _flush_accumulators(self):
+    def _flush_accumulators(self, entering_carrier_block=False):
         """Save accumulated multi-line values before role change"""
+        # DON'T flush carrier accumulator if entering carrier block
+        # because we might need to combine it with the incoming line
+        if not entering_carrier_block:
+            if self.carrier_accumulator and "carrier_name" not in self.fields:
+                combined = " ".join(self.carrier_accumulator)
+                if _looks_like_carrier(combined):
+                    self.fields["carrier_name"] = {
+                        "value": combined.upper(),
+                        "confidence": 0.96,
+                        "source": "accumulated",
+                    }
+                self.carrier_accumulator = []
+        
+        # Flush address accumulator
         if self.address_accumulator:
             addr = " ".join(self.address_accumulator)
             if "property_address" not in self.fields:
                 self.fields["property_address"] = {
-                    "value": addr, "confidence": 0.94, "source": "block_accumulated"
+                    "value": addr,
+                    "confidence": 0.94,
+                    "source": "accumulated",
                 }
             self.address_accumulator = []
-        
-        if self.insured_accumulator:
-            name = " ".join(self.insured_accumulator)
-            if "insured_name" not in self.fields and _looks_like_name(name):
-                self.fields["insured_name"] = {
-                    "value": name, "confidence": 0.94, "source": "block_accumulated"
-                }
-            self.insured_accumulator = []
     
     def extract(self, line: str):
         """Main extraction logic for each line"""
-        # Always try inline extraction
+        # Always try inline extraction first
         self._inline(line)
+        
+        # Try carrier extraction from any line (multi-line support)
+        self._try_carrier_accumulation(line)
         
         # Role-based extraction
         if self.window > 0:
@@ -1744,61 +755,169 @@ class StatefulExtractor:
                 self._flush_accumulators()
                 self.role = Role.NONE
     
+    def _try_carrier_accumulation(self, line: str):
+        """Try to accumulate carrier name across lines"""
+        if "carrier_name" in self.fields:
+            return
+        
+        ll = line.lower()
+        clean = line.strip().replace("*", "")
+        
+        # Check if this line contains 'insurance'
+        if 'insurance' in ll:
+            # If we have accumulated a prefix, ALWAYS try to combine
+            if self.carrier_accumulator:
+                combined = " ".join(self.carrier_accumulator) + " " + clean
+                combined_lower = combined.lower()
+                # If combined has insurance + company type, use it
+                if 'insurance' in combined_lower and any(w in combined_lower for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual')):
+                    if not any(w in combined_lower for w in ('agency', 'agent', 'services')):
+                        self.fields["carrier_name"] = {
+                            "value": combined.upper(),
+                            "confidence": 0.97,
+                            "source": "multi_line_combined",
+                        }
+                        self.carrier_accumulator = []
+                        return
+            
+            # No accumulator - check if this line alone is a complete carrier
+            if _looks_like_carrier(clean):
+                self.fields["carrier_name"] = {
+                    "value": clean.upper(),
+                    "confidence": 0.95,
+                    "source": "direct",
+                }
+                self.carrier_accumulator = []
+                return
+        
+        # Check if this might be first part of multi-line carrier
+        elif clean.isupper() and len(clean.split()) <= 2 and not any(c.isdigit() for c in clean):
+            # Might be company name prefix like "ADIRONDACK"
+            noise_words = {"PAGE", "DATE", "POLICY", "NUMBER", "INSURED", "ADDRESS", "NOTICE", "PO", "BOX"}
+            words = clean.split()
+            if words and not any(w in noise_words for w in words):
+                if all(len(w) >= 3 for w in words):  # Each word should be substantial
+                    self.carrier_accumulator = [clean]
+    
     def _inline(self, line: str):
         """Extract from inline patterns (Label: Value)"""
         ll = line.lower()
         
-        # Policy Number: XXXXXXXX
+        # Policy Number
         if "policy_number" not in self.fields:
             if ":" in line and any(k in ll for k in POLICY_LABELS):
                 _, _, v = line.partition(":")
                 v = _clean(v)
-                # Handle split values like "DPC 0076173896 -1"
-                v = re.sub(r"\s+(\d)$", r"-\1", v)
-                v = v.replace(" ", "")
-                if _looks_like_policy(v):
-                    self.fields["policy_number"] = {
-                        "value": v, "confidence": 0.99, "source": "inline"
+                
+                # Check if it matches the "602732135 664 1" format FIRST (before any modification)
+                if re.match(r'^\d{9}\s+\d{3}\s+\d$', v):
+                    # This is a spaced policy number format - keep it as-is
+                    v_no_space = v.replace(" ", "")
+                    if _looks_like_policy(v_no_space):
+                        self.fields["policy_number"] = {
+                            "value": v,  # Keep with spaces
+                            "confidence": 0.99,
+                            "source": "inline",
+                        }
+                else:
+                    # Handle split values like "DPC 0076173896 -1"
+                    v = re.sub(r"\s+(\d)$", r"-\1", v)
+                    v_no_space = v.replace(" ", "")
+                    
+                    if _looks_like_policy(v_no_space):
+                        self.fields["policy_number"] = {
+                            "value": v_no_space,
+                            "confidence": 0.99,
+                            "source": "inline",
+                        }
+        
+        # Property Address (NEW - for "Risk Location: 3004 NORFOLK DR" patterns)
+        if "property_address" not in self.fields and ":" in line:
+            if any(k in ll for k in PROPERTY_INLINE_LABELS):
+                _, _, v = line.partition(":")
+                v = v.strip()
+                if v and _looks_like_address(v):
+                    self.fields["property_address"] = {
+                        "value": v,
+                        "confidence": 0.98,
+                        "source": "inline",
                     }
         
-        # Insured: John Doe
+        # Insured Name (IMPROVED)
         if "insured_name" not in self.fields and ":" in line:
             label, _, val = line.partition(":")
-            if label.lower().strip() in INSURED_LABELS or any(k in label.lower() for k in ("insured", "policyholder")):
-                v = _normalize_name(val)
-                if v and _looks_like_name(v):
-                    self.fields["insured_name"] = {
-                        "value": v, "confidence": 0.99, "source": "inline"
-                    }
+            label_lower = label.lower().strip()
+            
+            # Check if this is an insured label
+            if any(k in label_lower for k in ("insured", "policyholder")):
+                # CRITICAL: Skip if label contains mortgagee terms
+                if any(bad in label_lower for bad in ("mortgagee", "loss payee", "lender")):
+                    pass  # Skip this
+                else:
+                    v = _normalize_name(val)
+                    if v and _looks_like_name(v):
+                        self.fields["insured_name"] = {
+                            "value": v,
+                            "confidence": 0.99,
+                            "source": "inline",
+                        }
+                    elif v and len(v.strip()) > 3:
+                        # Value on same line might be partial - check next line context
+                        # Store as potential first part of multi-line name
+                        self._partial_insured = v.strip()
         
-        # Loan Number
+        # Loan Number (IMPROVED)
         if "loan_number" not in self.fields and any(k in ll for k in LOAN_LABELS):
             if ":" in line:
                 _, _, v = line.partition(":")
                 digits = ''.join(c for c in v if c.isdigit())
             else:
-                digits = ''.join(c for c in line if c.isdigit())
+                # Try to find number on line
+                digits = ''
+                for token in line.split():
+                    d = ''.join(c for c in token if c.isdigit())
+                    if len(d) >= 7:
+                        digits = d
+                        break
             
-            if len(digits) >= 8 and not _is_phone_number(digits):
+            if _looks_like_loan_number(digits):
                 self.fields["loan_number"] = {
-                    "value": digits, "confidence": 0.96, "source": "inline"
+                    "value": digits,
+                    "confidence": 0.96,
+                    "source": "inline",
                 }
         
-        # Effective Date
+        # Dates
         if "effective_date" not in self.fields:
             date = _extract_date(line, DATE_LABELS_EFFECTIVE)
             if date:
                 self.fields["effective_date"] = {
-                    "value": date, "confidence": 0.95, "source": "inline"
+                    "value": date,
+                    "confidence": 0.95,
+                    "source": "inline",
                 }
         
-        # Expiration Date
         if "expiration_date" not in self.fields:
             date = _extract_date(line, DATE_LABELS_EXPIRATION)
             if date:
                 self.fields["expiration_date"] = {
-                    "value": date, "confidence": 0.95, "source": "inline"
+                    "value": date,
+                    "confidence": 0.95,
+                    "source": "inline",
                 }
+        
+        # Carrier from "underwritten by" or "your insurer"
+        if "carrier_name" not in self.fields:
+            if any(k in ll for k in ("underwritten by", "your insurer")):
+                if ":" in line:
+                    _, _, v = line.partition(":")
+                    v = v.strip()
+                    if 'insurance' in v.lower() and len(v) > 10:
+                        self.fields["carrier_name"] = {
+                            "value": v.upper(),
+                            "confidence": 0.98,
+                            "source": "inline_carrier",
+                        }
     
     def _policy(self, line: str):
         """Extract policy number from POLICY block"""
@@ -1810,7 +929,9 @@ class StatefulExtractor:
             clean_token = _clean(token)
             if _looks_like_policy(clean_token):
                 self.fields["policy_number"] = {
-                    "value": clean_token, "confidence": 0.96, "source": "block"
+                    "value": clean_token,
+                    "confidence": 0.96,
+                    "source": "block",
                 }
                 return
         
@@ -1819,41 +940,87 @@ class StatefulExtractor:
         no_spaces = clean_line.replace(" ", "")
         if _looks_like_policy(no_spaces):
             self.fields["policy_number"] = {
-                "value": no_spaces, "confidence": 0.94, "source": "block_combined"
+                "value": no_spaces,
+                "confidence": 0.94,
+                "source": "block_combined",
             }
     
     def _insured(self, line: str):
-        """Extract insured name from INSURED block"""
+        """Extract insured name from INSURED block - IMPROVED"""
         ll = line.lower().strip()
         
         # Skip obvious non-name lines
         skip_patterns = [
             "po box", "policy period", "loan number", "policy type",
             "description", "coverage", "premium", "effective", "expiration",
-            "page", "continued", "summary"
+            "page", "continued", "summary", "mortgagee", "loss payee",
+            "mailing address",
         ]
         if any(p in ll for p in skip_patterns):
             return
         
         # Skip if line is just a header
-        if line.strip().endswith(":") or line.strip().lower() in INSURED_LABELS:
+        if line.strip().endswith(":"):
+            return
+        if ll in [l.lower() for l in INSURED_LABELS]:
+            return
+        
+        # CRITICAL: Skip if line looks like a label fragment
+        if ll.startswith("and ") or ll.startswith("or "):
             return
         
         clean_line = _normalize_name(line)
+        
+        # CRITICAL: Additional check - block mortgagee-related values
+        if any(bad in ll for bad in BAD_INSURED_TERMS):
+            return
+        
+        # Check for multi-line name combination (e.g., "DUMMY NAME" + "PROPERTIES, LLC")
+        if self._partial_insured and "insured_name" not in self.fields:
+            # Try combining with previous partial
+            combined = self._partial_insured + " " + clean_line
+            if _looks_like_name(combined):
+                self.fields["insured_name"] = {
+                    "value": combined,
+                    "confidence": 0.96,
+                    "source": "block_combined",
+                }
+                self._partial_insured = ""
+                return
         
         # Check if it's a name
         if _looks_like_name(clean_line):
             if "insured_name" not in self.fields:
                 self.fields["insured_name"] = {
-                    "value": clean_line, "confidence": 0.97, "source": "block"
+                    "value": clean_line,
+                    "confidence": 0.97,
+                    "source": "block",
                 }
+            self._partial_insured = ""
             return
+        
+        # If it might be first part of multi-line name (single word, uppercase)
+        if clean_line.isupper() and len(clean_line.split()) <= 2 and "insured_name" not in self.fields:
+            # Check if it looks like a name part (not a header)
+            if not any(w in clean_line.lower() for w in ("page", "policy", "coverage")):
+                self._partial_insured = clean_line
+                return
         
         # Check if it's an address (capture for mailing)
         if _looks_like_address(line):
             if "mailing_address" not in self.fields:
+                # Check if line has "Label: Value" format
+                address_value = line.strip()
+                if ":" in line:
+                    _, _, val = line.partition(":")
+                    val = val.strip()
+                    if val and _looks_like_address(val):
+                        address_value = val
+                
                 self.fields["mailing_address"] = {
-                    "value": line.strip(), "confidence": 0.92, "source": "insured_block"
+                    "value": address_value,
+                    "confidence": 0.92,
+                    "source": "insured_block",
                 }
     
     def _property(self, line: str):
@@ -1861,25 +1028,43 @@ class StatefulExtractor:
         ll = line.lower().strip()
         
         # Skip headers and labels
-        if line.strip().endswith(":") or ll in [t.lower() for t in PROPERTY_TRIGGERS]:
+        if line.strip().endswith(":"):
+            return
+        if ll in [t.lower() for t in PROPERTY_TRIGGERS]:
             return
         
-        if _looks_like_address(line):
+        # Check if line has "Label: Value" format
+        address_value = line.strip()
+        if ":" in line:
+            label, _, val = line.partition(":")
+            val = val.strip()
+            # If value part looks like an address, use just the value
+            if val and _looks_like_address(val):
+                address_value = val
+        
+        if _looks_like_address(address_value):
             if "property_address" not in self.fields:
                 self.fields["property_address"] = {
-                    "value": line.strip(),
+                    "value": address_value,
                     "confidence": 0.98,
                     "source": "block",
                 }
-            elif len(line.strip()) > len(self.fields["property_address"]["value"]):
-                # Update if we found a more complete address
-                self.fields["property_address"]["value"] = line.strip()
+            else:
+                # Only overwrite if new address has street number (more complete)
+                # Don't overwrite "3004 NORFOLK DR" with "AUSTIN, TX 78745"
+                current = self.fields["property_address"]["value"]
+                has_street_number = bool(re.match(r'^\d+\s+', current.strip()))
+                new_has_street = bool(re.match(r'^\d+\s+', address_value.strip()))
+                
+                if new_has_street and not has_street_number:
+                    # New address has street number, current doesn't - use new
+                    self.fields["property_address"]["value"] = address_value
+                elif len(address_value) > len(current) and (new_has_street or not has_street_number):
+                    # Only update if new is longer AND either has street or current doesn't
+                    self.fields["property_address"]["value"] = address_value
     
     def _mailing(self, line: str):
         """Extract mailing address from MAILING block"""
-        ll = line.lower().strip()
-        
-        # Skip headers
         if line.strip().endswith(":"):
             return
         
@@ -1891,7 +1076,6 @@ class StatefulExtractor:
                     "source": "mailing_block",
                 }
         elif _looks_like_name(line) and "insured_name" not in self.fields:
-            # Name might appear in mailing block too
             self.fields["insured_name"] = {
                 "value": _normalize_name(line),
                 "confidence": 0.90,
@@ -1902,41 +1086,53 @@ class StatefulExtractor:
         """Extract mortgage company and loan number from MORTGAGE block"""
         ll = line.lower()
         
-        # Skip product names and junk
-        if any(p in ll for p in BAD_MORTGAGE_PRODUCTS):
-            return
-        
         # Skip headers
         if line.strip().endswith(":"):
             return
         
-        # Mortgage company
-        if "mortgage_company" not in self.fields and _looks_like_name(line):
-            # Additional check: should have bank/mortgage-like words or be a company
-            if any(w in ll for w in ("bank", "mortgage", "lending", "credit", "loan", "isaoa", "atima")):
-                self.fields["mortgage_company"] = {
-                    "value": line.strip(),
-                    "confidence": 0.94,
-                    "source": "block",
-                }
-            elif _looks_like_name(line):
-                self.fields["mortgage_company"] = {
-                    "value": line.strip(),
-                    "confidence": 0.88,
-                    "source": "block",
-                }
+        # Skip bad patterns (EXPANDED)
+        bad_patterns = [
+            "policy", "coverage", "endorsement", "homeowners", "premium",
+            "first mortgagee", "second mortgagee", "third mortgagee",
+            "1st mortgagee", "2nd mortgagee", "3rd mortgagee",
+            "mortgagee copy", "mortgagee certificate",
+            "other interest", "type of interest",
+        ]
+        if any(p in ll for p in bad_patterns):
+            return
         
         # Loan number
         if "loan_number" not in self.fields:
             for token in line.split():
                 digits = ''.join(c for c in token if c.isdigit())
-                if len(digits) >= 8 and not _is_phone_number(token):
+                if _looks_like_loan_number(digits):
                     self.fields["loan_number"] = {
                         "value": digits,
                         "confidence": 0.94,
-                        "source": "block",
+                        "source": "mortgage_block",
                     }
                     break
+        
+        # Mortgage company
+        if "mortgage_company" not in self.fields:
+            # Look for company-like patterns
+            if any(w in ll for w in ("bank", "mortgage", "lending", "credit", "loan", "federal", "financial")):
+                # CRITICAL: Skip if it's just a label like "First Mortgagee"
+                if re.match(r'^(first|second|third|1st|2nd|3rd)\s+(mortgagee|lender)', ll):
+                    return
+                
+                clean = line.strip()
+                # Remove ISAOA/ATIMA suffixes
+                clean = re.sub(r'\s+(ISAOA|ATIMA|ISAOA/ATIMA).*$', '', clean, flags=re.I)
+                # Remove numbering prefixes
+                clean = re.sub(r'^(\d+\.?\s*|first\s+|second\s+|third\s+)', '', clean, flags=re.I)
+                
+                if len(clean) > 5:
+                    self.fields["mortgage_company"] = {
+                        "value": clean,
+                        "confidence": 0.94,
+                        "source": "mortgage_block",
+                    }
     
     def _carrier(self, line: str):
         """Extract carrier name from CARRIER block"""
@@ -1950,13 +1146,12 @@ class StatefulExtractor:
             return
         
         # Look for insurance company patterns
-        if "insurance" in ll and any(w in ll for w in ("company", "exchange", "group", "mutual", "corp")):
-            # Block agencies
-            if not any(w in ll for w in ("agency", "agent", "services", "producer")):
+        if 'insurance' in ll and any(w in ll for w in ('company', 'exchange', 'group', 'mutual', 'corp')):
+            if not any(w in ll for w in ('agency', 'agent', 'services', 'producer')):
                 self.fields["carrier_name"] = {
                     "value": line.strip().upper(),
                     "confidence": 0.96,
-                    "source": "block",
+                    "source": "carrier_block",
                 }
     
     def finalize(self):
@@ -1965,28 +1160,25 @@ class StatefulExtractor:
 
 
 # ============================================================
-# SAFE SWEEP (ENHANCED FALLBACK)
+# SAFE SWEEP (FALLBACK)
 # ============================================================
 
 def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
-    """
-    Final pass to catch missed fields using lookahead patterns
-    """
-    text_block = "\n".join(lines)
+    """Final pass to catch missed fields"""
     
     # --- Policy Number fallback ---
     if "policy_number" not in fields:
-        # Look for "Policy Number" followed by value on same or next line
         for i, line in enumerate(lines):
             ll = line.lower()
             if any(k in ll for k in POLICY_LABELS):
-                # Check same line after colon
                 if ":" in line:
                     _, _, v = line.partition(":")
                     v = _clean(v).replace(" ", "")
                     if _looks_like_policy(v):
                         fields["policy_number"] = {
-                            "value": v, "confidence": 0.88, "source": "sweep"
+                            "value": v,
+                            "confidence": 0.88,
+                            "source": "sweep",
                         }
                         break
                 
@@ -1995,24 +1187,31 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                     candidate = _clean(lines[j]).replace(" ", "")
                     if _looks_like_policy(candidate):
                         fields["policy_number"] = {
-                            "value": candidate, "confidence": 0.85, "source": "sweep_lookahead"
+                            "value": candidate,
+                            "confidence": 0.85,
+                            "source": "sweep_lookahead",
                         }
                         break
                 if "policy_number" in fields:
                     break
     
-    # --- Insured Name fallback ---
+    # --- Insured Name fallback (IMPROVED) ---
     if "insured_name" not in fields:
         for i, line in enumerate(lines):
             ll = line.lower()
             if any(k in ll for k in INSURED_LABELS):
-                # Check same line after colon
+                # CRITICAL: Skip if it's a mortgagee section
+                if any(bad in ll for bad in ("mortgagee", "loss payee")):
+                    continue
+                
                 if ":" in line:
                     _, _, v = line.partition(":")
                     v = _normalize_name(v)
                     if _looks_like_name(v):
                         fields["insured_name"] = {
-                            "value": v, "confidence": 0.88, "source": "sweep"
+                            "value": v,
+                            "confidence": 0.88,
+                            "source": "sweep",
                         }
                         break
                 
@@ -2021,7 +1220,9 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                     candidate = _normalize_name(lines[j])
                     if _looks_like_name(candidate):
                         fields["insured_name"] = {
-                            "value": candidate, "confidence": 0.85, "source": "sweep_lookahead"
+                            "value": candidate,
+                            "confidence": 0.85,
+                            "source": "sweep_lookahead",
                         }
                         break
                 if "insured_name" in fields:
@@ -2032,68 +1233,67 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
         for i, line in enumerate(lines):
             ll = line.lower()
             if any(k in ll for k in PROPERTY_TRIGGERS):
-                # Check same line (might have address inline)
-                if _looks_like_address(line) and ":" in line:
-                    _, _, v = line.partition(":")
-                    if _looks_like_address(v):
-                        fields["property_address"] = {
-                            "value": v.strip(), "confidence": 0.86, "source": "sweep"
-                        }
-                        break
-                
-                # Check next few lines
                 for j in range(i + 1, min(i + 5, len(lines))):
                     if _looks_like_address(lines[j]):
                         fields["property_address"] = {
-                            "value": lines[j].strip(), "confidence": 0.84, "source": "sweep_lookahead"
+                            "value": lines[j].strip(),
+                            "confidence": 0.84,
+                            "source": "sweep_lookahead",
                         }
                         break
                 if "property_address" in fields:
                     break
     
-    # --- Mailing Address fallback ---
-    if "mailing_address" not in fields:
-        for i, line in enumerate(lines):
-            ll = line.lower()
-            if any(k in ll for k in MAILING_TRIGGERS):
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    if _looks_like_address(lines[j]):
-                        fields["mailing_address"] = {
-                            "value": lines[j].strip(), "confidence": 0.84, "source": "sweep_lookahead"
-                        }
-                        break
-                if "mailing_address" in fields:
-                    break
-    
-    # --- Carrier Name fallback (scan first 15 lines) ---
+    # --- Carrier Name fallback (scan first 20 lines) ---
     if "carrier_name" not in fields:
-        for line in lines[:15]:
+        # First, look for "underwritten by" or "your insurer" patterns
+        for line in lines[:30]:
             ll = line.lower()
-            if "insurance" in ll:
-                if any(w in ll for w in ("company", "exchange", "group", "mutual", "corp")):
-                    if not any(w in ll for w in ("agency", "agent", "services")):
+            if "underwritten by" in ll or "your insurer" in ll:
+                if ":" in line:
+                    _, _, v = line.partition(":")
+                    v = v.strip()
+                    if 'insurance' in v.lower():
                         fields["carrier_name"] = {
-                            "value": line.strip().upper(),
-                            "confidence": 0.85,
-                            "source": "sweep_header",
+                            "value": v.upper(),
+                            "confidence": 0.90,
+                            "source": "sweep_underwritten",
                         }
                         break
-    
-    # --- Date extraction fallback ---
-    for line in lines:
-        if "effective_date" not in fields:
-            date = _extract_date(line, DATE_LABELS_EFFECTIVE)
-            if date:
-                fields["effective_date"] = {
-                    "value": date, "confidence": 0.85, "source": "sweep"
-                }
         
-        if "expiration_date" not in fields:
-            date = _extract_date(line, DATE_LABELS_EXPIRATION)
-            if date:
-                fields["expiration_date"] = {
-                    "value": date, "confidence": 0.85, "source": "sweep"
-                }
+        # Then try direct insurance company pattern
+        if "carrier_name" not in fields:
+            for line in lines[:20]:
+                ll = line.lower()
+                if 'insurance' in ll:
+                    if any(w in ll for w in ('company', 'exchange', 'group', 'mutual', 'corp')):
+                        if not any(w in ll for w in ('agency', 'agent', 'services')):
+                            fields["carrier_name"] = {
+                                "value": line.strip().upper(),
+                                "confidence": 0.85,
+                                "source": "sweep_header",
+                            }
+                            break
+    
+    # --- Loan Number fallback ---
+    if "loan_number" not in fields:
+        for line in lines:
+            ll = line.lower()
+            if any(k in ll for k in LOAN_LABELS):
+                # Try to extract number from line
+                if ":" in line:
+                    _, _, v = line.partition(":")
+                    digits = ''.join(c for c in v if c.isdigit())
+                else:
+                    digits = ''.join(c for c in line if c.isdigit())
+                
+                if _looks_like_loan_number(digits):
+                    fields["loan_number"] = {
+                        "value": digits,
+                        "confidence": 0.85,
+                        "source": "sweep",
+                    }
+                    break
 
 
 # ============================================================
@@ -2122,4 +1322,3 @@ def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
 def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     """Alias for backward compatibility"""
     return extract_fields(lines, layout_elements)
- 
