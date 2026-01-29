@@ -1,242 +1,16 @@
-# # classification/document_classifier.py
-
-# """
-# Document Classification based on official business rules
-# Matches the company's Document Types reference table
-# """
-
-# DOC_TYPES = {
-#     # ⚠️ ORDER MATTERS - More specific patterns first!
-    
-#     "FPN": [
-#         # Force Placed Notice - Must be very specific to avoid false positives
-#         "second and final notice",
-#         "final notice of flood insurance",
-#         "flood insurance required by lender",
-#         "force placed",
-#         "force-placed",
-#         "we will purchase coverage",
-#         "lender-placed insurance",
-#         "required by your mortgage",
-#         "adequately insured",
-#         "your property must be kept insured",
-#         "insurance will be purchased at your expense",
-#         "notice of special flood hazard"
-#         # NOTE: Removed standalone "sfha" and "nfip" - these appear in all flood policies
-#         # FPN must have clear "notice" or "requirement" context
-#     ],
-    
-#     "DOI": [
-#         # Deletion of Interest
-#         "interest removed",
-#         "deletion of interest",
-#         "mortgage deleted",
-#         "mortgage removed",
-#         "loan has been satisfied"
-#     ],
-
-#     "RNW": [
-#         # Renewal (Reciprocal)
-#         "renewal notice",
-#         "policy renewal",
-#         "renew your policy",
-#         "renewed",
-#         "policy change",
-#         "reason: policy change",
-#         "renewal policy",
-#         "transaction desc: renewal",
-#         "transaction dese: renewal",  # OCR variant
-#         "declaration form contains dwelling amount",
-#         "declaration form contains deductible amount",
-#         "borrower chooses to continue the policy",
-#         "revised declaration",  # Added - key for your doc
-#         "type: revised declaration",  # Added - exact match
-#         "policy changes: from: to:",  # Added - indicates renewal with changes
-#         "policy period"  # Added - if has active period, likely renewal/COI
-#     ],
-
-#     "RNS": [
-#         # Reinstatement
-#         "reinstatement",
-#         "policy reinstated",
-#         "rescission of cancellation",
-#         "rescission notice",
-#         "your policy has been reinstated",
-#         "rescind intend to cancellation",
-#         "withdrawal of cancellation"
-#     ],
-
-#     "CAN": [
-#         # Cancellation
-#         "cancellation notice",
-#         "policy cancelled",
-#         "flood policy cancellation",  # Added - specific to your doc
-#         "your policy has been cancelled",
-#         "expired policy",
-#         "expiration notice",
-#         "return premium",
-#         "cancelled by wish of borrower",
-#         "non-payment of premium",
-#         "non-renewal",
-#         "borrower request",
-#         "company cancelled",
-#         "the building has been sold",  # Added - from your doc
-#         "removed, destroyed"  # Added - from your doc
-#     ],
-
-#     "INV": [
-#         # Invoice
-#         "invoice number",
-#         "invoice date",
-#         "invoice total",
-#         "past due",
-#         "due amount",
-#         "balance due",
-#         "pay in full",
-#         "remit to",
-#         "premium notice",
-#         "amount remit to",
-#         "make check payable"
-#     ],
-
-#     "COI": [
-#         # Certificate of Insurance
-#         "certificate of insurance",
-#         "acord",
-#         "flood maps",
-#         "additional insured",
-#         "certificate holder",
-#         "this declaration page is attached",
-#         "certificate provisions"
-#     ],
-
-#     "BIN": [
-#         # Binder (temporary coverage)
-#         "binder without policy number",
-#         "quote without policy number",
-#         "quote date",
-#         "binder issued",
-#         "temporary coverage",
-#         "cover note",
-#         "binder is an offer issued"
-#     ],
-
-#     "OTH": [
-#         # Other documents
-#         "multiple loans number",
-#         "multiple policy numbers",
-#         "multiple insured names",
-#         "borrower letters",
-#         "document without any details"
-#     ]
-# }
-
-
-# def classify_document(lines):
-#     """
-#     Enhanced document classification with business logic
-#     Follows official document type definitions
-#     """
-#     text = " ".join(lines).lower()
-    
-#     # ========================================
-#     # PRE-CHECK 1: Renewal Invoice Detection
-#     # ========================================
-#     has_invoice = any(kw in text for kw in [
-#         "invoice number", "invoice date", "invoice total", "invoice"
-#     ])
-#     has_renewal = any(kw in text for kw in [
-#         "renewal", "transaction desc: renewal", "transaction dese: renewal",
-#         "renewal policy", "policy renewal"
-#     ])
-    
-#     if has_invoice and has_renewal:
-#         return "RNW"  # Renewal Invoice
-    
-#     # ========================================
-#     # PRE-CHECK 2: Cancellation Context
-#     # ========================================
-#     has_cancellation = "cancellation" in text or "cancelled" in text
-#     has_rescission = "rescission" in text or "reinstated" in text
-    
-#     if has_cancellation and has_rescission:
-#         return "RNS"  # Reinstatement (takes priority over cancellation)
-    
-#     # ========================================
-#     # STANDARD KEYWORD MATCHING
-#     # ========================================
-#     for doc_type, keywords in DOC_TYPES.items():
-#         for keyword in keywords:
-#             if keyword in text:
-#                 # Special validation for BIN to prevent false positives
-#                 if doc_type == "BIN":
-#                     # Only return BIN if explicit binder indicators present
-#                     if any(x in text for x in [
-#                         "binder without policy number",
-#                         "quote without policy number",
-#                         "binder issued",
-#                         "temporary coverage"
-#                     ]):
-#                         return doc_type
-#                     continue
-                
-#                 return doc_type
-    
-#     # ========================================
-#     # FALLBACK HEURISTICS
-#     # ========================================
-    
-#     # Invoice without renewal
-#     if has_invoice and not has_renewal:
-#         return "INV"
-    
-#     # Declaration page
-#     if "declaration" in text and "coverage" in text:
-#         if any(x in text for x in ["certificate", "insured", "limits"]):
-#             return "COI"
-    
-#     # Cancellation without rescission
-#     if has_cancellation and not has_rescission:
-#         return "CAN"
-    
-#     return "OTH"
-
-
-# def get_document_explanation(doc_type: str) -> str:
-#     """
-#     Returns business explanation for document type
-#     """
-#     explanations = {
-#         "BIN": "A binder is an offer issued to the customer by the insurance company. It's an insurance contract used temporarily until the policy is issued.",
-        
-#         "COI": "A COI is a statement of coverage issued by the company that insures your individual and business also which provides a summary of the coverage.",
-        
-#         "DOI": "Once the loan has been satisfied or required change in Mortgage by the borrower then a notice of DOI will be raised.",
-        
-#         "INV": "Invoice is a bill raised to the borrower with the details of due date and due amount which provides a summary of the pending balances.",
-        
-#         "RNS": "Any Cancellation/Pending policy which can be renewed/reactivated after a lapse is known as reinstatement.",
-        
-#         "RNW": "Once the borrower chooses to continue the policy with the same insurance company before the policy period expires would be considered as renewal.",
-        
-#         "OTH": "Information with multiple policies listed in one document and document which is not related to insurance would be considered as other.",
-        
-#         "CAN": "The Policy might get cancelled by wish of Borrower/Insurance company due to various reasons.",
-        
-#         "FPN": "Force placed notice for required insurance coverage."
-#     }
-    
-#     return explanations.get(doc_type, "Unknown document type")
-
 """
-Document Classification based on official business rules
-Matches the company's Document Types reference table
+Document Classification - FIXED VERSION
+Added underwriting keywords, no deletions
 """
-
+from typing import List
+ 
 DOC_TYPES = {
-    # ORDER MATTERS – specific first
-
+    # ORDER MATTERS - More specific patterns first
+    
     "FPN": [
+        # Force Placed Notice
+        "force placed notice",
+        "force-placed notice", 
         "second and final notice",
         "final notice of flood insurance",
         "flood insurance required by lender",
@@ -246,43 +20,39 @@ DOC_TYPES = {
         "lender-placed insurance",
         "required by your mortgage",
         "adequately insured",
+        "your property must be kept insured",
         "insurance will be purchased at your expense",
         "notice of special flood hazard"
     ],
-
+    
     "DOI": [
-        "interest removed",
+        # Deletion of Interest
         "deletion of interest",
+        "interest removed",
         "mortgage deleted",
+        "mortgage deleted/removed",
         "mortgage removed",
         "loan has been satisfied"
     ],
 
-    "RNW": [
-        "renewal notice",
-        "policy renewal",
-        "renew your policy",
-        "renewed",
-        "renewal policy",
-        "transaction desc: renewal",
-        "transaction dese: renewal",
-        "revised declaration",
-        "policy period",
-        "declaration form contains dwelling amount",
-        "declaration form contains deductible amount"
-    ],
-
     "RNS": [
+        # Reinstatement
         "reinstatement",
-        "policy reinstated",
         "rescission of cancellation",
         "rescission notice",
-        "withdrawal of cancellation"
+        "rescind the policy",
+        "policy reinstated",
+        "your policy has been reinstated",
+        "withdrawal of cancellation",
+        "rescind intend to cancellation"
     ],
 
     "CAN": [
+        # Cancellation
         "cancellation notice",
         "policy cancelled",
+        "your policy has been cancelled",
+        "cancelled",
         "expired policy",
         "expiration notice",
         "return premium",
@@ -290,84 +60,355 @@ DOC_TYPES = {
         "non-renewal",
         "borrower request",
         "company cancelled",
+        "the building has been sold",
         "property sold",
-        "removed, destroyed"
+        "removed, destroyed",
+        "cancelled by wish of borrower",
+        "flood policy cancellation",
+        "expiration",
+        "total premium amount is -",
+        "negative example total premium",
+        # Added per instructions - underwriting reasons
+        "underwriting guidelines",
+        "company request",
+        "no longer required by lender"
+    ],
+
+    "RNW": [
+        # Renewal (Reciprocal)
+        "renewal notice",
+        "policy renewal",
+        "renew your policy",
+        "policy change",
+        "reason: policy change",
+        "renewal policy",
+        "transaction desc: renewal",
+        "transaction dese: renewal",
+        "declaration form contains dwelling amount",
+        "declaration form contains deductible amount",
+        "borrower chooses to continue the policy",
+        "revised declaration",
+        "type: revised declaration",
+        "renewed",
+        "policy changes: from: to:",
+        "policy period"
     ],
 
     "INV": [
-        "invoice",
+        # Invoice
         "invoice number",
         "invoice date",
-        "balance due",
-        "amount due",
-        "minimum due",
-        "paid in full",
+        "invoice total",
+        "invoice amount",
         "past due",
+        "due amount",
+        "balance due",
+        "pay in full",
+        "paid in full",
         "remit to",
+        "premium notice",
+        "amount remit to",
         "make check payable",
-        "premium notice"
+        "minimum due",
+        "the document only contains premium amount and due date without the balance due"
     ],
 
     "COI": [
+        # Certificate of Insurance
         "certificate of insurance",
         "acord",
         "flood maps",
+        "additional insured",
         "certificate holder",
-        "additional insured"
+        "this declaration page is attached",
+        "certificate provisions"
     ],
 
     "BIN": [
+        # Binder
         "binder without policy number",
         "quote without policy number",
+        "quote date",
         "binder issued",
         "temporary coverage",
-        "cover note"
+        "cover note",
+        "binder is an offer issued"
     ],
 
     "OTH": [
+        # Other
+        "multiple loans number",
         "multiple policy numbers",
-        "multiple loan numbers",
+        "multiple insured names",
+        "multiple insured names\\address",
         "borrower letters",
         "document without any details"
     ]
 }
 
+def classify_document(lines: List[str]) -> str:
+    """
+    Classify insurance document type.
+    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, FPN, OTH
+    """
 
-def classify_document(lines):
     text = " ".join(lines).lower()
 
-    has_invoice = "invoice" in text
-    has_renewal = "renewal" in text
+    # -----------------------
+    # CANCELLATION (CAN)
+    # -----------------------
+    if any(k in text for k in (
+        "notice of cancellation",
+        "policy cancellation",
+        "is cancelled",
+        "cancelled effective",
+        "expiration notice",
+        "return premium",
+        "expired policy",
+        "void date",
+        "cease date",
+    )):
+        # 🔒 GUARD: Declarations / Renewals must NOT be CAN
+        if any(rnw in text for rnw in (
+            "declaration",
+            "policy declarations",
+            "mortgagee declarations",
+            "renewal",
+            "policy period",
+            "coverage a",
+            "coverage b",
+            "coverage c",
+            "coverage d",
+            "coverage e",
+            "coverage f",
+        )):
+            pass
+        # 🔒 GUARD: underwriting / borrower wording alone ≠ CAN
+        elif any(k in text for k in (
+            "underwriting guidelines",
+            "company request",
+            "borrower request",
+        )) and not any(c in text for c in (
+            "notice of cancellation",
+            "policy cancelled",
+            "cancelled effective",
+        )):
+            pass
+        else:
+            return "CAN"
 
-    if has_invoice and has_renewal:
-        return "RNW"
-
-    if "cancellation" in text and "rescission" in text:
+    # -----------------------
+    # REINSTATEMENT (RNS)
+    # -----------------------
+    if any(k in text for k in (
+        "reinstatement",
+        "rescission of cancellation",
+        "policy reinstated",
+        "rescind cancellation",
+        "withdrawal of cancellation",
+    )):
         return "RNS"
 
-    for doc_type, keywords in DOC_TYPES.items():
-        for kw in keywords:
-            if kw in text:
-                if doc_type == "BIN" and "policy number" in text:
-                    continue
-                return doc_type
+    # -----------------------
+    # INVOICE (INV)
+    # -----------------------
+    if any(k in text for k in (
+        "invoice",
+        "amount due",
+        "balance due",
+        "minimum due",
+        "pay in full",
+        "premium notice",
+        "remit to",
+        "make check payable",
+    )):
+        # 🔒 GUARD: declarations / renewals are NOT invoices
+        if any(g in text for g in (
+            "policy declarations",
+            "declaration page",
+            "mortgagee declarations",
+            "coverage a",
+            "coverage b",
+            "coverage c",
+            "coverage d",
+            "coverage e",
+            "coverage f",
+            "policy period",
+            "renewal",
+        )):
+            pass
+        else:
+            return "INV"
 
-    if has_invoice:
-        return "INV"
+    # -----------------------
+    # STRONG RENEWAL / DECLARATION (RNW)
+    # -----------------------
+    if (
+        "declaration" in text
+        and any(cov in text for cov in (
+            "coverage a",
+            "coverage b",
+            "coverage c",
+            "coverage d",
+            "coverage e",
+            "coverage f",
+        ))
+    ):
+        return "RNW"
 
+    if any(k in text for k in (
+        # Declaration language
+        "policy declarations",
+        "declarations page",
+        "policy declaration",
+        "declaration page",
+        "mortgagee declarations summary",
+        "policy summary",
+
+        # Coverage indicators
+        "coverage a dwelling",
+        "coverage b other structures",
+        "coverage c personal property",
+        "coverage d loss of use",
+        "coverage e personal liability",
+        "coverage f medical payments",
+
+        # Deductible / dwelling indicators
+        "dwelling amount",
+        "dwelling limit",
+        "all other peril deductible",
+        "wind and hail deductible",
+        "deductible",
+
+        # Premium summary
+        "total policy premium",
+        "annual premium",
+        "premium summary",
+
+        # Term / effective language
+        "policy period",
+        "effective date",
+        "expiration date",
+        "term start",
+        "term end",
+
+        # Change / amended declarations
+        "policy change",
+        "amended declarations",
+        "revised declarations",
+        "transaction effective date",
+    )):
+        return "RNW"
+
+    # -----------------------
+    # CERTIFICATE OF INSURANCE (COI)
+    # -----------------------
+    if any(k in text for k in (
+        "certificate of insurance",
+        "this certifies that",
+        "acord",
+        "certificate holder",
+    )):
+        # 🔒 Guard: RNW / DOI must beat COI
+        if any(r in text for r in (
+            # RNW guards
+            "policy declarations",
+            "declarations page",
+            "policy declaration",
+            "declaration page",
+            "mortgagee declarations summary",
+            "policy summary",
+            "coverage a",
+            "coverage b",
+            "coverage c",
+            "coverage d",
+            "coverage e",
+            "coverage f",
+            "dwelling",
+            "policy period",
+            "effective date",
+            "expiration date",
+            "renewal",
+            "renewed",
+            # DOI guards
+            "interest removed",
+            "deletion of interest",
+            "mortgage deleted",
+            "mortgage removed",
+        )):
+            pass
+        else:
+            return "COI"
+
+    # -----------------------
+    # DELETE OF INTEREST (DOI)
+    # -----------------------
+    if any(k in text for k in (
+        "interest removed",
+        "deletion of interest",
+        "mortgage deleted",
+        "mortgage removed",
+    )):
+        # 🔒 GUARD: mortgagee declarations ≠ DOI
+        if any(r in text for r in (
+            "policy declarations",
+            "mortgagee declarations summary",
+            "coverage a",
+            "policy period",
+        )):
+            pass
+        else:
+            return "DOI"
+
+    # -----------------------
+    # FORCE PLACED NOTICE (FPN)
+    # -----------------------
+    if any(k in text for k in (
+        "force placed notice",
+        "force-placed notice",
+        "second and final notice",
+        "final notice of flood insurance",
+        "lender-placed insurance",
+    )):
+        return "FPN"
+
+    # -----------------------
+    # BINDER (BIN)
+    # -----------------------
+    if any(k in text for k in (
+        "binder without policy number",
+        "quote without policy number",
+        "binder issued",
+        "temporary coverage",
+    )):
+        return "BIN"
+
+    # -----------------------
+    # DEFAULT
+    # -----------------------
     return "OTH"
 
 
-def get_document_explanation(doc_type):
+def get_document_explanation(doc_type: str) -> str:
+    """Business explanation for document type"""
     explanations = {
-        "BIN": "Temporary insurance contract issued before policy number generation.",
-        "COI": "Certificate summarizing insurance coverage.",
-        "DOI": "Document indicating removal of mortgage or lien interest.",
-        "INV": "Invoice requesting premium payment.",
-        "RNS": "Reinstatement after cancellation or lapse.",
-        "RNW": "Policy renewed before expiration.",
-        "CAN": "Policy cancellation notice.",
-        "FPN": "Force placed insurance notice.",
-        "OTH": "Unclassified or non-insurance document."
+        "BIN": "A binder is an offer issued to the customer by the insurance company. It's an insurance contract used temporarily until the policy is issued.",
+        
+        "COI": "A COI is a statement of coverage issued by the company that insures your individual and business also which provides a summary of the coverage.",
+        
+        "DOI": "Once the loan has been satisfied or required change in Mortgage by the borrower then a notice of DOI will be raised.",
+        
+        "INV": "Invoice is a bill raised to the borrower with the details of due date and due amount which provides a summary of the pending balances.",
+        
+        "RNS": "Any Cancellation/Pending policy which can be renewed/reactivated after a lapse is known as reinstatement.",
+        
+        "RNW": "Once the borrower chooses to continue the policy with the same insurance company before the policy period expires would be considered as renewal.",
+        
+        "OTH": "Information with multiple policies listed in one document and document which is not related to insurance would be considered as other.",
+        
+        "CAN": "The Policy might get cancelled by wish of Borrower/Insurance company due to various reasons.",
+        
+        "FPN": "Force placed notice for required insurance coverage."
     }
+    
     return explanations.get(doc_type, "Unknown document type")
