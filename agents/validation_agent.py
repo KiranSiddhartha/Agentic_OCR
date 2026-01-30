@@ -404,53 +404,60 @@ def _is_mortgage_company_address(value: str) -> bool:
 def validate_carrier(value: str) -> Tuple[bool, str, float]:
     """Validate carrier name"""
     v = _normalize_whitespace(value)
+    vl = v.lower()
+
+    if not v or len(v) < 5:
+        return False, v, 0.0
 
     if _is_section_header_value(v):
         return False, v, 0.0
 
-    if v.lower() in JUNK_VALUES:
+    if vl in JUNK_VALUES:
         return False, v, 0.0
 
-    if len(v) < 5:
+    # HARD BLOCK: website / CTA / marketing FIRST
+    if any(x in vl for x in (
+        ".com",
+        "go to",
+        "visit",
+        "online",
+        "select",
+        "click",
+        "make a payment",
+    )):
         return False, v, 0.0
 
-    # Clean up common OCR artifacts
+    # Clean OCR artifacts
     v_clean = v.replace('*', '').replace('/', '').strip()
     vl_clean = v_clean.lower()
 
-    # Block known bad carrier patterns (must check before positive matches)
+    # Block known bad carrier patterns
     for bad in BAD_CARRIER_PATTERNS:
         if bad in vl_clean:
             return False, v, 0.0
 
-    # Block agencies/agents/services FIRST (before insurance check)
+    # Block agencies/services
     if any(w in vl_clean for w in ('agency', 'agent', 'services', 'producer')):
         return False, v, 0.0
 
-    # Must contain "insurance" (or "ins" abbreviation)
-    # Check for various patterns: "insurance", " ins ", " ins.", ends with " ins"
-    has_insurance = ('insurance' in vl_clean or 
-                     ' ins ' in vl_clean or 
-                     vl_clean.endswith(' ins') or 
-                     ' ins.' in vl_clean or
-                     ' ins co' in vl_clean or
-                     vl_clean.endswith(' ins co'))
+    # Must contain insurance indicator
+    has_insurance = (
+        'insurance' in vl_clean or
+        ' ins ' in vl_clean or
+        vl_clean.endswith(' ins') or
+        ' ins.' in vl_clean or
+        ' ins co' in vl_clean
+    )
     if not has_insurance:
         return False, v, 0.0
 
-    # Company type indicator (relaxed - many valid variations)
+    # Prefer company type
     company_types = ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')
-    has_company_type = any(w in vl_clean for w in company_types)
-    
-    # If no company type, still accept if it clearly has "insurance" and is reasonably formatted
-    if not has_company_type:
-        # Must have at least 2 words and insurance
-        words = v_clean.split()
-        if len(words) < 2:
+    if not any(w in vl_clean for w in company_types):
+        if len(v_clean.split()) < 2:
             return False, v, 0.0
 
     return True, v_clean.upper(), 0.95
-
 
 def validate_policy_number(value: str) -> Tuple[bool, str, float]:
     """Validate policy number with strict filtering"""
@@ -522,98 +529,104 @@ def validate_policy_number(value: str) -> Tuple[bool, str, float]:
 
     return True, v, 0.95
 
-
 def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     """Validate loan number"""
     v = value.strip()
+    vl = v.lower()
+
+    if not v:
+        return False, v, 0.0
+
+    # HARD BLOCK: mortgage/address contamination
+    if any(x in vl for x in ("po box", "mortgagee", "lienholder")):
+        return False, v, 0.0
+
+    # HARD BLOCK: ZIP-only or ZIP-dominant values
+    if ZIP_RE.fullmatch(v):
+        return False, v, 0.0
 
     if _is_section_header_value(v):
         return False, v, 0.0
 
-    if v.lower() in JUNK_VALUES:
+    if vl in JUNK_VALUES:
         return False, v, 0.0
 
     if _is_document_reference(v):
         return False, v, 0.0
 
-    # Extract digits
-    digits = ''.join(c for c in v if c.isdigit())
-
-    # Loan numbers are typically 8-16 digits
-    if len(digits) < 7 or len(digits) > 16:
+    if _is_phone_number(v):
         return False, v, 0.0
 
-    # Block obvious page reference patterns (underscore separated)
+    # Extract digits ONLY AFTER blocking
+    digits = ''.join(c for c in v if c.isdigit())
+
+    # Loan numbers: 8–16 digits (tightened)
+    if not (8 <= len(digits) <= 16):
+        return False, v, 0.0
+
+    # Block page refs like 12345_678
     if re.match(r'^\d{5}_\d+', v):
         return False, v, 0.0
 
-    # Block date patterns
+    # Block dates
     if DATE_RE.search(v):
         return False, v, 0.0
-    
-    # Block very long sequences of zeros (padding patterns)
-    # But allow some zeros as they're common in real loan numbers
-    if '000000' in digits:  # 6+ consecutive zeros is suspicious
+
+    # Block padding patterns
+    if '000000' in digits:
         return False, v, 0.0
-    
-    # Block if more than 60% zeros
-    zero_count = digits.count('0')
-    if len(digits) > 0 and zero_count > len(digits) * 0.6:
+
+    # Block excessive zeros
+    if digits.count('0') > len(digits) * 0.6:
         return False, v, 0.0
 
     return True, digits, 0.95
 
-
 def validate_name(value: str) -> Tuple[bool, str, float]:
     """
-    Validate person/company name - MAJOR IMPROVEMENTS
-    Block marketing slogans, product names, and document text
+    Validate person/company name
     """
     v = _normalize_whitespace(_strip_prefixes(value))
+    vl = v.lower()
 
     if not v or len(v) < 2:
+        return False, v, 0.0
+
+    # HARD BLOCK: carrier names as insured
+    if "insurance" in vl and any(x in vl for x in ("group", "exchange", "company")):
         return False, v, 0.0
 
     if _is_section_header_value(v):
         return False, v, 0.0
 
-    # Allow colons only if they're separating name parts (e.g., "Last, First")
-    if v.count(":") > 0:
+    if ":" in v:
         return False, v, 0.0
 
-    vl = v.lower()
-
-    # Block marketing slogans
     for slogan in MARKETING_SLOGANS:
         if slogan in vl:
             return False, v, 0.0
 
-    # Block product names
     for product in PRODUCT_NAMES:
         if product in vl:
             return False, v, 0.0
 
-    # Block company names that shouldn't be insured names
     for company in BAD_INSURED_COMPANY_NAMES:
         if company in vl:
             return False, v, 0.0
 
-    # Block bad name phrases
     for phrase in BAD_NAME_PHRASES:
         if phrase in vl:
             return False, v, 0.0
 
-    # Block if starts with certain keywords
     bad_starts = (
         "policy", "coverage", "premium", "billing", "copy",
         "page", "section", "office", "message", "declarations",
-        "effective", "expiration", "total", "subtotal", "the ",
-        "this ", "our ", "your ", "and ", "or ", "for ",
+        "effective", "expiration", "total", "subtotal",
+        "the ", "this ", "our ", "your ", "and ", "or ", "for ",
     )
     if any(vl.startswith(w) for w in bad_starts):
         return False, v, 0.0
 
-    # Block if ends with certain patterns
     bad_ends = (
         " copy", " page", " info", " information", " type",
         " period", " date", " number", " account",
@@ -621,25 +634,20 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     if any(vl.endswith(w) for w in bad_ends):
         return False, v, 0.0
 
-    # Block values with weird characters
     if re.search(r'[$%&*#@!]', v):
         return False, v, 0.0
 
-    # Block document reference patterns
     if _is_document_reference(v):
         return False, v, 0.0
 
-    # Block if contains phone number
     if _is_phone_number(v):
         return False, v, 0.0
 
-    # Allow digits only if entity suffix present
-    has_entity = any(w in vl for w in ["llc", "inc", "corp", "company", "trust", "ltd", "dba"])
+    has_entity = any(w in vl for w in ("llc", "inc", "corp", "company", "trust", "ltd", "dba"))
     if any(c.isdigit() for c in v) and not has_entity:
         return False, v, 0.0
 
-    # Word count check
-    words = [w for w in v.split() if w and len(w) > 0]
+    words = v.split()
     if has_entity:
         if not (2 <= len(words) <= 12):
             return False, v, 0.0
@@ -647,13 +655,11 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
         if not (2 <= len(words) <= 8):
             return False, v, 0.0
 
-    # At least some words should be capitalized (or all caps)
     caps = sum(1 for w in words if w and (w[0].isupper() or w.isupper()))
     if caps < 1:
         return False, v, 0.0
 
     return True, v, 0.95
-
 
 def validate_address(value: str) -> Tuple[bool, str, float]:
     """
@@ -733,7 +739,6 @@ def validate_address(value: str) -> Tuple[bool, str, float]:
 
     return False, v, 0.0
 
-
 def validate_date(value: str) -> Tuple[bool, str, float]:
     """Validate date value"""
     v = _normalize_whitespace(_strip_prefixes(value))
@@ -773,7 +778,6 @@ def validate_date(value: str) -> Tuple[bool, str, float]:
 
     return False, v, 0.0
 
-
 def validate_money(value: str) -> Tuple[bool, str, float]:
     """Validate monetary value"""
     if _is_section_header_value(value):
@@ -790,7 +794,6 @@ def validate_money(value: str) -> Tuple[bool, str, float]:
         pass
 
     return False, value, 0.0
-
 
 def validate_phone(value: str) -> Tuple[bool, str, float]:
     """Validate phone number"""
@@ -850,8 +853,7 @@ def _cross_validate(validated: Dict) -> Dict:
             pass
 
     return validated
-
-
+ 
 # ============================================================
 # MAIN VALIDATION
 # ============================================================
