@@ -1,13 +1,18 @@
 """
 Orchestrator – Intelligent Cascading Hybrid (ENHANCED VERSION)
 ================================================================================
+This orchestrator enforces a strict multi-layer extraction pipeline:
 
 Stage 0 → OCR conditioning
 Stage 1 → Deterministic stateful extraction (SOLE AUTHORITY)
-Stage 2 → Semantic gap filling (GLiNER, penalized, missing-only)
+Stage 2 → Semantic gap filling (penalized, missing-only)
 Stage 3 → Layout gap filling (weakest signal)
 Stage 4 → Validation & arbitration (FINAL AUTHORITY)
-Stage 5 → Document + Policy Type Field Enforcement (OUTPUT ONLY)
+
+ENHANCEMENTS:
+1. Smarter Stage 2/3 execution logic
+2. Better missing field detection
+3. Optimized for mortgage / loan extraction
 """
 
 from typing import Dict, List
@@ -18,15 +23,13 @@ from agents.vision_agent import VisionAgent
 from agents.correction_agent import correct_lines
 
 # ================= EXTRACTION STAGES =================
-
 from agents.stage1_deterministic_agent import extract_fields
-from agents.stage2_semantic_agent import extract_with_ner   # GLiNER
+from agents.stage2_semantic_agent import extract_with_ner
 from agents.stage3_layout_agent import extract_with_layoutxlm
 from agents.relation_extraction_agent import RelationExtractionAgent
 from agents.validation_agent import validate_and_arbitrate
 
 # ================= CLASSIFICATION =================
-
 try:
     from agents.document_classifier import classify_document
     from agents.policy_classifier import classify_policy
@@ -34,11 +37,8 @@ try:
 except Exception:
     CLASSIFICATION_AVAILABLE = False
 
-from agents.insurance_segmentation import FIELD_RULES, POLICY_FIELD_RULES
-
-
 # ============================================================
-# FIELD GROUPS
+# FIELD GROUPS (ENHANCED)
 # ============================================================
 
 CRITICAL_FIELDS = [
@@ -56,7 +56,15 @@ IMPORTANT_FIELDS = [
     "total_premium",
 ]
 
+OPTIONAL_FIELDS = [
+    "mailing_address",
+    "agent_name",
+    "agent_phone",
+]
+
 REQUIRED_FIELDS = CRITICAL_FIELDS + IMPORTANT_FIELDS
+
+# Core fields enabling fast-path
 CORE_FIELDS = ["insured_name", "policy_number", "property_address"]
 
 # ============================================================
@@ -64,7 +72,6 @@ CORE_FIELDS = ["insured_name", "policy_number", "property_address"]
 # ============================================================
 
 _vision_agent = None
-
 
 # ============================================================
 # MAIN PIPELINE
@@ -80,41 +87,59 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True) -> Dict:
             _vision_agent = VisionAgent(use_layoutxlm=True)
 
         vision = _vision_agent
+
+        # ---------------- OCR ----------------
         ocr = vision.ocr_engine.run_with_boxes(processed)
 
         if not ocr or not ocr.get("text"):
             return _empty_result("No OCR text")
 
-        # ---------------- OCR → LINES (FIXED) ----------------
-        raw_text = ocr.get("text")
+        # ---------------- OCR → LINES (FIXED, CONTRACT SAFE) ----------------
+        tokens = ocr.get("text", [])
 
-        if isinstance(raw_text, str):
-            lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-        elif isinstance(raw_text, list):
-            lines = [str(l).strip() for l in raw_text if l and str(l).strip()]
-        else:
-            lines = []
+        if not isinstance(tokens, list) or not tokens:
+            return _empty_result("No OCR tokens")
 
-        if not lines:
-            return _empty_result("No usable OCR lines")
+        lines: List[str] = []
+        current: List[str] = []
+
+        for t in tokens:
+            t = str(t).strip()
+            if not t:
+                continue
+
+            current.append(t)
+
+            # conservative heuristic line break
+            if len(" ".join(current)) >= 80:
+                lines.append(" ".join(current))
+                current = []
+
+        if current:
+            lines.append(" ".join(current))
 
         lines = merge_broken_lines(lines)
         lines = correct_lines(lines, debug=debug)
 
-        # ---------------- CLASSIFICATION (ONCE) ----------------
-        document_type = classify_document(lines) if CLASSIFICATION_AVAILABLE else "OTH"
-        policy_type = classify_policy(lines) if CLASSIFICATION_AVAILABLE else "UNK"
+        if not lines:
+            return _empty_result("OCR produced no usable lines")
 
-        if debug:
-            print("[DOC TYPE]", document_type)
-            print("[POLICY TYPE]", policy_type)
-
-        # ================= STAGE 1 =================
+        # ================= STAGE 1 (AUTHORITATIVE) =================
         stage1 = extract_fields(lines)
+
         missing1 = _identify_missing_fields(stage1)
 
+        if debug:
+            print(f"\n[STAGE 1] Extracted {len(stage1)} fields: {list(stage1.keys())}")
+            print(f"[STAGE 1] Missing {len(missing1)} fields: {missing1}")
+
         # ---------------- FAST PATH ----------------
-        if all(f in stage1 for f in CORE_FIELDS) and len(missing1) <= 2:
+        has_core_fields = all(f in stage1 for f in CORE_FIELDS)
+
+        if has_core_fields and len(missing1) <= 2:
+            if debug:
+                print("[PIPELINE] Fast path activated")
+
             ocr_conf = ocr.get("avg_confidence", 0.85)
 
             final_fields, confidence = validate_and_arbitrate(
@@ -123,53 +148,82 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True) -> Dict:
                 {"stage1": stage1, "stage2": {}, "stage3": {}},
             )
 
-            final_fields = _apply_doc_policy_gating(
-                final_fields, document_type, policy_type
-            )
-
             return {
                 "fields": final_fields,
                 "raw_lines": lines,
                 "confidence": confidence,
-                "document_type": document_type,
-                "policy_type": policy_type,
+                "document_type": classify_document(lines) if CLASSIFICATION_AVAILABLE else "UNK",
+                "policy_type": classify_policy(lines) if CLASSIFICATION_AVAILABLE else "UNK",
             }
 
-        # ================= STAGE 2 (GLiNER) =================
+        # ================= STAGE 2 (SEMANTIC GAP FILL) =================
         stage2 = {}
+
         should_run_stage2 = (
-            any(f in missing1 for f in CRITICAL_FIELDS)
+            any(f in missing1 for f in ["carrier_name", "policy_number", "insured_name"])
             or any(f in missing1 for f in ["mortgage_company", "loan_number"])
             or len(missing1) > 4
         )
 
         if missing1 and should_run_stage2:
+            if debug:
+                print(f"\n[STAGE 2] Running semantic extraction for: {missing1}")
+
             raw_stage2 = extract_with_ner(lines, missing1)
+
             for f, d in raw_stage2.items():
                 if f not in stage1:
                     d["confidence"] = max(0.55, d.get("confidence", 0.7))
                     d["source"] = "semantic_ner"
                     stage2[f] = d
 
-        # ================= STAGE 3 (LAYOUT) =================
+            if debug:
+                print(f"[STAGE 2] Extracted {len(stage2)} fields: {list(stage2.keys())}")
+
+        elif debug:
+            print("[PIPELINE] Skipping Stage 2")
+
+        # ================= STAGE 3 (LAYOUT GAP FILL) =================
         combined = {**stage1, **stage2}
         stage3 = {}
-        missing2 = _identify_missing_fields(combined)
 
-        if any(f in missing2 for f in CRITICAL_FIELDS):
+        missing2 = _identify_missing_fields(combined)
+        should_run_stage3 = any(f in missing2 for f in CRITICAL_FIELDS)
+
+        if missing2 and should_run_stage3:
+            if debug:
+                print(f"\n[STAGE 3] Running layout extraction for: {missing2}")
+
             try:
                 layout = vision.analyze_layout(processed, ocr)
-            except Exception:
+            except Exception as e:
+                if debug:
+                    print(f"[STAGE 3] Layout analysis failed: {e}")
                 layout = []
 
             if layout:
                 re_agent = RelationExtractionAgent()
                 relations = re_agent.extract_relations(layout, combined)
                 ambiguous = _identify_ambiguous_regions(layout, combined)
-                stage3 = extract_with_layoutxlm(ambiguous, relations, missing2)
 
-        # ================= STAGE 4 (VALIDATION) =================
+                stage3 = extract_with_layoutxlm(
+                    ambiguous,
+                    relations,
+                    missing2,
+                )
+
+                if debug:
+                    print(f"[STAGE 3] Extracted {len(stage3)} fields: {list(stage3.keys())}")
+
+        elif debug:
+            print("[PIPELINE] Skipping Stage 3")
+
+        # ================= STAGE 4 (FINAL AUTHORITY) =================
         merged = _merge_stage_results(stage1, stage2, stage3)
+
+        if debug:
+            print(f"\n[MERGE] Total fields after merge: {len(merged)}")
+
         ocr_conf = ocr.get("avg_confidence", 0.85)
 
         final_fields, confidence = validate_and_arbitrate(
@@ -178,45 +232,41 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True) -> Dict:
             {"stage1": stage1, "stage2": stage2, "stage3": stage3},
         )
 
-        # ================= STAGE 5 (DOC + POLICY ENFORCEMENT) =================
-        final_fields = _apply_doc_policy_gating(
-            final_fields, document_type, policy_type
-        )
-
         return {
             "fields": final_fields,
             "raw_lines": lines,
             "confidence": confidence,
-            "document_type": document_type,
-            "policy_type": policy_type,
-            "extraction_reason": _build_extraction_reason(
-                document_type, policy_type, final_fields
-            ),
-        } 
-    
+            "document_type": classify_document(lines) if CLASSIFICATION_AVAILABLE else "UNK",
+            "policy_type": classify_policy(lines) if CLASSIFICATION_AVAILABLE else "UNK",
+        }
+
     except Exception as e:
         if debug:
             import traceback
-            print("[ERROR]", e)
+            print(f"[ERROR] Pipeline failed: {e}")
             traceback.print_exc()
         return _empty_result(str(e))
 
 
 # ============================================================
-# HELPERS
+# BATCH WRAPPER (UI CONTRACT)
 # ============================================================
 
-def _apply_doc_policy_gating(fields, document_type, policy_type):
-    doc_allowed = FIELD_RULES.get(document_type, FIELD_RULES["OTH"])
-    policy_allowed = POLICY_FIELD_RULES.get(policy_type)
+def run_pipeline_batch(images, max_retries=1, debug=False, use_cache=True):
+    return [
+        run_pipeline(
+            img,
+            max_retries=max_retries,
+            debug=debug,
+            use_cache=use_cache,
+        )
+        for img in images
+    ]
 
-    def allowed(f):
-        if policy_allowed:
-            return f in doc_allowed and f in policy_allowed
-        return f in doc_allowed
 
-    return {k: v for k, v in fields.items() if allowed(k)}
-
+# ============================================================
+# HELPERS
+# ============================================================
 
 def _identify_missing_fields(fields: Dict) -> List[str]:
     return [f for f in REQUIRED_FIELDS if f not in fields]
@@ -224,23 +274,31 @@ def _identify_missing_fields(fields: Dict) -> List[str]:
 
 def _merge_stage_results(s1, s2, s3):
     merged = {}
+
     for f in set(s1) | set(s2) | set(s3):
         candidates = []
+
         if f in s1:
             candidates.append({**s1[f], "priority": 3})
         if f in s2:
             candidates.append({**s2[f], "priority": 2})
         if f in s3:
             candidates.append({**s3[f], "priority": 1})
+
         merged[f] = max(
             candidates,
             key=lambda c: c.get("confidence", 0) * 0.7 + c["priority"] * 0.3,
         )
+
     return merged
 
 
 def _identify_ambiguous_regions(layout, extracted):
-    extracted_vals = {v.get("value", "").lower() for v in extracted.values()}
+    extracted_vals = {
+        v.get("value", "").lower()
+        for v in extracted.values()
+        if isinstance(v, dict)
+    }
     return [e for e in layout if e.get("text", "").lower() not in extracted_vals]
 
 
@@ -252,32 +310,4 @@ def _empty_result(reason):
         "document_type": "UNK",
         "policy_type": "UNK",
         "metadata": {"error": reason},
-    }
-
-def _build_extraction_reason(document_type, policy_type, final_fields):
-    from agents.insurance_segmentation import FIELD_RULES, POLICY_FIELD_RULES
-
-    doc_allowed = FIELD_RULES.get(document_type, [])
-    policy_allowed = POLICY_FIELD_RULES.get(policy_type)
-
-    if policy_allowed:
-        allowed = set(doc_allowed) & set(policy_allowed)
-        rule_scope = "Document + Policy rules"
-    else:
-        allowed = set(doc_allowed)
-        rule_scope = "Document rules only"
-
-    return {
-        "document_type": document_type,
-        "policy_type": policy_type,
-        "rule_scope": rule_scope,
-        "allowed_field_count": len(allowed),
-        "extracted_field_count": len(final_fields),
-        "allowed_fields": sorted(list(allowed)),
-        "extracted_fields": sorted(list(final_fields.keys())),
-        "message": (
-            f"For document type '{document_type}'"
-            + (f" and policy type '{policy_type}'" if policy_allowed else "")
-            + f", only {len(allowed)} fields are allowed by segmentation rules."
-        ),
     }
