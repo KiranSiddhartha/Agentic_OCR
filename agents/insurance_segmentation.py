@@ -191,6 +191,35 @@ POLICY_FIELD_RULES = {
     },
 }
 
+from typing import Optional, Set
+
+def get_allowed_fields(
+    document_type: str,
+    policy_type: Optional[str] = None
+) -> Set[str]:
+    """
+    Determine allowed fields based on document and policy type.
+
+    Rules:
+    - RNW / HO / HAZ → UNION of document + policy rules
+    - CAN / DOI     → INTERSECTION (strict)
+    - Others        → document rules only
+    """
+    doc_fields: Set[str] = FIELD_RULES.get(document_type, set())
+    policy_fields: Set[str] = (
+        POLICY_FIELD_RULES.get(policy_type, set())
+        if policy_type
+        else set()
+    )
+
+    if document_type in {"RNW", "HO", "HAZ"}:
+        return doc_fields | policy_fields
+
+    if document_type in {"CAN", "DOI"} and policy_fields:
+        return doc_fields & policy_fields
+
+    return doc_fields
+
 # ============================================================
 # SECTION DEFINITIONS (OWNERSHIP MODEL)
 # ============================================================

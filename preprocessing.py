@@ -11,6 +11,7 @@ def preprocess(image, strategy=None):
     - No morphology
     - No aggressive denoising
     - Keeps 3-channel image
+    - OPTIMIZATION: Skip denoising for clean scans
     """
 
     if image is None:
@@ -20,7 +21,14 @@ def preprocess(image, strategy=None):
     if len(image.shape) == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    # VERY mild denoise (optional, safe)
+    # OPTIMIZATION: Skip denoising for clean/high-quality scans
+    # Clean scans have high mean pixel value and low noise
+    mean_val = image.mean()
+    if mean_val > 200:
+        # Clean scan — denoising would only slow us down
+        return image
+
+    # VERY mild denoise for noisy/fax/low-quality scans only
     image = cv2.fastNlMeansDenoisingColored(
         image,
         None,
