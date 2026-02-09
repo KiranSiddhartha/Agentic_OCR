@@ -1,4 +1,3 @@
- 
 # # app.py – INTELLIGENT CASCADING HYBRID VISUALIZATION
 # # Bounding boxes ONLY in preview (NOT in extracted fields)
 
@@ -369,6 +368,11 @@ def merge_page_results(results: list) -> dict:
         "raw_lines": all_lines,
         "confidence": best.get("confidence", 0.0),
         "page_count": len(results),
+        "document_type": best.get("document_type", "UNK"),
+        "policy_type": best.get("policy_type", "UNK"),
+        "approach": best.get("approach"),
+        "routing_reason": best.get("routing_reason"),
+        "fallback_used": best.get("fallback_used"),
     }
 
 
@@ -584,12 +588,12 @@ for f in st.session_state.files:
             results = run_pipeline_batch(pages)
             result = merge_page_results(results)
 
-            # 🔑 FIX: Use orchestrator fields directly, don't call segregate_insurance_document
-            # (orchestrator already does all extraction)
+            # Use orchestrator's classification (already routed through
+            # document_classifier → document_router pipeline)
             seg = {
                 "fields": strip_bbox(result["fields"]),
-                "document_type": classify_document(result["raw_lines"]),
-                "policy_type": classify_policy(result["raw_lines"])
+                "document_type": result.get("document_type") or classify_document(result["raw_lines"]),
+                "policy_type": result.get("policy_type") or classify_policy(result["raw_lines"]),
             }
 
             # store original fields for preview boxes

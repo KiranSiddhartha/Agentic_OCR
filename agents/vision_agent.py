@@ -14,7 +14,7 @@ class VisionAgent:
         Stage-aware Vision Agent
         Stage 0 : PP-OCRv3
         Stage 1 : Rule-based layout
-        Stage 2 : LayoutLMv3 (ONLY if needed)
+        Stage 2 : LayoutLMv3 (LAZY — loaded only when needed)
         """
         from api.ocr_engine import OCREngine
         self.ocr_engine = OCREngine()
@@ -23,27 +23,29 @@ class VisionAgent:
         self.use_layoutxlm = use_layoutxlm
         self.processor = None
         self.model = None
+        self._layoutlm_load_attempted = False
 
-        if use_layoutxlm:
-            try:
-                from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
-
-                # IMPORTANT: apply_ocr MUST be False
-                self.processor = LayoutLMv3Processor.from_pretrained(
-                    "microsoft/layoutlmv3-base",
-                    apply_ocr=False
-                )
-
-                self.model = LayoutLMv3ForTokenClassification.from_pretrained(
-                    "microsoft/layoutlmv3-base"
-                )
-                self.model.eval()
-
-                print("[VisionAgent] LayoutLMv3 loaded")
-
-            except Exception as e:
-                print(f"[VisionAgent] LayoutLMv3 unavailable: {e}")
-                self.use_layoutxlm = False
+    def _ensure_layoutlm(self):
+        """Lazy-load LayoutLMv3 only when first needed."""
+        if self._layoutlm_load_attempted:
+            return self.model is not None
+        self._layoutlm_load_attempted = True
+        try:
+            from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
+            self.processor = LayoutLMv3Processor.from_pretrained(
+                "microsoft/layoutlmv3-base",
+                apply_ocr=False
+            )
+            self.model = LayoutLMv3ForTokenClassification.from_pretrained(
+                "microsoft/layoutlmv3-base"
+            )
+            self.model.eval()
+            print("[VisionAgent] LayoutLMv3 loaded (lazy)")
+            return True
+        except Exception as e:
+            print(f"[VisionAgent] LayoutLMv3 unavailable: {e}")
+            self.use_layoutxlm = False
+            return False
 
     # --------------------------------------------------------
     # STAGE 0 – OCR (STANDARD)
@@ -143,7 +145,9 @@ class VisionAgent:
         if not self._needs_semantic_layout(basic_layout):
             return basic_layout
 
-        # ---------- STAGE 2: LAYOUTLMv3 (EXPENSIVE) ----------
+        # ---------- STAGE 2: LAYOUTLMv3 (EXPENSIVE, LAZY-LOADED) ----------
+        if not self._ensure_layoutlm():
+            return basic_layout
         try:
             return self._layoutlm_analysis(image, ocr_results)
         except Exception as e:
