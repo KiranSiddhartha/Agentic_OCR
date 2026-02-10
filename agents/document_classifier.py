@@ -3,6 +3,7 @@ Document Classification - FIXED VERSION
 Added underwriting keywords, no deletions
 """
 from typing import List
+import re
  
 DOC_TYPES = {
     # ORDER MATTERS - More specific patterns first
@@ -149,32 +150,62 @@ DOC_TYPES = {
 def classify_document(lines: List[str]) -> str:
     """
     Classify insurance document type.
-    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, FPN, OTH
+    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, BRQ, TPN, FPN, EDI, OTH
+
+    Valid doc types per business rules:
+      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN, FPN
+    Additional extraction-only types (used for routing, not displayed):
+      BRQ, TPN, EDI
+
+    NRNW is NOT a doc type — non-renewal is a CAN with reason=non-renewal.
+    The policy classifier separately returns NRNW as a policy_type.
     """
 
     text = " ".join(lines).lower()
 
-    # -----------------------
-    # CANCELLATION (CAN)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 1: THIRD PARTY NOTICE OF TERMINATION
+    # Always doc_type=CAN (or DOI for interest-only).
+    # The cancellation reason (BREQ) is handled by policy_classifier.
+    # ==========================================================
+    if "third party notice of termination" in text:
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", text))
+        has_interest_terminate = bool(re.search(
+            r"terminate the interest.*?hereon[:\s]*\d", text))
+
+        if has_interest_terminate and not has_policy_terminate:
+            # Only interest termination → DOI
+            return "DOI"
+        # Policy termination (borrower request) → CAN
+        return "CAN"
+
+    # ==========================================================
+    # PRIORITY 2: CANCELLATION (CAN) — includes non-renewal
+    # Non-renewal IS a form of cancellation per business rules.
+    # ==========================================================
     if any(k in text for k in (
         "notice of cancellation",
         "policy cancellation",
         "is cancelled",
         "cancelled effective",
-        "expiration notice",
-        "return premium",
-        "expired policy",
+        "policy is cancelled",
         "void date",
         "cease date",
+        # Non-renewal keywords → still CAN doc type
+        "notice of non-renewal",
+        "non-renewal date",
+        "non-renewal notice",
+        "will be non-renewed",
+        "will not be renewed",
+        "nonrenewal notice",
+        "notice of nonrenewal",
     )):
         # 🔒 GUARD: Declarations / Renewals must NOT be CAN
         if any(rnw in text for rnw in (
             "declaration",
             "policy declarations",
             "mortgagee declarations",
-            "renewal",
-            "policy period",
             "coverage a",
             "coverage b",
             "coverage c",
@@ -183,23 +214,12 @@ def classify_document(lines: List[str]) -> str:
             "coverage f",
         )):
             pass
-        # 🔒 GUARD: underwriting / borrower wording alone ≠ CAN
-        elif any(k in text for k in (
-            "underwriting guidelines",
-            "company request",
-            "borrower request",
-        )) and not any(c in text for c in (
-            "notice of cancellation",
-            "policy cancelled",
-            "cancelled effective",
-        )):
-            pass
         else:
             return "CAN"
 
-    # -----------------------
-    # REINSTATEMENT (RNS)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 4: REINSTATEMENT (RNS)
+    # ==========================================================
     if any(k in text for k in (
         "reinstatement",
         "rescission of cancellation",
@@ -209,10 +229,46 @@ def classify_document(lines: List[str]) -> str:
     )):
         return "RNS"
 
-    # -----------------------
-    # INVOICE (INV)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 5: DELETION OF INTEREST (DOI) — broader patterns
+    # ==========================================================
     if any(k in text for k in (
+        "deletion of interest",
+        "interest removed",
+        "mortgage deleted",
+        "mortgage removed",
+        "terminate the interest of the third party",
+        "interest is hereby removed",
+        "interest has been removed",
+        "loan has been satisfied",
+    )):
+        # 🔒 GUARD: mortgagee declarations ≠ DOI
+        if any(r in text for r in (
+            "policy declarations",
+            "mortgagee declarations summary",
+            "coverage a",
+        )):
+            pass
+        else:
+            return "DOI"
+
+    # ==========================================================
+    # PRIORITY 6: EDI (Electronic Data Interchange image)
+    # ==========================================================
+    if any(k in text for k in (
+        "edi image",
+        "electronic data interchange",
+    )):
+        return "EDI"
+
+    # ==========================================================
+    # PRIORITY 7: INVOICE (INV) — check BEFORE RNW to catch
+    # "policy bill" documents that also contain "effective date"
+    # ==========================================================
+    inv_signals = any(k in text for k in (
+        "policy bill",
+        "homeowners policy bill",
+        "renewal premium bill",
         "invoice",
         "amount due",
         "balance due",
@@ -221,28 +277,29 @@ def classify_document(lines: List[str]) -> str:
         "premium notice",
         "remit to",
         "make check payable",
-    )):
-        # 🔒 GUARD: declarations / renewals are NOT invoices
+        "make checks payable",
+        "to pay in full amount due",
+        "balance (to pay in full)",
+        "return this portion with your payment",
+    ))
+    if inv_signals:
+        # 🔒 GUARD: declarations with coverage tables are RNW, not INV
         if any(g in text for g in (
             "policy declarations",
             "declaration page",
             "mortgagee declarations",
-            "coverage a",
-            "coverage b",
-            "coverage c",
-            "coverage d",
-            "coverage e",
-            "coverage f",
-            "policy period",
-            "renewal",
+            "coverage a dwelling",
+            "coverage b other",
+            "coverage c personal",
+            "coverage d loss",
         )):
             pass
         else:
             return "INV"
 
-    # -----------------------
-    # STRONG RENEWAL / DECLARATION (RNW)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 8: STRONG RENEWAL / DECLARATION (RNW)
+    # ==========================================================
     if (
         "declaration" in text
         and any(cov in text for cov in (
@@ -272,6 +329,14 @@ def classify_document(lines: List[str]) -> str:
         "coverage d loss of use",
         "coverage e personal liability",
         "coverage f medical payments",
+        "coverage and limits of liability",
+
+        # Dwelling fire / dwelling policy indicators
+        "dwelling policy",
+        "dwelling fire policy",
+        "dwelling fire policy number",
+        "loss payee, mortgagee or other interest",
+        "a. dwelling",
 
         # Deductible / dwelling indicators
         "dwelling amount",
@@ -284,6 +349,8 @@ def classify_document(lines: List[str]) -> str:
         "total policy premium",
         "annual premium",
         "premium summary",
+        "total premium this location",
+        "total premium all locations",
 
         # Term / effective language
         "policy period",
@@ -297,12 +364,16 @@ def classify_document(lines: List[str]) -> str:
         "amended declarations",
         "revised declarations",
         "transaction effective date",
+
+        # Renewal language
+        "renewal notice",
+        "this is your renewal",
     )):
         return "RNW"
 
-    # -----------------------
-    # CERTIFICATE OF INSURANCE (COI)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 9: CERTIFICATE OF INSURANCE (COI)
+    # ==========================================================
     if any(k in text for k in (
         "certificate of insurance",
         "this certifies that",
@@ -311,7 +382,6 @@ def classify_document(lines: List[str]) -> str:
     )):
         # 🔒 Guard: RNW / DOI must beat COI
         if any(r in text for r in (
-            # RNW guards
             "policy declarations",
             "declarations page",
             "policy declaration",
@@ -330,7 +400,6 @@ def classify_document(lines: List[str]) -> str:
             "expiration date",
             "renewal",
             "renewed",
-            # DOI guards
             "interest removed",
             "deletion of interest",
             "mortgage deleted",
@@ -340,29 +409,9 @@ def classify_document(lines: List[str]) -> str:
         else:
             return "COI"
 
-    # -----------------------
-    # DELETE OF INTEREST (DOI)
-    # -----------------------
-    if any(k in text for k in (
-        "interest removed",
-        "deletion of interest",
-        "mortgage deleted",
-        "mortgage removed",
-    )):
-        # 🔒 GUARD: mortgagee declarations ≠ DOI
-        if any(r in text for r in (
-            "policy declarations",
-            "mortgagee declarations summary",
-            "coverage a",
-            "policy period",
-        )):
-            pass
-        else:
-            return "DOI"
-
-    # -----------------------
-    # FORCE PLACED NOTICE (FPN)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 10: FORCE PLACED NOTICE (FPN)
+    # ==========================================================
     if any(k in text for k in (
         "force placed notice",
         "force-placed notice",
@@ -372,9 +421,9 @@ def classify_document(lines: List[str]) -> str:
     )):
         return "FPN"
 
-    # -----------------------
-    # BINDER (BIN)
-    # -----------------------
+    # ==========================================================
+    # PRIORITY 11: BINDER (BIN)
+    # ==========================================================
     if any(k in text for k in (
         "binder without policy number",
         "quote without policy number",
@@ -383,9 +432,9 @@ def classify_document(lines: List[str]) -> str:
     )):
         return "BIN"
 
-    # -----------------------
+    # ==========================================================
     # DEFAULT
-    # -----------------------
+    # ==========================================================
     return "OTH"
 
 
