@@ -213,16 +213,16 @@ def _detect_inner_doc_type(lines: List[str]) -> Optional[str]:
         return "CAN"
     if any(k in text for k in ("non-renewal", "nonrenewal",
                                 "will not be renewed")):
-        return "NRNW"
+        return "CAN"
     if any(k in text for k in ("edi image", "electronic data")):
         return "EDI"
     if any(k in text for k in ("certificate of insurance",
                                 "certificate holder")):
         return "COI"
     if "borrower request" in text:
-        return "BRQ"
+        return "CAN"
     if "third party notice" in text:
-        return "TPN"
+        return "CAN"
     return None
 
 
@@ -423,12 +423,12 @@ def route(
     if doc_type == "PQ" or is_fax:
         inner = _detect_inner_doc_type(lines)
         # DOI FIR PQ → DTE  (table 6)
-        if inner in ("DOI", "CAN", "NRNW", "EDI"):
+        if inner in ("DOI", "CAN", "EDI"):
             return _r(Approach.DTE,
                       f"PQ wrapping {inner} → DTE",
                       is_multi_page=True)
         # COI UO PQ → SC+TE → DTE (table 6)
-        if inner in ("COI", "BRQ", "TPN"):
+        if inner in ("COI", "TPN"):
             return _r(Approach.SC_TE_DTE,
                       f"PQ wrapping {inner} → SC+TE → DTE",
                       is_multi_page=True)
@@ -437,7 +437,7 @@ def route(
                   "Fax/packet → SC → SARDE → LATE",
                   is_multi_page=True)
 
-    # ─── CANCELLATIONS ──────────────────────────────────────
+    # ─── CANCELLATIONS (includes non-renewal) ─────────────────
     # CAN → DTE by default
     # CAN + FLD (flood/underwriting cancel) → SC+TE (table 3)
     if doc_type == "CAN":
@@ -446,11 +446,6 @@ def route(
                       "Flood cancellation → SC+TE")
         return _r(Approach.DTE,
                   "Cancellation → DTE")
-
-    # ─── NON-RENEWAL ────────────────────────────────────────
-    if doc_type == "NRNW":
-        return _r(Approach.DTE,
-                  "Non-renewal → DTE")
 
     # ─── DELETION OF INTEREST ───────────────────────────────
     # DOI + HO  → SARDE  (policy change, table 3)
@@ -471,8 +466,8 @@ def route(
         return _r(Approach.DTE, "EDI → DTE")
 
     # ─── SEMI-TEMPLATE DOCS ────────────────────────────────
-    # BRQ, TPN, COI, RNS, BIN → SC+TE → DTE
-    if doc_type in ("BRQ", "TPN", "COI", "RNS", "BIN"):
+    # TPN, COI, RNS, BIN → SC+TE → DTE
+    if doc_type in ("TPN", "COI", "RNS", "BIN"):
         return _r(Approach.SC_TE_DTE,
                   f"Semi-template ({doc_type}) → SC+TE → DTE")
 
