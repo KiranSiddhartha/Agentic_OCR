@@ -205,24 +205,61 @@ def _detect_inner_doc_type(lines: List[str]) -> Optional[str]:
     if not lines:
         return None
     text = " ".join(lines).lower()
+    
+    # DOI signals (check before CAN since DOI docs may contain cancellation language)
     if any(k in text for k in ("deletion of interest", "interest removal",
-                                "interest deleted")):
+                                "interest deleted", "interest removed",
+                                "mortgagee interest removed",
+                                "mir-mortgagee interest removed",
+                                "mir mortgagee interest removed",
+                                "third party interest removed")) or bool(
+        re.search(r"mir[\s\-]*mortgagee", text)
+    ) or bool(re.search(r"cancel\s*reason[:\s]*mir", text)):
         return "DOI"
+    
+    # CAN signals
     if any(k in text for k in ("notice of cancellation", "cancellation notice",
-                                "policy cancelled")):
+                                "policy cancelled",
+                                "reason cancellation", "doc type - cancellation",
+                                "doc type cancellation",
+                                "cancellation customer initiated",
+                                "cancel reason")):
         return "CAN"
     if any(k in text for k in ("non-renewal", "nonrenewal",
                                 "will not be renewed")):
         return "CAN"
-    if any(k in text for k in ("edi image", "electronic data")):
+    # LexisNexis notification with cancellation
+    if "insurance coverage notification" in text and "cancellation" in text:
+        return "CAN"
+    if "borrower request" in text or "customer initiated" in text:
+        return "CAN"
+    if "third party notice" in text:
+        return "CAN"
+    
+    # EDI images
+    if any(k in text for k in ("edi image", "electronic data",
+                                "electronic image generated for edi",
+                                "electronic image generated",
+                                "generated for edi", "edi data")):
         return "EDI"
     if any(k in text for k in ("certificate of insurance",
                                 "certificate holder")):
         return "COI"
-    if "borrower request" in text:
-        return "CAN"
-    if "third party notice" in text:
-        return "CAN"
+    
+    # Check for renewal/declarations content inside the packet
+    if any(k in text for k in ("renewal flood insurance",
+                                "flood insurance policy declarations",
+                                "policy declarations",
+                                "agent issued declarations",
+                                "declarations",
+                                "coverage a", "coverage b",
+                                "total policy premium",
+                                "annual premium",
+                                "homeowners policy",
+                                "policy premium",
+                                "dwelling (coverage a)")):
+        return "RNW"
+    
     return None
 
 
@@ -261,12 +298,28 @@ def classify_doc_type(lines: List[str]) -> str:
         return "UNK"
 
     head = " ".join(lines[:50]).lower()
+    full = " ".join(lines).lower()
+
+    # ---- Deletion of interest (check BEFORE cancellation) ----
+    if any(k in full for k in ("deletion of interest", "interest removal",
+                                "interest deleted", "remove interest",
+                                "interest removed", "mortgagee interest removed",
+                                "mir-mortgagee interest removed",
+                                "mir mortgagee interest removed",
+                                "third party interest removed")) or bool(
+        re.search(r"mir[\s\-]*mortgagee\s+interest\s+removed", full)
+    ) or bool(re.search(r"cancel\s*reason[:\s]*mir", full)):
+        return "DOI"
 
     # ---- Cancellation ----
-    if any(k in head for k in ("notice of cancellation", "cancellation notice",
+    if any(k in full for k in ("notice of cancellation", "cancellation notice",
                                 "policy cancelled", "will be cancelled",
                                 "cancel effective", "is hereby cancelled",
-                                "cancellation date")):
+                                "cancellation date",
+                                "reason cancellation", "doc type - cancellation",
+                                "doc type cancellation",
+                                "cancellation customer initiated",
+                                "reason: cancellation")):
         return "CAN"
 
     # ---- Non-renewal ----
@@ -279,11 +332,6 @@ def classify_doc_type(lines: List[str]) -> str:
     if any(k in head for k in ("borrower request", "borrower cancel",
                                 "borrower-requested")):
         return "BRQ"
-
-    # ---- Deletion of interest ----
-    if any(k in head for k in ("deletion of interest", "interest removal",
-                                "interest deleted", "remove interest")):
-        return "DOI"
 
     # ---- Third-party notice ----
     if any(k in head for k in ("third party notice", "third-party notice",
@@ -320,8 +368,26 @@ def classify_doc_type(lines: List[str]) -> str:
         return "BIN"
 
     # ---- EDI image ----
-    if any(k in head for k in ("edi image", "electronic data",
-                                "edi transaction")):
+    if any(k in full for k in ("edi image", "electronic data",
+                                "edi transaction",
+                                "electronic image generated for edi",
+                                "electronic image generated",
+                                "generated for edi",
+                                "edi data")):
+        # Check if it's actually a DOI wrapped in EDI format
+        if any(k in full for k in ("interest removed", "mir-mortgagee",
+                                    "mir mortgagee", "cancel reason mir",
+                                    "mortgagee interest removed")) or bool(
+            re.search(r"mir[\s\-]*mortgagee", full)):
+            return "DOI"
+        return "EDI"
+    
+    # ---- LexisNexis insurance coverage notification ----
+    if "insurance coverage notification" in full:
+        if "cancellation" in full:
+            return "CAN"
+        if any(k in full for k in ("interest removed", "mir")):
+            return "DOI"
         return "EDI"
 
     # ---- Fax / packet ----
@@ -336,9 +402,13 @@ def classify_doc_type(lines: List[str]) -> str:
         return "RNW"
 
     # ---- Full-text fallback for renewals ----
-    full = " ".join(lines).lower()
     if any(k in full for k in ("coverage a", "coverage b",
-                                "dwelling coverage", "annual premium")):
+                                "dwelling coverage", "annual premium",
+                                "renewal flood insurance",
+                                "flood insurance policy declarations",
+                                "agent issued declarations",
+                                "policy premium",
+                                "total policy premium")):
         return "RNW"
 
     return "UNK"
@@ -349,12 +419,16 @@ def classify_policy_type(lines: List[str]) -> str:
     if not lines:
         return "UNK"
     text = " ".join(lines[:60]).lower()
+    full = " ".join(lines).lower()
 
-    if any(k in text for k in ("flood", "nfip", "fema")):
+    if any(k in full for k in ("flood", "nfip", "fema")):
         return "FLD"
-    if any(k in text for k in ("wind only", "hurricane")):
+    if any(k in full for k in ("wind only", "hurricane")):
         return "WND"
-    if any(k in text for k in ("dwelling fire", "dp-3", "dp3", "dp-1")):
+    if any(k in full for k in ("dwelling fire", "dp-3", "dp3", "dp-1",
+                                "dfire", "dfire-s11",
+                                "cov type - dwelling fire",
+                                "cov type dwelling fire")):
         return "FIR"
     if any(k in text for k in ("hazard", " haz ")):
         return "HAZ"
@@ -362,7 +436,8 @@ def classify_policy_type(lines: List[str]) -> str:
         return "HO6"
     if "dp3" in text or "dp-3" in text:
         return "DP3"
-    if any(k in text for k in ("homeowner", "ho-3", "ho3", "home protection")):
+    if any(k in full for k in ("homeowner", "ho-3", "ho3", "home protection",
+                                "homeowners pol", "homeowner pol")):
         return "HO"
     return "UNK"
 
@@ -422,16 +497,52 @@ def route(
     #   route to that doc's native approach instead
     if doc_type == "PQ" or is_fax:
         inner = _detect_inner_doc_type(lines)
-        # DOI FIR PQ → DTE  (table 6)
+        # DOI/CAN/EDI inside PQ → DTE
         if inner in ("DOI", "CAN", "EDI"):
-            return _r(Approach.DTE,
-                      f"PQ wrapping {inner} → DTE",
-                      is_multi_page=True)
-        # COI UO PQ → SC+TE → DTE (table 6)
+            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS["PQ"])
+            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS["PQ"])
+            return RoutingResult(
+                approach=Approach.DTE,
+                doc_type=inner,
+                policy_type=policy_type,
+                required_fields=inner_req,
+                optional_fields=inner_opt,
+                carrier_hint=carrier,
+                has_tables=has_tables,
+                reason=f"PQ wrapping {inner} → DTE",
+                is_multi_page=True,
+            )
+        # COI/TPN inside PQ → SC+TE → DTE
         if inner in ("COI", "TPN"):
-            return _r(Approach.SC_TE_DTE,
-                      f"PQ wrapping {inner} → SC+TE → DTE",
-                      is_multi_page=True)
+            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS["PQ"])
+            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS["PQ"])
+            return RoutingResult(
+                approach=Approach.SC_TE_DTE,
+                doc_type=inner,
+                policy_type=policy_type,
+                required_fields=inner_req,
+                optional_fields=inner_opt,
+                carrier_hint=carrier,
+                has_tables=has_tables,
+                reason=f"PQ wrapping {inner} → SC+TE → DTE",
+                is_multi_page=True,
+            )
+        # RNW inside PQ → SARDE + LATE (standard renewal approach)
+        if inner == "RNW":
+            rnw_req = REQUIRED_FIELDS.get("RNW", req)
+            rnw_opt = OPTIONAL_FIELDS.get("RNW", opt)
+            approach = Approach.SARDE_LATE if (has_tables or policy_type in TABLE_POLICY_TYPES) else Approach.SARDE
+            return RoutingResult(
+                approach=approach,
+                doc_type="RNW",
+                policy_type=policy_type,
+                required_fields=rnw_req,
+                optional_fields=rnw_opt,
+                carrier_hint=carrier,
+                has_tables=has_tables,
+                reason=f"PQ wrapping RNW ({policy_type}) → {approach.value}",
+                is_multi_page=True,
+            )
         # General PQ → full cascade
         return _r(Approach.SC_SARDE_LATE,
                   "Fax/packet → SC → SARDE → LATE",

@@ -496,6 +496,14 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             except Exception:
                 pass
 
+        # If classify_document returned OTH, treat it as UNK so the
+        # router's classify_doc_type gets a second chance.  OTH is the
+        # default/"I don't know" bucket — the router's classifier uses
+        # different heuristics and may succeed where document_classifier
+        # did not (e.g. for fax packets, EDI images, etc.).
+        if doc_type == "OTH":
+            doc_type = "UNK"
+
         # ============================
         # STAGE 2 — ROUTE
         # ============================

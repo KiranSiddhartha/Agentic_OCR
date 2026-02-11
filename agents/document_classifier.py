@@ -181,17 +181,70 @@ def classify_document(lines: List[str]) -> str:
         return "CAN"
 
     # ==========================================================
-    # PRIORITY 2: CANCELLATION (CAN) — includes non-renewal
+    # PRIORITY 2: DELETION OF INTEREST (DOI) — check BEFORE CAN
+    # because some DOI docs also contain cancellation language
+    # (e.g., "policy change/cancellation notice" with "no longer have an interest")
+    # ==========================================================
+    doi_signals = any(k in text for k in (
+        "deletion of interest",
+        "interest removed",
+        "third party interest removed",
+        "mortgage deleted",
+        "mortgage removed",
+        "terminate the interest of the third party",
+        "interest is hereby removed",
+        "interest has been removed",
+        "loan has been satisfied",
+        "you no longer have an interest",
+        "no longer have an interest in the",
+        "removed all indications of your interest",
+        "mortgagee interest removed",
+        "mir-mortgagee interest removed",
+        # EDI format patterns
+        "mir - mortgagee interest removed",
+        "mir mortgagee interest removed",
+        "cancel reason mir",
+        # Additional OCR-robust patterns
+        "interest removal",
+        "interest deleted",
+        "remove interest",
+        "interest termination",
+        "interest terminated",
+    )) or bool(re.search(
+        r"mir[\s\-]*mortgagee\s+interest\s+removed", text
+    )) or bool(re.search(
+        r"cancel\s*reason[:\s]*mir", text
+    ))
+    if doi_signals:
+        # 🔒 GUARD: mortgagee declarations / full policy docs ≠ DOI
+        # Use regex for "coverage a" to avoid false match on "coverage amt"
+        doi_guard = any(r in text for r in (
+            "policy declarations",
+            "mortgagee declarations summary",
+        )) or bool(re.search(r"\bcoverage a\b", text))
+        if not doi_guard:
+            return "DOI"
+
+    # ==========================================================
+    # PRIORITY 3: CANCELLATION (CAN) — includes non-renewal
     # Non-renewal IS a form of cancellation per business rules.
     # ==========================================================
     if any(k in text for k in (
         "notice of cancellation",
+        "cancellation notice",
         "policy cancellation",
+        "flood policy cancellation",
         "is cancelled",
+        "is being cancelled",
+        "has been cancelled",
+        "will be cancelled",
         "cancelled effective",
+        "cancellation effective",
         "policy is cancelled",
+        "policy cancelled",
         "void date",
         "cease date",
+        "cancellation date",
         # Non-renewal keywords → still CAN doc type
         "notice of non-renewal",
         "non-renewal date",
@@ -200,19 +253,46 @@ def classify_document(lines: List[str]) -> str:
         "will not be renewed",
         "nonrenewal notice",
         "notice of nonrenewal",
-    )):
+        # Policy change/cancellation notice (AmFam format)
+        "policy change/cancellation notice",
+        # LexisNexis / EDI formats
+        "reason cancellation",
+        "doc type - cancellation",
+        "reason: cancellation",
+        # Additional: LexisNexis insurance coverage notification with cancellation
+        "reason cancellation customer",
+        "cancellation customer initiated",
+        "reason: cancellation customer initiated",
+        "xlc-s11 doc type - cancellation",
+        "doc type cancellation",
+        "nlc-s11 doc type - cancellation",
+        # EDI-style cancellation
+        "cancel reason",
+        "for all cancellation",
+    )) or (
+        # LexisNexis notification + "cancellation" anywhere = CAN
+        "insurance coverage notification" in text and "cancellation" in text
+    ):
         # 🔒 GUARD: Declarations / Renewals must NOT be CAN
-        if any(rnw in text for rnw in (
-            "declaration",
-            "policy declarations",
-            "mortgagee declarations",
-            "coverage a",
-            "coverage b",
-            "coverage c",
-            "coverage d",
-            "coverage e",
-            "coverage f",
-        )):
+        # Use \b to avoid false matches like "coverage afforded" matching "coverage a"
+        # EXCEPTION: LexisNexis notifications with explicit cancellation reason
+        # should ALWAYS be CAN regardless of guard
+        is_lexisnexis_can = (
+            "insurance coverage notification" in text 
+            and "cancellation" in text
+        )
+        can_guard_patterns = [
+            r"\bdeclarations?\b",
+            r"\bpolicy declarations\b",
+            r"\bmortgagee declarations\b",
+            r"\bcoverage a\b",
+            r"\bcoverage b\b",
+            r"\bcoverage c\b",
+            r"\bcoverage d\b",
+            r"\bcoverage e\b",
+            r"\bcoverage f\b",
+        ]
+        if not is_lexisnexis_can and any(re.search(p, text) for p in can_guard_patterns):
             pass
         else:
             return "CAN"
@@ -220,46 +300,93 @@ def classify_document(lines: List[str]) -> str:
     # ==========================================================
     # PRIORITY 4: REINSTATEMENT (RNS)
     # ==========================================================
-    if any(k in text for k in (
+    rns_signals = any(k in text for k in (
         "reinstatement",
         "rescission of cancellation",
         "policy reinstated",
         "rescind cancellation",
         "withdrawal of cancellation",
-    )):
-        return "RNS"
-
-    # ==========================================================
-    # PRIORITY 5: DELETION OF INTEREST (DOI) — broader patterns
-    # ==========================================================
-    if any(k in text for k in (
-        "deletion of interest",
-        "interest removed",
-        "mortgage deleted",
-        "mortgage removed",
-        "terminate the interest of the third party",
-        "interest is hereby removed",
-        "interest has been removed",
-        "loan has been satisfied",
-    )):
-        # 🔒 GUARD: mortgagee declarations ≠ DOI
-        if any(r in text for r in (
+    ))
+    if rns_signals:
+        # 🔒 GUARD: "reinstatement date: n/a" or "reinstatement date:" 
+        # appearing in declaration forms does NOT mean RNS.
+        # Only trigger RNS if there's actual reinstatement context.
+        rns_is_just_field_label = (
+            "reinstatement date" in text
+            and not any(k in text for k in (
+                "policy reinstated",
+                "rescission of cancellation",
+                "rescind cancellation",
+                "withdrawal of cancellation",
+                "your policy has been reinstated",
+                "hereby reinstated",
+            ))
+        )
+        # Also guard: if strong renewal/declaration signals present,
+        # "reinstatement" is just a field label in the dec page
+        rns_in_declaration = any(k in text for k in (
+            "renewal flood insurance",
+            "flood insurance policy declarations",
             "policy declarations",
-            "mortgagee declarations summary",
-            "coverage a",
-        )):
-            pass
+            "renewal notice",
+            "declarations page",
+            "agent issued declarations",
+        ))
+        if rns_is_just_field_label or rns_in_declaration:
+            pass  # Skip RNS — it's just a field label in a declaration
         else:
-            return "DOI"
+            return "RNS"
+
+    # (DOI moved to Priority 2 above)
 
     # ==========================================================
     # PRIORITY 6: EDI (Electronic Data Interchange image)
     # ==========================================================
+    # Note: "insurance coverage notification" (LexisNexis format) is 
+    # handled separately — it can be CAN, DOI, or RNW, NOT just EDI.
+    # Only pure EDI images (with explicit "edi" keywords) return EDI.
     if any(k in text for k in (
         "edi image",
         "electronic data interchange",
-    )):
-        return "EDI"
+        "electronic image generated for edi",
+        "electronic image generated for edi data",
+        # OCR-robust patterns for EDI header
+        "electronic image generated",
+        "generated for edi",
+        "edi data",
+    )) or bool(re.search(r"electronic\s+image\s+generated", text)):
+        # Guard: if strong CAN/DOI signals exist, those take priority
+        has_doi = any(k in text for k in (
+            "interest removed", "mir-mortgagee", "mir mortgagee",
+            "mortgagee interest removed",
+        )) or bool(re.search(r"mir[\s\-]*mortgagee", text)) or bool(
+            re.search(r"cancel\s*reason[:\s]*mir", text)
+        )
+        if has_doi:
+            return "DOI"  # Force DOI — the EDI doc IS a DOI
+        else:
+            return "EDI"
+    
+    # LexisNexis "insurance coverage notification" — classify based on content
+    if "insurance coverage notification" in text or "lexisnexis" in text:
+        # Check for cancellation context
+        if any(k in text for k in (
+            "reason cancellation", "cancellation customer",
+            "doc type - cancellation", "doc type cancellation",
+            "cancellation", "cancelled", "cancel date",
+            "cancel reason",
+        )):
+            # Don't return CAN here if the CAN check above already failed
+            # due to its guard. Instead, just skip EDI and let it fall 
+            # through to RNW or other checks.
+            pass
+        # Check for DOI context
+        elif any(k in text for k in (
+            "interest removed", "mir-mortgagee", "mir mortgagee",
+        )):
+            pass  # Already handled above
+        else:
+            return "EDI"
 
     # ==========================================================
     # PRIORITY 7: INVOICE (INV) — check BEFORE RNW to catch
@@ -284,15 +411,40 @@ def classify_document(lines: List[str]) -> str:
     ))
     if inv_signals:
         # 🔒 GUARD: declarations with coverage tables are RNW, not INV
-        if any(g in text for g in (
+        # Also guard: "this is not an invoice/bill" (LexisNexis format)
+        inv_guard = any(g in text for g in (
             "policy declarations",
             "declaration page",
+            "declarations page",
             "mortgagee declarations",
+            "agent issued declarations",
             "coverage a dwelling",
             "coverage b other",
             "coverage c personal",
             "coverage d loss",
-        )):
+            "this is not an invoice",
+            "not an invoice/bill",
+            "insurance coverage notification",
+            # Additional guards for declaration documents
+            "premium notice state farm",
+            "homeowners policy",
+            "homeowner policy",
+            "dwelling (coverage a)",
+            "dwelling coverage a",
+            "limit of liability",
+            "forms & endorsements",
+            "forms and endorsements",
+            "policy type",
+            "location of premises",
+            "mortgagee copy",
+        )) or (
+            "declarations" in text and re.search(r"\bcoverage a\b", text)
+        ) or (
+            "declarations" in text and "premium" in text and "policy" in text
+        ) or (
+            "premium notice" in text and "declarations" in text
+        )
+        if inv_guard:
             pass
         else:
             return "INV"
@@ -368,6 +520,16 @@ def classify_document(lines: List[str]) -> str:
         # Renewal language
         "renewal notice",
         "this is your renewal",
+        
+        # Flood renewal specific
+        "renewal flood insurance",
+        "flood insurance policy declarations",
+        "renewal billing payor",
+        
+        # Agent-issued declarations
+        "agent issued declarations",
+        "premium notice state farm",
+        
     )):
         return "RNW"
 
