@@ -8,16 +8,121 @@ from typing import List
 def classify_policy(lines: List[str]) -> str:
     """
     Classify insurance policy type.
-    Returns: AUTO, ERQ, FIR, FLD, HAZ, HO6, LL, HO, UO, WND, NRNW, UNK
+    Returns: BREQ, NPAY, NRNW, UNWR, CEL,
+             AUTO, ERQ, FIR, FLD, HAZ, HO6, LL, HO, UO, WND, UNK
 
-    NRNW = non-renewal (cancellation sub-type expressed as policy type).
-    Priority: standalone types first (FLD, FIR, AUTO, ERQ, WND),
-              then residential sub-types (HO6, LL, UO),
-              then HO vs HAZ (HO needs strong residential signals),
-              then NRNW for non-renewal cancellations.
+    For CAN/DOI docs, the cancellation REASON (BREQ/NPAY/NRNW/UNWR/CEL)
+    takes priority over coverage type (FLD/HO/etc).
     """
 
     text = " ".join(lines).lower()
+
+    # ==========================================================
+    # 0. CANCELLATION SUB-TYPES — checked FIRST
+    # For CAN docs, the reason WHY it was cancelled is more
+    # important than WHAT was insured (flood/home/etc).
+    # Priority: BREQ > NPAY > NRNW > UNWR > CEL
+    # ==========================================================
+
+    # BREQ — Borrower Request / Insured-initiated cancellation
+    if "third party notice of termination" in text:
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", text))
+        if has_policy_terminate:
+            return "BREQ"
+
+    if any(k in text for k in (
+        "insured - non pay",
+        "insured non pay",
+        "insured - nonpay",
+        "insured request",
+        "borrower request",
+        "customer request",
+        "customer initiated",
+        "cancellation customer initiated",
+        "reason cancellation customer",
+        "at the request of the insured",
+        "requested by the insured",
+        "requested by insured",
+        # LexisNexis / EDI cancellation reason patterns
+        "reason cancellation customer initiated",
+        "reason: customer initiated",
+        "cancel reason: customer",
+        "cancel reason customer",
+    )):
+        return "BREQ"
+    
+    # Additional BREQ: LexisNexis notification with cancellation context
+    # If "insurance coverage notification" + "cancellation" + no other 
+    # specific reason → check if customer/borrower initiated
+    if "insurance coverage notification" in text and "cancellation" in text:
+        # If we see cancellation in a LexisNexis notification but no specific
+        # sub-reason was detected above, default to BREQ (most common for 
+        # LexisNexis notifications to insurance tracking)
+        if not any(k in text for k in (
+            "non-payment", "nonpayment", "failure to pay",
+            "non-renewal", "nonrenewal",
+            "underwriting", "company request",
+        )):
+            return "BREQ"
+    if any(k in text for k in (
+        "premium payment has not been received",
+        "non-payment of premium",
+        "nonpayment of premium",
+        "failure to pay premium",
+        "premium not paid",
+        "premium has not been paid",
+        "payment is not received on or before",
+    )):
+        return "NPAY"
+
+    # NRNW — Non-Renewal
+    if any(k in text for k in (
+        "non-renewal",
+        "nonrenewal",
+        "will be non-renewed",
+        "will not be renewed",
+        "notice of non-renewal",
+    )):
+        return "NRNW"
+
+    # UNWR — Underwriting (carrier decision to cancel)
+    if any(k in text for k in (
+        "underwriting",
+        "underwriting guidelines",
+        "building has been sold",
+        "building has been sold, removed",
+        "property has been sold",
+        "no longer meets the definition",
+        "company request",
+        "company decision",
+        "does not meet underwriting",
+        "risk does not meet",
+    )):
+        return "UNWR"
+
+    # CEL — Generic Cancellation (CAN doc without specific reason)
+    # Guard: skip if DOI signals present (cancellation date in DOI = interest end date)
+    is_doi_context = any(k in text for k in (
+        "no longer have an interest",
+        "loan has been satisfied",
+        "interest removed",
+        "interest has been removed",
+        "deletion of interest",
+    ))
+    if not is_doi_context and any(k in text for k in (
+        "cancellation notice",
+        "notice of cancellation",
+        "policy cancellation",
+        "flood policy cancellation",
+        "will be cancelled",
+        "has been cancelled",
+        "is being cancelled",
+        "cancelled effective",
+        "cancellation effective",
+        "cancellation date",
+    )):
+        return "CEL"
 
     # ==========================================================
     # 1. FLOOD (DOMINANT — standalone policy)
@@ -54,7 +159,16 @@ def classify_policy(lines: List[str]) -> str:
         "insured under perils fire",
         "coverage type: dwelling fire",
         "dwelling fire policy",
-    ))
+        # EDI format patterns
+        "dfire",
+        "dfire-s11",
+        "cov type - dwelling fire",
+        "cov type dwelling fire",
+        "covtype dwelling fire",
+        "coverage type dwelling fire",
+    )) or bool(re.search(r"dfire[\s\-]*s11", text)) or bool(
+        re.search(r"cov\s*type.*dwelling\s*fire", text)
+    )
     if fir_signals:
         # FIR ALWAYS wins when explicit dwelling fire keywords present.
         # "coverage a" in a dwelling fire doc does NOT make it HO.
@@ -231,39 +345,7 @@ def classify_policy(lines: List[str]) -> str:
     if ho_score >= 1 and "dwelling" in text and "dwelling fire" not in text:
         return "HO"
 
-    # ==========================================================
-    # 11. CANCELLATION SUB-TYPES (as policy types)
-    # These only fire for CAN/DOI docs. Priority: BREQ > NPAY > NRNW
-    # ==========================================================
-
-    # BREQ — Borrower Request (Third Party Notice of Termination)
-    # Only fires when policy termination checkbox is actually checked (has a date)
-    if "third party notice of termination" in text:
-        has_policy_terminate = bool(re.search(
-            r"terminate this policy effective[:\s]*\d", text))
-        if has_policy_terminate:
-            return "BREQ"
-
-    # NPAY — Non-Payment of Premium
-    if any(k in text for k in (
-        "premium payment has not been received",
-        "non-payment of premium",
-        "nonpayment of premium",
-        "failure to pay premium",
-        "premium not paid",
-        "premium has not been paid",
-    )):
-        return "NPAY"
-
-    # NRNW — Non-Renewal
-    if any(k in text for k in (
-        "non-renewal",
-        "nonrenewal",
-        "will be non-renewed",
-        "will not be renewed",
-        "notice of non-renewal",
-    )):
-        return "NRNW"
+    # (Cancellation sub-types moved to step 0 at top)
 
     # ==========================================================
     # 12. "House & Home" → HAZ (Allstate policy type label)
@@ -276,7 +358,18 @@ def classify_policy(lines: List[str]) -> str:
         return "HAZ"
 
     # ==========================================================
-    # 13. MOBILEHOME → HO (per table: HO includes Mobile Home)
+    # 13. "Homeowners Policy" standalone → HO
+    # For docs that mention "homeowners policy" but lack coverage details
+    # ==========================================================
+    if any(k in text for k in (
+        "homeowners policy",
+        "homeowner policy",
+        "homeowner's policy",
+    )):
+        return "HO"
+
+    # ==========================================================
+    # 14. MOBILEHOME → HO (per table: HO includes Mobile Home)
     # ==========================================================
     if any(k in text for k in (
         "mobile home",
@@ -351,7 +444,9 @@ def get_policy_explanation(policy_type: str) -> str:
         "WND": "Windstorm insurance covers damages caused by high winds, tornadoes, hail and other weather events.",
         "NRNW": "Non-renewal indicates the insurance company has chosen not to renew the policy at the end of its term.",
         "NPAY": "Non-payment cancellation occurs when premium payment has not been received by the due date.",
-        "BREQ": "Borrower request cancellation occurs when the insured/borrower requests termination of the policy.",
+        "BREQ": "Borrower request cancellation occurs when the insured/borrower requests or triggers termination of the policy.",
+        "CEL": "Generic cancellation where the specific reason for policy termination is not categorized.",
+        "UNWR": "Underwriting cancellation occurs when the carrier cancels due to underwriting guidelines, property changes, or risk assessment.",
         "UNK": "If policy-related information is not available in the document it will be considered as Unknown."
     }
     return explanations.get(policy_type, "Unknown policy type")
