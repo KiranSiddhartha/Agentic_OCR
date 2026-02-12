@@ -49,30 +49,47 @@ ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".pdf", ".zip")
 def prettify(name: str) -> str:
     return name.replace("_", " ").title()
 
-
 def merge_page_results(results: list) -> dict:
     if not results:
-        return {"fields": {}, "raw_lines": [], "confidence": 0.0, "page_count": 0}
+        return {
+            "fields": {},
+            "raw_lines": [],
+            "confidence": 0.0,
+            "page_count": 0,
+            "document_type": "UNK",
+            "policy_type": "UNK",
+        }
 
-    all_lines, fields = [], {}
-    best = max(results, key=lambda r: r.get("confidence", 0.0))
+    all_lines = []
+    fields = {}
 
+    # Merge all pages FIRST
     for r in results:
         all_lines.extend(r.get("raw_lines", []))
         fields.update(r.get("fields", {}))
 
+    merged_lines = all_lines
+
+    # Now classify on FULL document
+    from document_router import classify_doc_type
+    from policy_classifier import classify_policy
+
+    doc_type = classify_doc_type(merged_lines)
+    policy_type = classify_policy(merged_lines)
+
+    best = max(results, key=lambda r: r.get("confidence", 0.0))
+
     return {
         "fields": fields,
-        "raw_lines": all_lines,
+        "raw_lines": merged_lines,
         "confidence": best.get("confidence", 0.0),
         "page_count": len(results),
-        "document_type": best.get("document_type", "UNK"),
-        "policy_type": best.get("policy_type", "UNK"),
+        "document_type": doc_type,
+        "policy_type": policy_type,
         "approach": best.get("approach"),
         "routing_reason": best.get("routing_reason"),
         "fallback_used": best.get("fallback_used"),
     }
-
 
 def render_extracted_text(seg: dict) -> str:
     fields = seg.get("fields", {})
@@ -118,10 +135,20 @@ def draw_preview_boxes(image, fields, page_index, ocr_data=None, bbox_mode="fiel
     img = image.copy()
     h, w = img.shape[:2]
     
-    print(f"\n=== Drawing boxes for page {page_index} ===")
+    print(f"\n{'='*80}")
+    print(f"=== Drawing boxes for page {page_index} ===")
     print(f"Image size: {w}x{h}")
-    print(f"Fields received: {list(fields.keys()) if fields else 'None'}")
     print(f"Bbox mode: {bbox_mode}")
+    print(f"Fields received: {len(fields) if fields else 0}")
+    
+    if fields:
+        # Count fields with bboxes for this page
+        fields_with_bbox = 0
+        for fname, fdata in fields.items():
+            if isinstance(fdata, dict) and 'bbox' in fdata and 'page' in fdata:
+                fields_with_bbox += 1
+        print(f"Fields with bbox data: {fields_with_bbox}")
+    print('='*80)
 
     # Draw word-level bounding boxes (if available and requested)
     if bbox_mode in ["words", "both"] and ocr_data:
@@ -177,54 +204,84 @@ def draw_preview_boxes(image, fields, page_index, ocr_data=None, bbox_mode="fiel
                 print(f"  Skipping - no bbox or page")
                 continue
 
-            # 🔑 FIX #1: Check both 0-based and 1-based page indices
-            # Try multiple page matching strategies
+            # 🔑 FIX #1: Improved page matching logic
+            # Handle multiple page numbering conventions
             page_matches = False
             
-            if page + 1 == page_index:  # Standard: page is 0-based
+            # Case 1: page is 0-based, page_index is 1-based
+            if page + 1 == page_index:
                 page_matches = True
-                print(f"  Page match: 0-based ({page} + 1 == {page_index})")
-            elif page == page_index:  # Alternative: page is 1-based
+                print(f"  ✓ Page match (0-based): {page} + 1 == {page_index}")
+            # Case 2: both are 1-based
+            elif page == page_index:
                 page_matches = True
-                print(f"  Page match: 1-based ({page} == {page_index})")
-            elif page == page_index - 1:  # Another alternative
+                print(f"  ✓ Page match (1-based): {page} == {page_index}")
+            # Case 3: page is 1-based, page_index needs adjustment
+            elif page == page_index - 1:
                 page_matches = True
-                print(f"  Page match: adjusted ({page} == {page_index - 1})")
+                print(f"  ✓ Page match (adjusted): {page} == {page_index - 1}")
+            # Case 4: Try page 0 = page 1 (some extractors use 0 for first page)
+            elif page == 0 and page_index == 1:
+                page_matches = True
+                print(f"  ✓ Page match (zero-indexed): page 0 == page 1")
                 
             if not page_matches:
-                print(f"  Skipping - page mismatch")
+                print(f"  ✗ Skipping - page mismatch (field page={page}, display page={page_index})")
                 continue
 
             try:
                 x1, y1, x2, y2 = bbox
                 print(f"  Original bbox: ({x1}, {y1}, {x2}, {y2})")
 
-                # 🔑 FIX #2: normalized → pixel (check multiple formats)
-                if 0 <= x1 <= 1 and 0 <= y1 <= 1 and 0 <= x2 <= 1 and 0 <= y2 <= 1:
-                    # Normalized 0-1
-                    x1, x2 = int(x1 * w), int(x2 * w)
-                    y1, y2 = int(y1 * h), int(y2 * h)
-                    print(f"  Converted from 0-1 normalized to pixels")
-                elif 0 <= x1 <= 1000 and 0 <= y1 <= 1000:
-                    # Normalized 0-1000
-                    x1 = int((x1 / 1000) * w)
-                    y1 = int((y1 / 1000) * h)
-                    x2 = int((x2 / 1000) * w)
-                    y2 = int((y2 / 1000) * h)
-                    print(f"  Converted from 0-1000 normalized to pixels")
+                # 🔑 FIX #2: Robust coordinate conversion
+                # Check if coordinates are normalized (0-1) or (0-1000) or pixels
+                if all(isinstance(coord, (int, float)) for coord in [x1, y1, x2, y2]):
+                    if 0 <= x1 <= 1 and 0 <= y1 <= 1 and 0 <= x2 <= 1 and 0 <= y2 <= 1:
+                        # Normalized 0-1
+                        x1, x2 = int(x1 * w), int(x2 * w)
+                        y1, y2 = int(y1 * h), int(y2 * h)
+                        print(f"  Converted from 0-1 normalized to pixels")
+                    elif 0 <= x1 <= 1000 and 0 <= y1 <= 1000 and 0 <= x2 <= 1000 and 0 <= y2 <= 1000:
+                        # Normalized 0-1000
+                        x1 = int((x1 / 1000) * w)
+                        y1 = int((y1 / 1000) * h)
+                        x2 = int((x2 / 1000) * w)
+                        y2 = int((y2 / 1000) * h)
+                        print(f"  Converted from 0-1000 normalized to pixels")
+                    else:
+                        # Already in pixels
+                        x1, y1, x2, y2 = map(int, bbox)
+                        print(f"  Using pixel coordinates as-is")
+                    
+                    # Ensure coordinates are within image bounds
+                    x1 = max(0, min(x1, w))
+                    y1 = max(0, min(y1, h))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+                    
+                    # Ensure x2 > x1 and y2 > y1 (swap if needed)
+                    if x2 < x1:
+                        x1, x2 = x2, x1
+                    if y2 < y1:
+                        y1, y2 = y2, y1
+                    
+                    # Validate box has area
+                    if x2 - x1 < 1 or y2 - y1 < 1:
+                        print(f"  ✗ Box too small: width={x2-x1}, height={y2-y1}")
+                        continue
                 else:
-                    # Already in pixels
-                    x1, y1, x2, y2 = map(int, bbox)
-                    print(f"  Using pixel coordinates as-is")
+                    print(f"  ✗ Invalid bbox format: {bbox}")
+                    continue
                 
                 print(f"  Final pixel bbox: ({x1}, {y1}, {x2}, {y2})")
 
-                # Draw field-level boxes in green
+                # Draw field-level boxes in dark green
+                dark_green = (0, 100, 0)  # Dark green color (BGR format)
                 cv2.rectangle(
                     img,
                     (x1, y1),
                     (x2, y2),
-                    (0, 255, 0),  # Green for field-level
+                    dark_green,  # Dark green for field-level
                     2
                 )
                 
@@ -243,7 +300,7 @@ def draw_preview_boxes(image, fields, page_index, ocr_data=None, bbox_mode="fiel
                     img,
                     (x1, label_y - text_h - 4),
                     (x1 + text_w + 4, label_y),
-                    (0, 255, 0),
+                    dark_green,
                     -1
                 )
                 
@@ -444,15 +501,33 @@ for f in st.session_state.files:
             results = run_pipeline_batch(pages)
             result = merge_page_results(results)
 
+            # seg = {
+            #     "fields": strip_bbox(result["fields"]),
+            #     "document_type": result.get("document_type") if result.get("document_type") not in (None, "", "UNK", "OTH") else classify_document(result.get("raw_lines", [])),
+            #     "policy_type": result.get("policy_type") if result.get("policy_type") not in (None, "", "UNK") else classify_policy(result.get("raw_lines", [])),
+            # }
+
             seg = {
                 "fields": strip_bbox(result["fields"]),
-                "document_type": result.get("document_type") if result.get("document_type") not in (None, "", "UNK", "OTH") else classify_document(result.get("raw_lines", [])),
-                "policy_type": result.get("policy_type") if result.get("policy_type") not in (None, "", "UNK") else classify_policy(result.get("raw_lines", [])),
-            }
-
+                "document_type": result.get("document_type", "UNK"),
+                "policy_type": result.get("policy_type", "UNK"),
+            } 
+            
             # store original fields for preview boxes
             st.session_state["latest_fields"] = result["fields"]
             st.session_state["processed"] = True
+            
+            # Debug: Check what fields have bounding boxes
+            print(f"\n=== Stored fields for bounding boxes ===")
+            for fname, fdata in result["fields"].items():
+                if isinstance(fdata, dict):
+                    has_bbox = "bbox" in fdata
+                    has_page = "page" in fdata
+                    print(f"  {fname}: bbox={has_bbox}, page={has_page}")
+                    if has_bbox and has_page:
+                        print(f"    → bbox={fdata['bbox']}, page={fdata['page']}")
+            print("=" * 50)
+            
             elapsed = time.time() - start
 
     # # -------- UPDATE PREVIEW WITH BOUNDING BOXES --------

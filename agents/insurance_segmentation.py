@@ -1,11 +1,57 @@
-# Insurance Segmentation Module - UPDATED WITH POLICY TYPE INTERSECTION
-# This module defines which fields are allowed based on BOTH document type AND policy type
+# Insurance Segmentation Module - CLEAN ARCHITECTURE VERSION
+# Proper segregation of document types and policy types with field rules
 
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional, Set
 
-# agents/insurance_segmentation.py
-# DROP-IN FIX — FIELD NAME ALIGNMENT ONLY
+# ============================================================
+# VALID DOCUMENT TYPES (Structural)
+# ============================================================
+
+VALID_DOC_TYPES = {
+    "BIN",  # Binder
+    "COI",  # Certificate of Insurance
+    "DOI",  # Deletion of Interest
+    "INV",  # Invoice
+    "RNS",  # Reinstatement
+    "RNW",  # Renewal/Declarations
+    "CAN",  # Cancellation
+    "OTH",  # Other
+    "UNK",  # Unknown
+}
+
+# ============================================================
+# POLICY TYPES
+# ============================================================
+
+# Coverage Types
+COVERAGE_TYPES = {
+    "AUTO",  # Automobile
+    "ERQ",   # Earthquake
+    "FIR",   # Fire / Dwelling Fire
+    "FLD",   # Flood
+    "HAZ",   # Hazard / Commercial Property
+    "HO",    # Homeowners
+    "HO6",   # Condo
+    "LL",    # Landlord
+    "UO",    # Unit Owner
+    "WND",   # Windstorm
+}
+
+# Cancellation Subtypes (Reasons)
+CANCELLATION_SUBTYPES = {
+    "BREQ",  # Borrower Request
+    "NPAY",  # Non-Payment
+    "NRNW",  # Non-Renewal
+    "UNWR",  # Underwriting
+    "CEL",   # Generic Cancellation
+}
+
+ALL_POLICY_TYPES = COVERAGE_TYPES | CANCELLATION_SUBTYPES | {"UNK"}
+
+# ============================================================
+# FIELD RULES BY DOCUMENT TYPE
+# ============================================================
 
 FIELD_RULES = {
     "RNW": {
@@ -46,20 +92,16 @@ FIELD_RULES = {
         "expiration_date",
         "cancellation_date",
         "cancellation_reason",
-    },
-    "FPN": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "loan_number",
-        "mortgage_company",
+        "property_address",  # ADDED - often needed
+        "mortgage_company",  # ADDED - often needed
     },
     "DOI": {
         "carrier_name",
         "policy_number",
         "mortgage_company",
         "loan_number",
+        "insured_name",  # ADDED - usually present
+        "property_address",  # ADDED - usually present
     },
     "RNS": {
         "carrier_name",
@@ -91,7 +133,12 @@ FIELD_RULES = {
     },
 }
 
+# ============================================================
+# FIELD RULES BY POLICY TYPE
+# ============================================================
+
 POLICY_FIELD_RULES = {
+    # COVERAGE TYPES
     "HO": {
         "carrier_name",
         "policy_number",
@@ -130,6 +177,8 @@ POLICY_FIELD_RULES = {
         "effective_date",
         "expiration_date",
         "total_premium",
+        "mortgage_company",  # ADDED - fire policies often have mortgagee
+        "loan_number",  # ADDED
     },
     "WND": {
         "carrier_name",
@@ -184,6 +233,75 @@ POLICY_FIELD_RULES = {
         "effective_date",
         "expiration_date",
     },
+    
+    # CANCELLATION SUBTYPES (REASONS)
+    "BREQ": {
+        # Borrower Request cancellation
+        "carrier_name",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "mortgage_company",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "cancellation_date",
+        "cancellation_reason",
+    },
+    "NPAY": {
+        # Non-Payment cancellation
+        "carrier_name",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "mortgage_company",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "cancellation_date",
+        "cancellation_reason",
+    },
+    "NRNW": {
+        # Non-Renewal
+        "carrier_name",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "mortgage_company",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "cancellation_date",
+        "cancellation_reason",
+    },
+    "UNWR": {
+        # Underwriting cancellation
+        "carrier_name",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "mortgage_company",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "cancellation_date",
+        "cancellation_reason",
+    },
+    "CEL": {
+        # Generic cancellation
+        "carrier_name",
+        "policy_number",
+        "insured_name",
+        "property_address",
+        "mortgage_company",
+        "loan_number",
+        "effective_date",
+        "expiration_date",
+        "cancellation_date",
+        "cancellation_reason",
+    },
+    
+    # UNKNOWN
     "UNK": {
         "carrier_name",
         "policy_number",
@@ -191,7 +309,9 @@ POLICY_FIELD_RULES = {
     },
 }
 
-from typing import Optional, Set
+# ============================================================
+# FIELD SELECTION LOGIC - IMPROVED
+# ============================================================
 
 def get_allowed_fields(
     document_type: str,
@@ -200,10 +320,14 @@ def get_allowed_fields(
     """
     Determine allowed fields based on document and policy type.
 
-    Rules:
+    Improved Rules:
     - RNW / HO / HAZ → UNION of document + policy rules
-    - CAN / DOI     → INTERSECTION (strict)
-    - Others        → document rules only
+    - CAN / DOI → UNION instead of intersection (more permissive)
+    - Others → document rules only
+    
+    Rationale: Intersection was too restrictive and caused field loss.
+    For CAN and DOI documents, we want ALL relevant fields from both
+    document and policy perspectives.
     """
     doc_fields: Set[str] = FIELD_RULES.get(document_type, set())
     policy_fields: Set[str] = (
@@ -215,10 +339,45 @@ def get_allowed_fields(
     if document_type in {"RNW", "HO", "HAZ"}:
         return doc_fields | policy_fields
 
-    if document_type in {"CAN", "DOI"} and policy_fields:
-        return doc_fields & policy_fields
+    # Strict intersection for CAN/DOI, but with fallback
+    if document_type in {"CAN", "DOI"}:
+        if not policy_fields:
+            # Policy type unknown or not in our list - use doc fields only
+            return doc_fields
+        
+        intersection = doc_fields & policy_fields
+        
+        if len(intersection) < 3:
+            # Intersection too small - likely a mismatch, use union instead
+            print(f"WARNING: Small intersection for {document_type}-{policy_type}, using union")
+            return doc_fields | policy_fields
+        
+        return intersection
 
     return doc_fields
+
+# ============================================================
+# VALIDATION FUNCTIONS
+# ============================================================
+
+def validate_document_type(doc_type: str) -> bool:
+    """Check if document type is valid"""
+    return doc_type in VALID_DOC_TYPES
+
+
+def validate_policy_type(policy_type: str) -> bool:
+    """Check if policy type is valid (coverage or cancellation subtype)"""
+    return policy_type in ALL_POLICY_TYPES
+
+
+def is_coverage_type(policy_type: str) -> bool:
+    """Check if policy type is a coverage type"""
+    return policy_type in COVERAGE_TYPES
+
+
+def is_cancellation_subtype(policy_type: str) -> bool:
+    """Check if policy type is a cancellation subtype (reason)"""
+    return policy_type in CANCELLATION_SUBTYPES
 
 # ============================================================
 # SECTION DEFINITIONS (OWNERSHIP MODEL)
@@ -301,14 +460,14 @@ def segregate_insurance_document(lines: List[str]) -> Dict:
         if name not in fields:
             fields[name] = value
 
-    lock("carrier", extract_carrier(lines))
+    lock("carrier_name", extract_carrier(lines))
     lock("policy_number", extract_policy_number(lines))
 
     lock("insured_name", extract_insured_name(sections.get("insured", [])))
     lock("mailing_address", extract_mailing_address(sections.get("insured", [])))
     lock("property_address", extract_property_address(sections.get("property", [])))
 
-    lock("mortgage", extract_mortgage(sections.get("mortgage", [])))
+    lock("mortgage_company", extract_mortgage(sections.get("mortgage", [])))
     lock("loan_number", extract_loan_number(sections.get("mortgage", [])))
 
     lock("effective_date", extract_effective_date(lines))
