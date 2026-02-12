@@ -1,30 +1,37 @@
 """
-Document Classification - FIXED VERSION
-Added underwriting keywords, no deletions
+Document Type Classifier - CLEAN ARCHITECTURE VERSION
+Returns ONLY valid document types (structural classification).
+Policy types and cancellation subtypes are handled by policy_classifier.
+
+Valid document types: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
+NOT returned: FPN, NRNW, BREQ/BRQ (these are policy subtypes)
 """
 from typing import List
 import re
  
+VALID_DOC_TYPES = {
+    "BIN",  # Binder
+    "COI",  # Certificate of Insurance
+    "DOI",  # Deletion of Interest
+    "INV",  # Invoice
+    "RNS",  # Reinstatement
+    "RNW",  # Renewal/Declarations
+    "CAN",  # Cancellation (includes non-renewal structurally)
+    "OTH",  # Other
+    "UNK",  # Unknown
+}
+
+# REMOVED FROM VALID DOCUMENT TYPES:
+# - FPN: Force Placed Notice (no longer a valid doc type per business rules)
+# - NRNW: Non-Renewal (this is a cancellation REASON, returned by policy_classifier)
+# - BREQ/BRQ: Borrower Request (this is a cancellation REASON, returned by policy_classifier)
+# - TPN: Third Party Notice (structural detection maps to CAN or DOI)
+# - EDI: Electronic Data Interchange (format indicator, not a document type)
+
 DOC_TYPES = {
     # ORDER MATTERS - More specific patterns first
-    
-    "FPN": [
-        # Force Placed Notice
-        "force placed notice",
-        "force-placed notice", 
-        "second and final notice",
-        "final notice of flood insurance",
-        "flood insurance required by lender",
-        "force placed",
-        "force-placed",
-        "we will purchase coverage",
-        "lender-placed insurance",
-        "required by your mortgage",
-        "adequately insured",
-        "your property must be kept insured",
-        "insurance will be purchased at your expense",
-        "notice of special flood hazard"
-    ],
+    # NOTE: This dictionary is kept for backwards compatibility with keyword matching
+    # but classify_document() only returns values from VALID_DOC_TYPES above
     
     "DOI": [
         # Deletion of Interest
@@ -33,7 +40,12 @@ DOC_TYPES = {
         "mortgage deleted",
         "mortgage deleted/removed",
         "mortgage removed",
-        "loan has been satisfied"
+        "loan has been satisfied",
+        "mortgagee interest removed",
+        "mir - mortgagee interest removed",
+        "mir-mortgagee interest removed",
+        "cancel reason: mir",
+        "cancel reason mir",
     ],
 
     "RNS": [
@@ -72,7 +84,9 @@ DOC_TYPES = {
         # Added per instructions - underwriting reasons
         "underwriting guidelines",
         "company request",
-        "no longer required by lender"
+        "no longer required by lender",
+        "insurance coverage notification",
+        "coverage notification",
     ],
 
     "RNW": [
@@ -149,16 +163,23 @@ DOC_TYPES = {
 
 def classify_document(lines: List[str]) -> str:
     """
-    Classify insurance document type.
-    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, BRQ, TPN, FPN, EDI, OTH
+    Classify insurance document type based on STRUCTURE only.
+    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
 
     Valid doc types per business rules:
-      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN, FPN
-    Additional extraction-only types (used for routing, not displayed):
-      BRQ, TPN, EDI
+      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN, UNK
+    
+    Does NOT return (these are policy subtypes handled by policy_classifier):
+      FPN   - Force Placed Notice (removed from valid types)
+      BREQ  - Borrower Request (cancellation reason)
+      TPN   - Third Party Notice (maps to CAN or DOI based on content)
+      NRNW  - Non-Renewal (cancellation reason)
+      EDI   - Electronic Data Interchange (format, not type)
 
-    NRNW is NOT a doc type — non-renewal is a CAN with reason=non-renewal.
+    NRNW is NOT a doc type — non-renewal is a CAN with reason=NRNW.
     The policy classifier separately returns NRNW as a policy_type.
+    BREQ is NOT a doc type — borrower request is a CAN with reason=BREQ.
+    The policy classifier separately returns BREQ as a policy_type.
     """
 
     text = " ".join(lines).lower()
@@ -171,8 +192,12 @@ def classify_document(lines: List[str]) -> str:
     if "third party notice of termination" in text:
         has_policy_terminate = bool(re.search(
             r"terminate this policy effective[:\s]*\d", text))
-        has_interest_terminate = bool(re.search(
-            r"terminate the interest.*?hereon[:\s]*\d", text))
+        has_interest_terminate = (
+            bool(re.search(
+                r"terminate the interest.*?(hereon|third party|interested party)", text))
+            or "terminate the interest of the third party" in text
+            or "terminate the interest" in text
+        )
 
         if has_interest_terminate and not has_policy_terminate:
             # Only interest termination → DOI
@@ -339,33 +364,34 @@ def classify_document(lines: List[str]) -> str:
 
     # (DOI moved to Priority 2 above)
 
-    # ==========================================================
-    # PRIORITY 6: EDI (Electronic Data Interchange image)
-    # ==========================================================
-    # Note: "insurance coverage notification" (LexisNexis format) is 
-    # handled separately — it can be CAN, DOI, or RNW, NOT just EDI.
-    # Only pure EDI images (with explicit "edi" keywords) return EDI.
+    # PRIORITY 6: EDI WRAPPER (format only — never a doc type)
     if any(k in text for k in (
         "edi image",
         "electronic data interchange",
         "electronic image generated for edi",
-        "electronic image generated for edi data",
-        # OCR-robust patterns for EDI header
         "electronic image generated",
         "generated for edi",
         "edi data",
-    )) or bool(re.search(r"electronic\s+image\s+generated", text)):
-        # Guard: if strong CAN/DOI signals exist, those take priority
-        has_doi = any(k in text for k in (
-            "interest removed", "mir-mortgagee", "mir mortgagee",
+    )):
+        # If DOI signals exist → treat as DOI
+        if any(k in text for k in (
+            "interest removed",
             "mortgagee interest removed",
-        )) or bool(re.search(r"mir[\s\-]*mortgagee", text)) or bool(
-            re.search(r"cancel\s*reason[:\s]*mir", text)
-        )
-        if has_doi:
-            return "DOI"  # Force DOI — the EDI doc IS a DOI
-        else:
-            return "EDI"
+            "mir-mortgagee",
+            "mir mortgagee",
+        )) or bool(re.search(r"mir[\s\-]*mortgagee", text)):
+            return "DOI"
+
+        # If cancellation context → treat as CAN
+        if any(k in text for k in (
+            "cancellation",
+            "cancel reason",
+            "cancelled",
+        )):
+            return "CAN"
+
+        # Otherwise do NOT classify as EDI
+        return "OTH"
     
     # LexisNexis "insurance coverage notification" — classify based on content
     if "insurance coverage notification" in text or "lexisnexis" in text:
@@ -386,7 +412,7 @@ def classify_document(lines: List[str]) -> str:
         )):
             pass  # Already handled above
         else:
-            return "EDI"
+            return "OTH"
 
     # ==========================================================
     # PRIORITY 7: INVOICE (INV) — check BEFORE RNW to catch
@@ -572,17 +598,12 @@ def classify_document(lines: List[str]) -> str:
             return "COI"
 
     # ==========================================================
-    # PRIORITY 10: FORCE PLACED NOTICE (FPN)
+    # PRIORITY 10: FORCE PLACED NOTICE (FPN) - REMOVED
+    # FPN is no longer a valid document type per clean architecture.
+    # Force placed notices should be classified as OTH if detected.
     # ==========================================================
-    if any(k in text for k in (
-        "force placed notice",
-        "force-placed notice",
-        "second and final notice",
-        "final notice of flood insurance",
-        "lender-placed insurance",
-    )):
-        return "FPN"
-
+    # Original FPN detection logic removed - FPN not in VALID_DOC_TYPES
+    
     # ==========================================================
     # PRIORITY 11: BINDER (BIN)
     # ==========================================================
@@ -618,8 +639,6 @@ def get_document_explanation(doc_type: str) -> str:
         "OTH": "Information with multiple policies listed in one document and document which is not related to insurance would be considered as other.",
         
         "CAN": "The Policy might get cancelled by wish of Borrower/Insurance company due to various reasons.",
-        
-        "FPN": "Force placed notice for required insurance coverage."
     }
     
     return explanations.get(doc_type, "Unknown document type")

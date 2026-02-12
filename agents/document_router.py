@@ -1,11 +1,22 @@
 """
-Document Router — Classification, Routing, DTE & LORH Extraction
-=================================================================
+Document Router - CLEAN ARCHITECTURE VERSION
+Classification, Routing, DTE & LORH Extraction
+
+CLEAN SEPARATION:
+- document_type: Structural (CAN, DOI, RNW, INV, COI, BIN, RNS, OTH, UNK) from document_classifier
+- policy_type: Coverage OR cancellation subtype (HO, FIR, BREQ, NRNW, NPAY, UNWR, CEL...) from policy_classifier
+- Routing: Based on document_type only (policy_type used for field selection)
+
+IMPORTANT: 
+- TPN (Third Party Notice) is NOT a document type - it maps to CAN (if termination) or COI (if notification)
+- BREQ/BRQ (Borrower Request) is NOT a document type - it's a policy subtype (cancellation reason)
+- NRNW (Non-Renewal) is NOT a document type - it's a policy subtype (cancellation reason)
+
 This file contains THREE concerns that belong together because they
 are all driven by document type:
 
   1. ROUTING   — classify doc → select ONE primary approach
-  2. DTE       — Direct Template Extraction (for CAN, NRNW, DOI, EDI)
+  2. DTE       — Direct Template Extraction (for CAN, DOI, EDI)
   3. LORH      — Lightweight OCR Result Heuristic (for trivial docs)
 
 Routing Table:
@@ -15,8 +26,8 @@ Routing Table:
 │ SARDE               │ Renewals, policy changes, amended declarations      │
 │ SARDE + LATE        │ Renewals w/ coverage/premium tables (HO,FIR,FLD…)   │
 │ SC → SARDE → LATE   │ Fax (PQ) packets, mixed multi-document files        │
-│ DTE                 │ Cancellations, non-renewals, interest removals, EDI │
-│ SC+TE → DTE         │ Borrower requests, third-party notices, certs       │
+│ DTE                 │ Cancellations, interest removals, EDI               │
+│ SC+TE → DTE         │ Certificates, third-party notices, binders          │
 │ SC+TE + LATE        │ Invoices with transaction tables                    │
 │ SC+TE               │ Simple invoices, flood cancellations                │
 │ LORH                │ Very simple, single-page invoices/notices           │
@@ -34,6 +45,8 @@ from enum import Enum
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import re
+from document_classifier import classify_document
+from policy_classifier import classify_policy
 
 
 # ============================================================
@@ -50,6 +63,26 @@ class Approach(Enum):
     SC_TE           = "sc_te"               # 7
     LORH            = "lorh"                # 8
 
+ALLOWED_DOC_TYPES = {
+    "BIN", "CAN", "OTH", "RNW",
+    "RNS", "INV", "DOI", "COI", "UNK"
+}
+
+# ============================================================
+# VALID DOCUMENT TYPES (Structural Classification Only)
+# ============================================================
+# These are the ONLY valid document types that should be returned.
+# Everything else is either a POLICY TYPE or a SUBTYPE.
+
+# REMOVED from document types (these are policy subtypes or indicators):
+# - FPN: Force Placed Notice (no longer valid per business rules)
+# - NRNW: Non-Renewal (this is a POLICY SUBTYPE - cancellation reason)
+# - BREQ/BRQ: Borrower Request (this is a POLICY SUBTYPE - cancellation reason)
+# - TPN: Third Party Notice (structural indicator that maps to CAN or COI)
+# - EDI: Electronic Data Interchange (format indicator, not a type)
+# - NPAY: Non-Payment (this is a POLICY SUBTYPE - cancellation reason)
+# - UNWR: Underwriting (this is a POLICY SUBTYPE - cancellation reason)
+# - CEL: Generic Cancellation (this is a POLICY SUBTYPE - cancellation reason)
 
 # ============================================================
 # FALLBACK MAP — each approach has at most ONE designated fallback
@@ -67,7 +100,6 @@ FALLBACK_MAP = {
     Approach.LORH:          Approach.SC_TE,            # heuristic missed → try semantic
 }
 
-
 # ============================================================
 # FIELD REQUIREMENTS PER DOC TYPE
 # ============================================================
@@ -77,18 +109,12 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
              "effective_date", "expiration_date"],
     "INV":  ["policy_number", "insured_name"],
     "CAN":  ["policy_number", "insured_name", "effective_date"],
-    "NRNW": ["policy_number", "insured_name", "expiration_date"],
     "DOI":  ["policy_number", "mortgage_company", "loan_number"],
     "COI":  ["carrier_name", "policy_number", "insured_name",
              "effective_date", "expiration_date"],
     "RNS":  ["policy_number", "insured_name", "effective_date"],
-    "FPN":  ["policy_number", "insured_name"],
     "BIN":  ["carrier_name", "policy_number", "insured_name",
              "effective_date"],
-    "EDI":  ["policy_number", "insured_name"],
-    "PQ":   ["policy_number", "insured_name"],
-    "BRQ":  ["policy_number", "insured_name"],
-    "TPN":  ["policy_number", "insured_name"],
     "OTH":  ["policy_number"],
     "UNK":  ["policy_number"],
 }
@@ -99,24 +125,19 @@ OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "INV":  ["carrier_name", "effective_date", "total_premium",
              "mortgage_company", "loan_number"],
     "CAN":  ["carrier_name", "mortgage_company", "property_address"],
-    "NRNW": ["carrier_name", "effective_date", "mortgage_company"],
     "DOI":  ["carrier_name", "insured_name", "property_address"],
     "COI":  ["property_address", "mortgage_company"],
     "RNS":  ["carrier_name", "expiration_date"],
-    "FPN":  ["carrier_name", "effective_date", "property_address"],
     "BIN":  ["expiration_date", "property_address"],
-    "EDI":  ["carrier_name", "effective_date", "expiration_date"],
-    "PQ":   ["carrier_name", "effective_date", "expiration_date",
-             "property_address"],
-    "BRQ":  ["carrier_name", "mortgage_company", "loan_number"],
-    "TPN":  ["carrier_name", "mortgage_company"],
     "OTH":  ["insured_name", "carrier_name"],
     "UNK":  ["insured_name", "carrier_name"],
 }
 
 # Policy types with coverage/premium tables → triggers + LATE
-TABLE_POLICY_TYPES = {"HO", "HO3", "HO6", "FIR", "FLD", "HAZ", "DP3", "WND"}
-
+TABLE_POLICY_TYPES = {
+    "HO", "HO3", "HO6", "FIR", "FLD", "HAZ", "DP3", "WND", "AUTO", "ERQ", "LL", "UO",
+    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", "UNK"
+}
 
 # ============================================================
 # ROUTING RESULT
@@ -175,7 +196,6 @@ def _detect_fax_packet(lines: List[str]) -> bool:
             signals += 1
     return signals >= 2
 
-
 def _detect_simple(lines: List[str]) -> bool:
     """Detect very simple single-page doc → LORH candidate.
     LORH is ONLY for truly trivial documents.
@@ -212,7 +232,12 @@ def _detect_inner_doc_type(lines: List[str]) -> Optional[str]:
                                 "mortgagee interest removed",
                                 "mir-mortgagee interest removed",
                                 "mir mortgagee interest removed",
-                                "third party interest removed")) or bool(
+                                "third party interest removed",
+                                "no longer have an interest",
+                                "removed all indications of your interest",
+                                "loan has been satisfied",
+                                "interest has been removed",
+                                "interest terminated")) or bool(
         re.search(r"mir[\s\-]*mortgagee", text)
     ) or bool(re.search(r"cancel\s*reason[:\s]*mir", text)):
         return "DOI"
@@ -231,17 +256,40 @@ def _detect_inner_doc_type(lines: List[str]) -> Optional[str]:
     # LexisNexis notification with cancellation
     if "insurance coverage notification" in text and "cancellation" in text:
         return "CAN"
+    # Borrower request or third party notice → CAN
     if "borrower request" in text or "customer initiated" in text:
         return "CAN"
     if "third party notice" in text:
-        return "CAN"
+        # Third party notice is a CAN if it mentions termination/cancellation
+        if any(k in text for k in ("terminate", "termination", "cancel", "cancellation")):
+            return "CAN"
+        else:
+            # Otherwise it's a coverage notification → COI
+            return "COI"
     
     # EDI images
     if any(k in text for k in ("edi image", "electronic data",
                                 "electronic image generated for edi",
                                 "electronic image generated",
                                 "generated for edi", "edi data")):
-        return "EDI"
+        pass
+    
+    # LexisNexis notification detection (even without full "insurance coverage notification")
+    if "lexisnexis" in text or "insurance coverage notification" in text:
+        if any(k in text for k in (
+            "cancellation", "cancelled", "cancel reason",
+            "cancellation customer", "reason cancellation",
+            "customer initiated",
+        )):
+            return "CAN"
+        if any(k in text for k in (
+            "interest removed", "mir-mortgagee", "mir mortgagee",
+        )):
+            return "DOI"
+        # LexisNexis with no specific signal but has policy info → likely CAN notification
+        if any(k in text for k in ("insurance coverage notification",)):
+            return "CAN"
+    
     if any(k in text for k in ("certificate of insurance",
                                 "certificate holder")):
         return "COI"
@@ -287,12 +335,10 @@ def _detect_carrier_hint(lines: List[str]) -> Optional[str]:
 # ============================================================
 # DOCUMENT-TYPE CLASSIFIER  (rule-based)
 # ============================================================
-
 def classify_doc_type(lines: List[str]) -> str:
     """
     Rule-based doc-type classification.
-    Used as primary classifier or fallback when embedding classifier
-    returns UNK.  Order matters — specific patterns checked first.
+    Specific patterns must be checked in strict priority order.
     """
     if not lines:
         return "UNK"
@@ -300,119 +346,229 @@ def classify_doc_type(lines: List[str]) -> str:
     head = " ".join(lines[:50]).lower()
     full = " ".join(lines).lower()
 
-    # ---- Deletion of interest (check BEFORE cancellation) ----
-    if any(k in full for k in ("deletion of interest", "interest removal",
-                                "interest deleted", "remove interest",
-                                "interest removed", "mortgagee interest removed",
-                                "mir-mortgagee interest removed",
-                                "mir mortgagee interest removed",
-                                "third party interest removed")) or bool(
-        re.search(r"mir[\s\-]*mortgagee\s+interest\s+removed", full)
-    ) or bool(re.search(r"cancel\s*reason[:\s]*mir", full)):
+    # ============================================================
+    # 1️⃣ DOI (HIGHEST PRIORITY — MUST BE FIRST)
+    # ============================================================
+    if (
+        "interest removed" in full
+        or "mortgagee interest removed" in full
+        or "no longer have an interest" in full
+        or "removed all indications of your interest" in full
+        or "loan has been satisfied" in full
+        or "interest has been removed" in full
+        or "interest removal" in full
+        or "interest deleted" in full
+        or "interest terminated" in full
+        or "mir-mortgagee interest removed" in full
+        or "mir mortgagee interest removed" in full
+        or "cancel reason mir" in full
+        or "cancel reason: mir" in full
+        or bool(re.search(r"mir[\s\-]*mortgagee", full))
+        or bool(re.search(r"cancel\s*reason[:\s]*mir", full))
+        or ("mir" in full and "mortgagee" in full and "removed" in full)
+    ):
         return "DOI"
+    
+    # DOI via Third Party Notice of Termination (interest-only termination)
+    if "third party notice of termination" in full:
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", full))
+        has_interest_terminate = (
+            "terminate the interest" in full
+            or bool(re.search(
+                r"terminate the interest.*?(third party|hereon)", full))
+        )
+        if has_interest_terminate and not has_policy_terminate:
+            return "DOI"
 
-    # ---- Cancellation ----
-    if any(k in full for k in ("notice of cancellation", "cancellation notice",
-                                "policy cancelled", "will be cancelled",
-                                "cancel effective", "is hereby cancelled",
-                                "cancellation date",
-                                "reason cancellation", "doc type - cancellation",
-                                "doc type cancellation",
-                                "cancellation customer initiated",
-                                "reason: cancellation")):
+    # ============================================================
+    # 2️⃣ Cancellation
+    # ============================================================
+    if any(k in full for k in (
+        "notice of cancellation",
+        "cancellation notice",
+        "policy cancelled",
+        "will be cancelled",
+        "cancel effective",
+        "is hereby cancelled",
+        "cancellation date",
+        "reason cancellation",
+        "doc type - cancellation",
+        "doc type cancellation",
+        "cancellation customer initiated",
+        "reason: cancellation",
+        "non-renewal",
+        "nonrenewal",
+        "will not be renewed",
+        "notice of non renewal",
+    )):
+        return "CAN"
+    
+    # LexisNexis/EDI notification with cancellation context
+    if "insurance coverage notification" in full and "cancellation" in full:
+        return "CAN"
+ 
+    # ============================================================
+    # 4️⃣ Borrower Request (MAPS TO CAN, not a doc type)
+    # BRQ/BREQ is a POLICY SUBTYPE (cancellation reason), not a document type
+    # ============================================================
+    if any(k in head for k in (
+        "borrower request",
+        "borrower cancel",
+        "borrower-requested",
+    )):
+        # This is a cancellation initiated by borrower
         return "CAN"
 
-    # ---- Non-renewal ----
-    if any(k in head for k in ("non-renewal", "nonrenewal",
-                                "will not be renewed",
-                                "notice of non renewal")):
-        return "NRNW"
+    # ============================================================
+    # 5️⃣ Third-party notice (MAPS TO CAN or COI, not a doc type)
+    # TPN is a structural indicator, not a document type
+    # ============================================================
+    if any(k in head for k in (
+        "third party notice",
+        "third-party notice",
+        "third party notification",
+    )):
+        # Check if it's termination (CAN) or coverage notification (COI)
+        if any(k in full for k in (
+            "terminate",
+            "termination",
+            "cancel",
+            "cancellation",
+            "non-renewal",
+        )):
+            return "CAN"
+        else:
+            # Coverage notification/certificate
+            return "COI"
 
-    # ---- Borrower request (cancellation sub-type) ----
-    if any(k in head for k in ("borrower request", "borrower cancel",
-                                "borrower-requested")):
-        return "BRQ"
-
-    # ---- Third-party notice ----
-    if any(k in head for k in ("third party notice", "third-party notice",
-                                "third party notification")):
-        return "TPN"
-
-    # ---- Invoice / billing ----
-    if any(k in head for k in ("invoice", "billing statement",
-                                "amount due", "balance due",
-                                "payment due", "remit to",
-                                "please pay", "minimum due")):
+    # ============================================================
+    # 6️⃣ Invoice
+    # ============================================================
+    if any(k in head for k in (
+        "invoice",
+        "billing statement",
+        "amount due",
+        "balance due",
+        "payment due",
+        "remit to",
+        "please pay",
+        "minimum due",
+    )):
         return "INV"
 
-    # ---- Certificate of insurance ----
-    if any(k in head for k in ("certificate of insurance",
-                                "certificate holder",
-                                "acord 25", "acord 28")):
+    # ============================================================
+    # 7️⃣ Certificate of Insurance
+    # ============================================================
+    if any(k in head for k in (
+        "certificate of insurance",
+        "certificate holder",
+        "acord 25",
+        "acord 28",
+    )):
         return "COI"
 
-    # ---- Reinstatement ----
-    if any(k in head for k in ("reinstatement", "reinstated",
-                                "rescission of cancellation")):
+    # ============================================================
+    # 8️⃣ Reinstatement
+    # ============================================================
+    if any(k in head for k in (
+        "reinstatement",
+        "reinstated",
+        "rescission of cancellation",
+    )):
         return "RNS"
 
-    # ---- Force-placed / final payment ----
-    if any(k in head for k in ("force placed", "force-placed",
-                                "lender-placed", "final notice",
-                                "final payment")):
-        return "FPN"
-
-    # ---- Binder ----
-    if any(k in head for k in ("binder", "evidence of coverage",
-                                "bound coverage")):
+    # ============================================================
+    # 9️⃣ Binder
+    # ============================================================
+    if any(k in head for k in (
+        "binder",
+        "evidence of coverage",
+        "bound coverage",
+    )):
         return "BIN"
 
-    # ---- EDI image ----
-    if any(k in full for k in ("edi image", "electronic data",
-                                "edi transaction",
-                                "electronic image generated for edi",
-                                "electronic image generated",
-                                "generated for edi",
-                                "edi data")):
-        # Check if it's actually a DOI wrapped in EDI format
-        if any(k in full for k in ("interest removed", "mir-mortgagee",
-                                    "mir mortgagee", "cancel reason mir",
-                                    "mortgagee interest removed")) or bool(
-            re.search(r"mir[\s\-]*mortgagee", full)):
-            return "DOI"
-        return "EDI"
-    
-    # ---- LexisNexis insurance coverage notification ----
+    # ============================================================
+    # 🔟 LexisNexis Insurance Coverage Notification
+    # ============================================================
     if "insurance coverage notification" in full:
-        if "cancellation" in full:
+        if any(k in full for k in (
+            "cancellation",
+            "cancel reason",
+            "cancelled",
+        )):
             return "CAN"
-        if any(k in full for k in ("interest removed", "mir")):
+
+        if any(k in full for k in (
+            "interest removed",
+            "mir-mortgagee",
+            "mir mortgagee",
+        )):
             return "DOI"
-        return "EDI"
 
-    # ---- Fax / packet ----
+        return "CAN"
+
+    # ============================================================
+    # 1️⃣1️⃣ Fax wrapper (structure only — detect inner content)
+    # ============================================================
     if _detect_fax_packet(lines):
-        return "PQ"
+        # Try to detect what's INSIDE the fax packet
+        inner = _detect_inner_doc_type(lines)
+        if inner:
+            return inner
+        
+        # Check for strong doc signals even without inner detection
+        strong_doc_signals = any(k in full for k in (
+            "notice of cancellation",
+            "cancellation notice",
+            "cancellation",
+            "interest removed",
+            "mortgagee interest removed",
+            "no longer have an interest",
+            "policy declarations",
+            "declarations page",
+            "coverage a",
+            "coverage b",
+            "annual premium",
+            "policy period",
+            "dwelling fire",
+            "dfire",
+            "homeowners policy",
+            "homeowner policy",
+            "insurance coverage notification",
+            "lexisnexis",
+        ))
+        if not strong_doc_signals:
+            return "UNK"
 
-    # ---- Renewal / Declarations (broadest — checked last) ----
-    if any(k in head for k in ("renewal", "declarations", "policy period",
-                                "your policy", "homeowner",
-                                "dwelling fire", "amended declarations",
-                                "coverage summary")):
+    # ============================================================
+    # 1️⃣2️⃣ Renewal (LAST — broadest)
+    # ============================================================
+    if any(k in head for k in (
+        "renewal",
+        "declarations",
+        "policy period",
+        "your policy",
+        "homeowner",
+        "amended declarations",
+        "coverage summary",
+    )):
         return "RNW"
 
-    # ---- Full-text fallback for renewals ----
-    if any(k in full for k in ("coverage a", "coverage b",
-                                "dwelling coverage", "annual premium",
-                                "renewal flood insurance",
-                                "flood insurance policy declarations",
-                                "agent issued declarations",
-                                "policy premium",
-                                "total policy premium")):
+    if any(k in full for k in (
+        "coverage a",
+        "coverage b",
+        "dwelling coverage",
+        "annual premium",
+        "renewal flood insurance",
+        "flood insurance policy declarations",
+        "agent issued declarations",
+        "policy premium",
+        "total policy premium",
+    )):
         return "RNW"
 
     return "UNK"
-
 
 def classify_policy_type(lines: List[str]) -> str:
     """Rule-based policy-type classification."""
@@ -421,15 +577,112 @@ def classify_policy_type(lines: List[str]) -> str:
     text = " ".join(lines[:60]).lower()
     full = " ".join(lines).lower()
 
-    if any(k in full for k in ("flood", "nfip", "fema")):
-        return "FLD"
-    if any(k in full for k in ("wind only", "hurricane")):
+    # Renewal/declaration guard - skip cancellation subtypes for renewals
+    is_renewal = any(k in full for k in (
+        "policy declarations", "declarations summary", "policy change summary",
+        "transaction: renewal", "agent issued declarations",
+        "landlord protection policy declarations",
+        "wind only policy - declarations", "homeowners hw-",
+    ))
+    
+    if not is_renewal:
+        # Cancellation subtypes first (for CAN docs, reason > coverage type)
+        # BREQ — Borrower Request / Customer Initiated
+        if "third party notice of termination" in full:
+            has_policy_terminate = bool(re.search(
+                r"terminate this policy effective[:\s]*\d", full))
+            if has_policy_terminate:
+                return "BREQ"
+        if any(k in full for k in (
+            "borrower request", "customer request", "customer initiated",
+            "cancellation customer initiated", "reason cancellation customer",
+            "insured request", "at the request of the insured",
+        )):
+            return "BREQ"
+        # LexisNexis notification with cancellation but no specific reason
+        if "insurance coverage notification" in full and "cancellation" in full:
+            if not any(k in full for k in (
+                "non-payment", "nonpayment", "failure to pay",
+                "non-renewal", "nonrenewal",
+                "underwriting", "company request",
+            )):
+                return "BREQ"
+        
+        # NPAY
+        if any(k in full for k in (
+            "non-payment of premium", "nonpayment of premium",
+            "failure to pay premium", "premium not paid",
+        )):
+            return "NPAY"
+        
+        # NRNW
+        if any(k in full for k in (
+            "non-renewal", "nonrenewal", "will not be renewed",
+        )):
+            return "NRNW"
+        
+        # UNWR — guard against "Rating/Underwriting Information" headers
+        unwr_strong = any(k in full for k in (
+            "underwriting guidelines", "company request", "building has been sold",
+            "does not meet underwriting", "company decision",
+        ))
+        unwr_bare = (
+            "underwriting" in full
+            and any(k in full for k in ("cancellation", "cancelled", "cancel"))
+            and "rating/underwriting" not in full
+            and "underwriting information" not in full
+        )
+        if unwr_strong or unwr_bare:
+            return "UNWR"
+
+    # Coverage types
+    # FLD — guard against flood disclaimers in wind/homeowner policies
+    if any(k in full for k in ("flood policy", "flood insurance", "nfip", "fema")):
+        fld_excluded = any(k in full for k in (
+            "flood coverage is not provided",
+            "does not include coverage for damage resulting from flood",
+            "does not include coverage for flood",
+            "purchase of flood insurance",
+            "consider the purchase of flood",
+            "does not provide earthquake coverage",
+        ))
+        if not fld_excluded:
+            return "FLD"
+    # WND — "wind only" is specific; "hurricane" alone is too broad
+    if any(k in full for k in ("wind only", "windstorm insurance policy",
+                                "hw-2 wind only", "wind-only policy")):
         return "WND"
-    if any(k in full for k in ("dwelling fire", "dp-3", "dp3", "dp-1",
-                                "dfire", "dfire-s11",
+    # FIR detection - guard against "dwelling fire" in endorsement/form titles
+    fir_strong_patterns = any(k in full for k in (
+                                "dwelling fire policy",
+                                "dp-3", "dp3", "dp-1",
+                                "dfire-s11",
                                 "cov type - dwelling fire",
-                                "cov type dwelling fire")):
+                                "cov type dwelling fire",
+                                "coverage type: dwelling fire",
+                                "coverage type dwelling fire"))
+    fir_dfire_match = bool(re.search(r"\bdfire\b", full)) or bool(re.search(r"\bdfir\b", full))
+    fir_dwelling_fire = False
+    if "dwelling fire" in full and not fir_strong_patterns:
+        # Guard: "dwelling fire provisions" or similar = endorsement, not policy type
+        dfire_in_endorsement = any(k in full for k in (
+            "dwelling fire provisions",
+            "dwelling fire endorsement",
+            "amendment of home and dwelling fire",
+            "amendment of dwelling fire",
+        ))
+        # Guard: "A DWELLING FIRE $..." = peril in coverage table (landlord/HO)
+        dfire_as_peril = any(k in full for k in (
+            "landlord", "landlord protection",
+            "occupancy: tenant", "loss of rent",
+        )) or bool(re.search(r"a\s+dwelling\s+fire\s+[\$\d]", full))
+        if not dfire_in_endorsement and not dfire_as_peril:
+            fir_dwelling_fire = True
+    if fir_strong_patterns or fir_dfire_match or fir_dwelling_fire:
         return "FIR"
+    if any(k in full for k in ("house & home", "house and home",
+                                "policy type: house")):
+        return "HAZ"
     if any(k in text for k in ("hazard", " haz ")):
         return "HAZ"
     if any(k in text for k in ("ho-6", "ho6", "condominium")):
@@ -460,9 +713,12 @@ def route(
     """
     # --- Auto-classify if not provided ---
     if not doc_type or doc_type == "UNK":
-        doc_type = classify_doc_type(lines)
+        doc_type = classify_document(lines) 
+    if doc_type not in ALLOWED_DOC_TYPES:
+        doc_type = "UNK"
+    # Enforce business-allowed document types only
     if not policy_type or policy_type == "UNK":
-        policy_type = classify_policy_type(lines)
+        policy_type = classify_policy(lines)
 
     # --- Structural signals ---
     has_tables = _detect_tables(lines)
@@ -495,7 +751,7 @@ def route(
     # Default: SC → SARDE → LATE (full cascade)
     # Exception: if we can detect what's INSIDE the packet,
     #   route to that doc's native approach instead
-    if doc_type == "PQ" or is_fax:
+    if doc_type == "PQ":
         inner = _detect_inner_doc_type(lines)
         # DOI/CAN/EDI inside PQ → DTE
         if inner in ("DOI", "CAN", "EDI"):
@@ -512,10 +768,10 @@ def route(
                 reason=f"PQ wrapping {inner} → DTE",
                 is_multi_page=True,
             )
-        # COI/TPN inside PQ → SC+TE → DTE
-        if inner in ("COI", "TPN"):
-            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS["PQ"])
-            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS["PQ"])
+        # COI inside PQ → SC+TE → DTE
+        if inner == "COI":
+            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS.get("UNK", []))
+            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS.get("UNK", []))
             return RoutingResult(
                 approach=Approach.SC_TE_DTE,
                 doc_type=inner,
@@ -552,11 +808,14 @@ def route(
     # CAN → DTE by default
     # CAN + FLD (flood/underwriting cancel) → SC+TE (table 3)
     if doc_type == "CAN":
+        if policy_type in ("BREQ", "NPAY", "NRNW", "UNWR", "CEL"):
+            return _r(Approach.DTE,
+                    f"Cancellation subtype {policy_type} → DTE")
         if policy_type == "FLD":
             return _r(Approach.SC_TE,
-                      "Flood cancellation → SC+TE")
+                    "Flood cancellation → SC+TE")
         return _r(Approach.DTE,
-                  "Cancellation → DTE")
+                "Cancellation → DTE")
 
     # ─── DELETION OF INTEREST ───────────────────────────────
     # DOI + HO  → SARDE  (policy change, table 3)
@@ -571,14 +830,14 @@ def route(
                       "DOI + HAZ → SC+TE → DTE")
         return _r(Approach.DTE,
                   f"DOI ({policy_type}) → DTE")
-
-    # ─── EDI ────────────────────────────────────────────────
-    if doc_type == "EDI":
-        return _r(Approach.DTE, "EDI → DTE")
-
+ 
     # ─── SEMI-TEMPLATE DOCS ────────────────────────────────
-    # TPN, COI, RNS, BIN → SC+TE → DTE
-    if doc_type in ("TPN", "COI", "RNS", "BIN"):
+    # COI, RNS, BIN → SC+TE → DTE
+    # Note: TPN (Third Party Notice) is no longer returned as a document type.
+    # It's mapped to CAN (if termination) or COI (if notification) by classify_doc_type.
+    # Note: BREQ (Borrower Request) is no longer returned as a document type.
+    # It's mapped to CAN and returned as a policy_type by policy_classifier.
+    if doc_type in ("COI", "RNS", "BIN"):
         return _r(Approach.SC_TE_DTE,
                   f"Semi-template ({doc_type}) → SC+TE → DTE")
 
@@ -586,7 +845,8 @@ def route(
     # INV + tables → SC+TE + LATE  (table 2: INV HO, INV LL)
     # INV + HO6 + simple → LORH   (table 2: INV HO6)
     # INV other → SC+TE           (table 2: INV HAZ, table 4: INV UNK)
-    if doc_type in ("INV", "FPN"):
+    # Note: FPN (Force Placed Notice) removed from valid document types
+    if doc_type == "INV":
         if has_tables:
             return _r(Approach.SC_TE_LATE,
                       "Invoice with tables → SC+TE + LATE")
@@ -1010,16 +1270,18 @@ def extract_dte(lines: List[str], doc_type: str) -> Dict[str, Dict]:
 
     dispatch = {
         "CAN":  _dte_cancellation,
-        "NRNW": _dte_nonrenewal,
         "DOI":  _dte_doi,
-        "EDI":  _dte_edi,
+        # REMOVED: "NRNW" - non-renewal is now CAN with policy_type=NRNW
+        # REMOVED: "EDI" - EDI is a format indicator, not a document type
     }
 
     extractor = dispatch.get(doc_type)
     if extractor:
         return extractor(lines)
 
-    # Generic fallback for BRQ, TPN, COI, RNS, BIN, etc.
+    # Generic fallback for COI, RNS, BIN, and other semi-structured docs
+    # Note: BRQ (Borrower Request) and TPN (Third Party Notice) are no longer
+    # document types - they're handled as policy subtypes or mapped to CAN/DOI
     return _dte_generic(lines, doc_type)
 
 
