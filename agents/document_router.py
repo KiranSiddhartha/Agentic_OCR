@@ -366,6 +366,13 @@ def classify_doc_type(lines: List[str]) -> str:
         or bool(re.search(r"mir[\s\-]*mortgagee", full))
         or bool(re.search(r"cancel\s*reason[:\s]*mir", full))
         or ("mir" in full and "mortgagee" in full and "removed" in full)
+        # Loss payee deletion patterns
+        or "deleted as loss payee" in full
+        or "removed as loss payee" in full
+        or "loss payee deleted" in full
+        or "loss payee removed" in full
+        or "has been deleted as loss payee" in full
+        or "has been removed as loss payee" in full
     ):
         return "DOI"
     
@@ -383,8 +390,11 @@ def classify_doc_type(lines: List[str]) -> str:
 
     # ============================================================
     # 2️⃣ Cancellation
+    # Guard: Declarations/renewal documents contain boilerplate like
+    # "if the policy is cancelled or not renewed" — this should NOT
+    # trigger CAN classification. Check for declarations context.
     # ============================================================
-    if any(k in full for k in (
+    can_signals = any(k in full for k in (
         "notice of cancellation",
         "cancellation notice",
         "policy cancelled",
@@ -401,8 +411,60 @@ def classify_doc_type(lines: List[str]) -> str:
         "nonrenewal",
         "will not be renewed",
         "notice of non renewal",
-    )):
-        return "CAN"
+    ))
+    if can_signals:
+        # Guard: declarations/renewal context with boilerplate cancellation language
+        is_declaration_context = any(k in full for k in (
+            "policy change declarations",
+            "policy declarations",
+            "declarations page",
+            "mortgagee declarations",
+            "amended declarations",
+            "homesaver policy",
+            "homeowners policy declarations",
+            "mortgagee certificate",
+        )) or (
+            "declarations" in full and any(k in full for k in (
+                "coverage a", "coverage b", "coverage c",
+                "coverage d", "coverage e", "coverage f",
+                "section i", "section ii",
+                "total premium",
+                "property coverages",
+                "liability coverages",
+            ))
+        )
+        # Additional guard: strong coverage structure (A-F with limits) + 
+        # boilerplate cancellation language from mortgagee clauses
+        if not is_declaration_context:
+            has_coverage_structure = (
+                sum(1 for cov in ("coverage a", "coverage b", "coverage c",
+                                  "coverage d", "coverage e", "coverage f",
+                                  "a.dwelling", "b.other structures",
+                                  "c.personal property", "d.loss of use",
+                                  "e.personal liability", "f.medical payments")
+                    if cov in full) >= 3
+            )
+            has_boilerplate = any(k in full for k in (
+                "if the policy is cancelled or not renewed",
+                "notice of cancellation we give our insured",
+                "advance notice of cancellation",
+                "the mortgagee will be notified at least",
+            ))
+            if has_coverage_structure and has_boilerplate:
+                is_declaration_context = True
+        if not is_declaration_context:
+            # Payment notice guard: non-payment + payment stub = INV, not CAN
+            is_payment_notice = (
+                ("non-payment" in full or "nonpayment" in full)
+                and sum(1 for k in (
+                    "return this portion with your payment",
+                    "amount enclosed", "make check or money order",
+                    "make check payable", "minimum amount due",
+                    "minimum premium amount due",
+                ) if k in full) >= 2
+            )
+            if not is_payment_notice:
+                return "CAN"
     
     # LexisNexis/EDI notification with cancellation context
     if "insurance coverage notification" in full and "cancellation" in full:
@@ -583,9 +645,42 @@ def classify_policy_type(lines: List[str]) -> str:
         "transaction: renewal", "agent issued declarations",
         "landlord protection policy declarations",
         "wind only policy - declarations", "homeowners hw-",
+        # Additional: Policy Change Declarations (e.g., Travelers Homesaver)
+        "policy change declarations",
+        "homesaver policy",
+        "mortgagee certificate",
     ))
-    
+    # Additional: docs with strong coverage structure + boilerplate cancel language
     if not is_renewal:
+        has_cov = sum(1 for c in ("coverage a", "coverage b", "coverage c",
+                                   "coverage d", "coverage e", "coverage f",
+                                   "a.dwelling", "b.other structures",
+                                   "c.personal property", "d.loss of use",
+                                   "e.personal liability", "f.medical payments")
+                      if c in full) >= 3
+        has_bp = any(k in full for k in (
+            "if the policy is cancelled or not renewed",
+            "advance notice of cancellation",
+            "the mortgagee will be notified at least",
+        ))
+        if has_cov and has_bp:
+            is_renewal = True
+    
+    # DOI context guard — but NOT if there's also a policy termination signal.
+    # A Third Party Notice of Termination that terminates BOTH the policy AND
+    # the third party interest is a BREQ (borrower request), not a DOI.
+    _has_policy_termination = bool(re.search(
+        r"terminate this policy effective[:\s]*\d", full
+    ))
+    is_doi_context = any(k in full for k in (
+        "terminate the interest of the third party",
+        "terminate the interest",
+        "interest removed",
+        "deletion of interest",
+        "no longer have an interest",
+    )) and not _has_policy_termination
+    
+    if not is_renewal and not is_doi_context:
         # Cancellation subtypes first (for CAN docs, reason > coverage type)
         # BREQ — Borrower Request / Customer Initiated
         if "third party notice of termination" in full:
@@ -685,12 +780,24 @@ def classify_policy_type(lines: List[str]) -> str:
         return "HAZ"
     if any(k in text for k in ("hazard", " haz ")):
         return "HAZ"
-    if any(k in text for k in ("ho-6", "ho6", "condominium")):
+    if any(k in text for k in ("ho-6", "ho6")):
         return "HO6"
+    # Guard: "condominium" in form names (e.g., "Rental Condominium Unit Form 664")
+    # should NOT trigger HO6. Only match in policy type context.
+    if "condominium" in text:
+        condo_in_form = bool(re.search(
+            r"(rental\s+)?condominium\s+unit\s+(form|coverage\s+form)", full
+        ))
+        strong_ho = any(k in full for k in (
+            "homeowners policy", "homeowner policy", "homesaver policy",
+            "home protection policy", "homeowners coverage",
+        ))
+        if not condo_in_form and not strong_ho:
+            return "HO6"
     if "dp3" in text or "dp-3" in text:
         return "DP3"
     if any(k in full for k in ("homeowner", "ho-3", "ho3", "home protection",
-                                "homeowners pol", "homeowner pol")):
+                                "homeowners pol", "homeowner pol", "homesaver")):
         return "HO"
     return "UNK"
 

@@ -44,20 +44,34 @@ def classify_policy(lines: List[str]) -> str:
     # For DOI docs, the coverage type (FIR/HO/HAZ) is more 
     # important than the cancellation reason (BREQ/CEL).
     # ==========================================================
-    is_doi_context = any(k in text for k in (
-        "no longer have an interest",
-        "loan has been satisfied",
-        "interest removed",
-        "interest has been removed",
-        "deletion of interest",
-        "mortgagee interest removed",
-        "mir-mortgagee interest removed",
-        "mir mortgagee interest removed",
-        "removed all indications of your interest",
-        "interest terminated",
-        "terminate the interest of the third party",
-        "terminate the interest",
-    )) or bool(re.search(r"mir[\s\-]*mortgagee\s+interest\s+removed", text))
+    # DOI context detection — but NOT if there's also a policy termination signal.
+    # A Third Party Notice of Termination that terminates BOTH the policy AND
+    # the third party interest is a BREQ (borrower request), not a DOI.
+    _has_policy_termination = bool(re.search(
+        r"terminate this policy effective[:\s]*\d", text
+    )) or any(k in text for k in (
+        "policy cancelled",
+        "policy has been cancelled",
+        "policy is cancelled",
+        "policy will be cancelled",
+    ))
+
+    is_doi_context = (
+        any(k in text for k in (
+            "no longer have an interest",
+            "loan has been satisfied",
+            "interest removed",
+            "interest has been removed",
+            "deletion of interest",
+            "mortgagee interest removed",
+            "mir-mortgagee interest removed",
+            "mir mortgagee interest removed",
+            "removed all indications of your interest",
+            "interest terminated",
+            "terminate the interest of the third party",
+            "terminate the interest",
+        )) or bool(re.search(r"mir[\s\-]*mortgagee\s+interest\s+removed", text))
+    ) and not _has_policy_termination  # Policy termination overrides DOI context
 
     # ==========================================================
     # RENEWAL/DECLARATION GUARD: If strong renewal/declaration 
@@ -70,6 +84,7 @@ def classify_policy(lines: List[str]) -> str:
         "declarations summary",
         "mortgagee declarations",
         "policy change summary",
+        "policy change declarations",
         "transaction: renewal",
         "transaction desc: renewal",
         "agent issued declarations",
@@ -80,17 +95,71 @@ def classify_policy(lines: List[str]) -> str:
         "landlord protection policy declarations",
         "wind only policy - declarations",
         "homeowners hw-",
+        "homesaver policy",
+        # Mortgagee certificates with coverage details are declarations, not cancellations
+        "mortgagee certificate",
     ))
+
+    # Additional renewal context: documents with strong coverage structure
+    # (Coverage A-F with dollar amounts) that also contain boilerplate
+    # cancellation/non-renewal language in mortgagee clauses.
+    # The boilerplate phrases like "if the policy is cancelled or not renewed"
+    # and "notice of cancellation we give our insured" are standard mortgagee 
+    # clause language and do NOT indicate actual cancellation.
+    if not is_renewal_context:
+        has_coverage_structure = (
+            sum(1 for cov in ("coverage a", "coverage b", "coverage c", 
+                              "coverage d", "coverage e", "coverage f",
+                              "a.dwelling", "b.other structures", 
+                              "c.personal property", "d.loss of use",
+                              "e.personal liability", "f.medical payments")
+                if cov in text) >= 3
+        )
+        # Boilerplate cancellation: appears in mortgagee clauses, not as actual notice
+        has_boilerplate_cancel = any(k in text for k in (
+            "if the policy is cancelled or not renewed",
+            "notice of cancellation we give our insured",
+            "advance notice of cancellation",
+            "same advance notice of cancellation",
+            "the mortgagee will be notified at least",
+            "if this policy is cancelled or not renewed by us, the party",
+        ))
+        if has_coverage_structure and has_boilerplate_cancel:
+            is_renewal_context = True
+
+    # ==========================================================
+    # INVOICE/PAYMENT NOTICE CONTEXT: Documents that are billing
+    # notices for non-payment (with payment stubs, "amount enclosed",
+    # "return this portion with your payment") should return coverage
+    # type (HAZ/HO), not cancellation subtype (NPAY).
+    # ==========================================================
+    is_payment_notice_context = (
+        any(k in text for k in (
+            "non-payment of premium", "non-payment", "nonpayment",
+        ))
+        and (
+            sum(1 for k in (
+                "return this portion with your payment",
+                "amount enclosed",
+                "make check or money order",
+                "make check payable",
+                "minimum amount due",
+                "minimum premium amount due",
+                "payment by check",
+                "check-by-phone",
+            ) if k in text) >= 2
+        )
+    )
 
     # ==========================================================
     # 0. CANCELLATION SUB-TYPES — checked FIRST 
-    # (but NOT for DOI or RENEWAL contexts)
+    # (but NOT for DOI or RENEWAL or PAYMENT NOTICE contexts)
     # For CAN docs, the reason WHY it was cancelled is more
     # important than WHAT was insured (flood/home/etc).
     # Priority: BREQ > NPAY > NRNW > UNWR > CEL
     # ==========================================================
 
-    if not is_doi_context and not is_renewal_context:
+    if not is_doi_context and not is_renewal_context and not is_payment_notice_context:
 
         # BREQ — Borrower Request / Insured-initiated cancellation
         if "third party notice of termination" in text:
@@ -229,10 +298,23 @@ def classify_policy(lines: List[str]) -> str:
         flood_positive = any(k in text for k in (
             "flood policy number",
             "flood insurance policy declarations",
-            "national flood insurance",
             "flood insurance declarations",
             "flood zone determination",
         ))
+        # "national flood insurance" is positive ONLY if NOT preceded by 
+        # "purchase of" or "consider" — those are disclaimer contexts
+        if not flood_positive and "national flood insurance" in text:
+            nfi_disclaimer = any(k in text for k in (
+                "purchase of flood insurance from the national flood",
+                "consider the purchase of flood insurance",
+                "need to purchase flood insurance",
+                "purchase flood insurance from the national",
+                "flood coverage is not provided",
+                "flood coverage is not part of this policy",
+                "is not part of this policy",
+            ))
+            if not nfi_disclaimer:
+                flood_positive = True
         if flood_positive:
             return "FLD"
 
@@ -295,6 +377,8 @@ def classify_policy(lines: List[str]) -> str:
     # 3. AUTO (STRICT — standalone)
     # Guard: "vehicle" in carrier names like "Allstate Vehicle and
     # Property Insurance Company" must NOT trigger AUTO.
+    # Guard: "vehicle" in endorsement/exclusion names like
+    # "Recreational Or Service Vehicle Exclusion" must NOT trigger AUTO.
     # ==========================================================
     auto_patterns = [
         r"\bvin\b",
@@ -302,15 +386,39 @@ def classify_policy(lines: List[str]) -> str:
         r"\bmotor vehicle\b",
     ]
     # "vehicle" needs extra context — only match if NOT in a carrier name
+    # and NOT in an endorsement/exclusion/form name
     has_vehicle = bool(re.search(r"\bvehicle\b", text))
-    vehicle_in_carrier = bool(re.search(
-        r"(allstate|nationwide|state farm|farmers|liberty|usaa|progressive|"
-        r"geico|travelers|hartford|safeco|mercury).*"
-        r"(vehicle|property).*insurance",
-        text,
-    ))
-    if has_vehicle and not vehicle_in_carrier:
-        return "AUTO"
+    if has_vehicle:
+        # Check if "vehicle" is in a carrier name
+        vehicle_in_carrier = bool(re.search(
+            r"(allstate|nationwide|state farm|farmers|liberty|usaa|progressive|"
+            r"geico|travelers|hartford|safeco|mercury).*"
+            r"(vehicle|property).*(insurance|ins\b)",
+            text,
+        ))
+        # Check if "vehicle" is in an endorsement/exclusion/form name
+        vehicle_in_endorsement = any(k in text for k in (
+            "vehicle exclusion",
+            "service vehicle",
+            "recreational or service vehicle",
+            "recreational vehicle exclusion",
+            "vehicle storage",
+            "vehicle endorsement",
+        ))
+        # Check if strong homeowners/property signals are present —
+        # a homeowners declarations page mentioning "vehicle" in an
+        # endorsement schedule is NOT an auto policy
+        has_strong_ho_signals = (
+            sum(1 for c in ("coverage a", "coverage b", "coverage c",
+                            "coverage d", "coverage e", "coverage f")
+                if c in text) >= 3
+            or any(k in text for k in (
+                "homeowners", "declarations page", "dwelling",
+                "residence premises", "house & home",
+            ))
+        )
+        if not vehicle_in_carrier and not vehicle_in_endorsement and not has_strong_ho_signals:
+            return "AUTO"
     if any(re.search(p, text) for p in auto_patterns):
         return "AUTO"
 
@@ -356,17 +464,47 @@ def classify_policy(lines: List[str]) -> str:
 
     # ==========================================================
     # 6. HO6 / CONDO (before HO — more specific)
+    # Guard: "Condominium Unit Form" is a form NAME used by carriers
+    # like Travelers for various policy types — it does NOT mean the 
+    # policy is HO6. Only match when "condominium" appears in policy
+    # type context, NOT inside form titles or endorsement names.
     # ==========================================================
-    if any(k in text for k in (
-        "condominium",
-        "condo unit",
-        "unit owner",
+    ho6_strong = any(k in text for k in (
         "ho6",
         "ho-6",
-        "co-op",
-        "town house",
-        "town home",
-    )):
+        "condo unit owner",
+        "condo unit-owner",
+    ))
+    
+    if not ho6_strong:
+        # "condominium" needs a guard — exclude when it's part of a form name
+        has_condo = any(k in text for k in (
+            "condominium",
+            "condo unit",
+            "unit owner",
+            "co-op",
+            "town house",
+            "town home",
+        ))
+        if has_condo:
+            # Guard: "condominium unit form" or "condominium unit coverage form"
+            # or "rental condominium unit form" = form title, NOT policy type
+            condo_in_form_name = bool(re.search(
+                r"(rental\s+)?condominium\s+unit\s+(form|coverage\s+form)", text
+            ))
+            # Guard: if strong HO/homeowners signals present alongside,
+            # "condominium" is likely a form reference, not the policy type
+            strong_ho_signal = any(k in text for k in (
+                "homeowners policy",
+                "homeowner policy",
+                "homesaver policy",
+                "home protection policy",
+                "homeowners coverage",
+            ))
+            if not condo_in_form_name and not strong_ho_signal:
+                ho6_strong = True
+    
+    if ho6_strong:
         return "HO6"
 
     # ==========================================================
@@ -477,12 +615,22 @@ def classify_policy(lines: List[str]) -> str:
 
     # ==========================================================
     # 12. "House & Home" → HAZ (Allstate policy type label)
+    # Guard: Third Party Notice of Termination should be BREQ,
+    # not HAZ, even when "House & Home" policy type label is present.
     # ==========================================================
     if any(k in text for k in (
         "house & home",
         "house and home",
         "policy type: house",
     )):
+        # Guard: if this is a Third Party Notice of Termination with 
+        # policy termination, it should have been caught as BREQ above.
+        # If we reach here, it's a genuine HAZ coverage type.
+        if "third party notice of termination" not in text:
+            return "HAZ"
+        # For TPN docs, we want the cancellation subtype (BREQ/CEL) 
+        # to take priority, but if we reached here, fall through to 
+        # check other coverage types or return HAZ as last resort
         return "HAZ"
 
     # ==========================================================
@@ -493,6 +641,7 @@ def classify_policy(lines: List[str]) -> str:
         "homeowners policy",
         "homeowner policy",
         "homeowner's policy",
+        "homesaver policy",
     )):
         return "HO"
 

@@ -46,6 +46,13 @@ DOC_TYPES = {
         "mir-mortgagee interest removed",
         "cancel reason: mir",
         "cancel reason mir",
+        # Loss payee deletion - CRITICAL FIX FOR "DELETED AS LOSS PAYEE"
+        "deleted as loss payee",
+        "removed as loss payee",
+        "loss payee deleted",
+        "loss payee removed",
+        "loss payee has been deleted",
+        "loss payee has been removed",
     ],
 
     "RNS": [
@@ -235,6 +242,13 @@ def classify_document(lines: List[str]) -> str:
         "remove interest",
         "interest termination",
         "interest terminated",
+        # Loss payee deletion patterns
+        "deleted as loss payee",
+        "removed as loss payee",
+        "loss payee deleted",
+        "loss payee removed",
+        "loss payee has been deleted",
+        "loss payee has been removed",
     )) or bool(re.search(
         r"mir[\s\-]*mortgagee\s+interest\s+removed", text
     )) or bool(re.search(
@@ -310,6 +324,7 @@ def classify_document(lines: List[str]) -> str:
             r"\bdeclarations?\b",
             r"\bpolicy declarations\b",
             r"\bmortgagee declarations\b",
+            r"\bpolicy change declarations\b",
             r"\bcoverage a\b",
             r"\bcoverage b\b",
             r"\bcoverage c\b",
@@ -317,7 +332,56 @@ def classify_document(lines: List[str]) -> str:
             r"\bcoverage e\b",
             r"\bcoverage f\b",
         ]
-        if not is_lexisnexis_can and any(re.search(p, text) for p in can_guard_patterns):
+        # Additional guard: declarations with coverage/premium tables
+        has_declaration_with_coverage = (
+            any(re.search(r"\bdeclarations?\b", text) for _ in [1])
+            and any(k in text for k in (
+                "section i", "section ii",
+                "property coverages", "liability coverages",
+                "total premium", "policy forms and endorsements",
+                "homesaver policy",
+            ))
+        )
+        # Additional guard: mortgagee certificates or docs with strong 
+        # coverage structure (A-F) + boilerplate cancellation language
+        has_mortgagee_cert_context = "mortgagee certificate" in text
+        has_coverage_with_boilerplate = (
+            sum(1 for cov in ("a.dwelling", "b.other structures",
+                              "c.personal property", "d.loss of use",
+                              "e.personal liability", "f.medical payments")
+                if cov in text) >= 3
+            and any(k in text for k in (
+                "if the policy is cancelled or not renewed",
+                "advance notice of cancellation",
+                "notice of cancellation we give our insured",
+            ))
+        )
+        # 🔒 GUARD: "Cancellation notice for non-payment" documents that function
+        # as invoices/billing notices should be INV, not CAN, when they contain
+        # strong payment/invoice signals (payment stub, amount due, remittance).
+        # These are conditional cancellation warnings requesting payment.
+        is_payment_notice = (
+            ("non-payment of premium" in text or "non-payment" in text 
+             or "nonpayment of premium" in text)
+        ) and (
+            # Strong payment stub signals — these indicate an invoice, not a final cancellation
+            sum(1 for k in (
+                "return this portion with your payment",
+                "amount enclosed",
+                "make check or money order",
+                "make check payable",
+                "make checks payable",
+                "minimum amount due",
+                "minimum premium amount due",
+                "remit to",
+                "payment by check",
+                "pay by phone",
+                "check-by-phone",
+            ) if k in text) >= 2
+        )
+        if is_payment_notice:
+            pass  # Let it fall through to INV detection below
+        elif not is_lexisnexis_can and (any(re.search(p, text) for p in can_guard_patterns) or has_declaration_with_coverage or has_mortgagee_cert_context or has_coverage_with_boilerplate):
             pass
         else:
             return "CAN"
@@ -431,6 +495,8 @@ def classify_document(lines: List[str]) -> str:
         "remit to",
         "make check payable",
         "make checks payable",
+        "make check or money order",
+        "amount enclosed",
         "to pay in full amount due",
         "balance (to pay in full)",
         "return this portion with your payment",
