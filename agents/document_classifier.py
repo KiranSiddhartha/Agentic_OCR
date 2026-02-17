@@ -3,7 +3,7 @@ Document Type Classifier - CLEAN ARCHITECTURE VERSION
 Returns ONLY valid document types (structural classification).
 Policy types and cancellation subtypes are handled by policy_classifier.
 
-Valid document types: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
+Valid document types: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH
 NOT returned: FPN, NRNW, BREQ/BRQ (these are policy subtypes)
 """
 from typing import List
@@ -17,11 +17,11 @@ VALID_DOC_TYPES = {
     "RNS",  # Reinstatement
     "RNW",  # Renewal/Declarations
     "CAN",  # Cancellation (includes non-renewal structurally)
-    "OTH",  # Other
-    "UNK",  # Unknown
+    "OTH",  # Other / Unknown
 }
 
 # REMOVED FROM VALID DOCUMENT TYPES:
+# - UNK: Unknown (merged into OTH - all unknown documents are now classified as OTH)
 # - FPN: Force Placed Notice (no longer a valid doc type per business rules)
 # - NRNW: Non-Renewal (this is a cancellation REASON, returned by policy_classifier)
 # - BREQ/BRQ: Borrower Request (this is a cancellation REASON, returned by policy_classifier)
@@ -165,7 +165,7 @@ DOC_TYPES = {
     ],
 
     "OTH": [
-        # Other
+        # Other / Unknown
         "multiple loans number",
         "multiple policy numbers",
         "multiple insured names",
@@ -178,10 +178,10 @@ DOC_TYPES = {
 def classify_document(lines: List[str]) -> str:
     """
     Classify insurance document type based on STRUCTURE only.
-    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
+    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH
 
     Valid doc types per business rules:
-      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN, UNK
+      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN
     
     Does NOT return (these are policy subtypes handled by policy_classifier):
       FPN   - Force Placed Notice (removed from valid types)
@@ -189,6 +189,7 @@ def classify_document(lines: List[str]) -> str:
       TPN   - Third Party Notice (maps to CAN or DOI based on content)
       NRNW  - Non-Renewal (cancellation reason)
       EDI   - Electronic Data Interchange (format, not type)
+      UNK   - Unknown (merged into OTH)
 
     NRNW is NOT a doc type — non-renewal is a CAN with reason=NRNW.
     The policy classifier separately returns NRNW as a policy_type.
@@ -769,7 +770,7 @@ def classify_document(lines: List[str]) -> str:
         return "BIN"
 
     # ==========================================================
-    # DEFAULT
+    # DEFAULT: All unclassified documents return OTH
     # ==========================================================
     return "OTH"
 
@@ -789,7 +790,7 @@ def get_document_explanation(doc_type: str) -> str:
         
         "RNW": "Once the borrower chooses to continue the policy with the same insurance company before the policy period expires would be considered as renewal.",
         
-        "OTH": "Information with multiple policies listed in one document and document which is not related to insurance would be considered as other.",
+        "OTH": "Information with multiple policies listed in one document, document which is not related to insurance, or document that could not be classified into a specific type would be considered as other.",
         
         "CAN": "The Policy might get cancelled by wish of Borrower/Insurance company due to various reasons.",
     }
