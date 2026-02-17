@@ -120,9 +120,11 @@ FIELD_RULES = {
     },
     "BIN": {
         "carrier_name",
+        "policy_number",
         "insured_name",
         "property_address",
         "effective_date",
+        "expiration_date",
     },
     "OTH": {
         "carrier_name",
@@ -130,6 +132,11 @@ FIELD_RULES = {
         "insured_name",
         "property_address",
         "loan_number",
+    },
+    "UNK": {
+        "carrier_name",
+        "policy_number",
+        "insured_name",
     },
 }
 
