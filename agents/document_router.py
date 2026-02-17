@@ -107,12 +107,14 @@ FALLBACK_MAP = {
 REQUIRED_FIELDS: Dict[str, List[str]] = {
     "RNW":  ["carrier_name", "policy_number", "insured_name",
              "effective_date", "expiration_date"],
-    "INV":  ["policy_number", "insured_name"],
-    "CAN":  ["policy_number", "insured_name", "effective_date"],
+    "INV":  ["carrier_name", "policy_number", "insured_name"],
+    "CAN":  ["carrier_name", "policy_number", "insured_name",
+             "effective_date"],
     "DOI":  ["policy_number", "mortgage_company", "loan_number"],
     "COI":  ["carrier_name", "policy_number", "insured_name",
              "effective_date", "expiration_date"],
-    "RNS":  ["policy_number", "insured_name", "effective_date"],
+    "RNS":  ["carrier_name", "policy_number", "insured_name",
+             "effective_date", "expiration_date"],
     "BIN":  ["carrier_name", "policy_number", "insured_name",
              "effective_date"],
     "OTH":  ["policy_number"],
@@ -121,15 +123,16 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
 
 OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "RNW":  ["property_address", "mailing_address", "mortgage_company",
-             "loan_number", "total_premium", "agent_name", "agent_phone"],
-    "INV":  ["carrier_name", "effective_date", "total_premium",
-             "mortgage_company", "loan_number"],
-    "CAN":  ["carrier_name", "mortgage_company", "property_address"],
+             "loan_number", "total_premium"],
+    "INV":  ["balance_due", "issue_date", "remit_info"],
+    "CAN":  ["expiration_date", "cancellation_date", "cancellation_reason",
+             "property_address", "mortgage_company", "loan_number"],
     "DOI":  ["carrier_name", "insured_name", "property_address"],
-    "COI":  ["property_address", "mortgage_company"],
-    "RNS":  ["carrier_name", "expiration_date"],
+    "COI":  ["property_address"],
+    "RNS":  [],
     "BIN":  ["expiration_date", "property_address"],
-    "OTH":  ["insured_name", "carrier_name"],
+    "OTH":  ["insured_name", "carrier_name", "property_address",
+             "loan_number"],
     "UNK":  ["insured_name", "carrier_name"],
 }
 
@@ -516,8 +519,34 @@ def classify_doc_type(lines: List[str]) -> str:
         "remit to",
         "please pay",
         "minimum due",
+        "policy bill",
+        "premium bill",
+        "premium statement",
+        "renewal premium bill",
     )):
-        return "INV"
+        # Guard: declarations with invoice header should be RNW, not INV
+        # But "policy bill" / "premium statement" as title should always be INV
+        is_policy_bill = any(k in head for k in (
+            "policy bill", "premium bill", "premium statement",
+            "renewal premium bill",
+        ))
+        inv_is_rnw = not is_policy_bill and any(k in full for k in (
+            "policy declarations",
+            "declaration page",
+            "declarations page",
+            "declaration page is attached",
+            "this is not an invoice",
+            "not an invoice/bill",
+            "coverage a",
+            "coverage b",
+            "total policy premium",
+            "annual premium",
+            "mortgagee dec summary",
+            "homeowners policy declarations",
+            "homeowner policy declarations",
+        ))
+        if not inv_is_rnw:
+            return "INV"
 
     # ============================================================
     # 7️⃣ Certificate of Insurance
@@ -528,7 +557,25 @@ def classify_doc_type(lines: List[str]) -> str:
         "acord 25",
         "acord 28",
     )):
-        return "COI"
+        # Guard: unit owner / condo certificate with coverage details = RNW, not COI
+        coi_is_rnw = any(k in full for k in (
+            "unit owner",
+            "master policy",
+            "condominium unit number",
+            "coverage amount",
+            "coverage summary",
+            "deductible",
+            "policy inception date",
+            "effective date",
+            "policy period",
+            "declarations",
+            "dwelling",
+            "renewal",
+            "coverage a",
+            "coverage b",
+        ))
+        if not coi_is_rnw:
+            return "COI"
 
     # ============================================================
     # 8️⃣ Reinstatement
@@ -538,7 +585,21 @@ def classify_doc_type(lines: List[str]) -> str:
         "reinstated",
         "rescission of cancellation",
     )):
-        return "RNS"
+        # Guard: "reinstatement date:" is a field label in flood/renewal declarations
+        rns_is_field_label = any(k in full for k in (
+            "flood policy declarations",
+            "flood insurance policy declarations",
+            "policy declarations",
+            "renewal flood insurance",
+            "declarations page",
+            "total premium paid",
+            "total premium",
+            "property location",
+            "policy period",
+            "annual premium",
+        ))
+        if not rns_is_field_label:
+            return "RNS"
 
     # ============================================================
     # 9️⃣ Binder
@@ -571,6 +632,32 @@ def classify_doc_type(lines: List[str]) -> str:
         return "CAN"
 
     # ============================================================
+    # 1️⃣1️⃣a EDI WRAPPER — detect inner document type
+    # ============================================================
+    if any(k in full for k in (
+        "electronic image generated for edi",
+        "electronic image generated",
+        "generated for edi",
+        "edi data",
+        "edi image",
+    )):
+        if any(k in full for k in (
+            "interest removed", "mir-mortgagee", "mir mortgagee",
+        )):
+            return "DOI"
+        if any(k in full for k in (
+            "cancellation", "cancel reason", "cancelled",
+        )):
+            return "CAN"
+        if any(k in full for k in (
+            "doc type - renewal", "doc type renewal",
+            "rwl-811", "rwl-s11", "rnw-811", "rnw-s11",
+            "transaction desc: renewal", "renewal",
+        )) or bool(re.search(r"doc\s*type.*renewal", full)):
+            return "RNW"
+        return "OTH"
+
+    # ============================================================
     # 1️⃣1️⃣ Fax wrapper (structure only — detect inner content)
     # ============================================================
     if _detect_fax_packet(lines):
@@ -599,6 +686,15 @@ def classify_doc_type(lines: List[str]) -> str:
             "homeowner policy",
             "insurance coverage notification",
             "lexisnexis",
+            # QBE / specialty declaration signals inside fax
+            "declaration page is attached",
+            "cert. #",
+            "effective from",
+            "total policy premium",
+            "policy premium",
+            "coverage detail",
+            "mortgagee(s)",
+            "mortgagees",
         ))
         if not strong_doc_signals:
             return "UNK"
@@ -614,6 +710,19 @@ def classify_doc_type(lines: List[str]) -> str:
         "homeowner",
         "amended declarations",
         "coverage summary",
+        # Wind / specialty formats
+        "carrier:",
+        "pol. type:",
+        "pol.type:",
+        "prop. loc:",
+        "prop.loc:",
+        # American Modern format
+        "policy declarations",
+        "premium summary",
+        "policy summary",
+        "named insured",
+        # Progressive format  
+        "progressive",
     )):
         return "RNW"
 
@@ -624,9 +733,37 @@ def classify_doc_type(lines: List[str]) -> str:
         "annual premium",
         "renewal flood insurance",
         "flood insurance policy declarations",
+        "flood policy declarations",
         "agent issued declarations",
         "policy premium",
         "total policy premium",
+        # Wind / specialty signals
+        "pol. from:",
+        "pol.from:",
+        "pol. to:",
+        "pol.to:",
+        "eff. date:",
+        "eff.date:",
+        "prop. loc:",
+        "prop.loc:",
+        # American Modern / general declaration signals
+        "policy type:",
+        "coverage detail",
+        "coverage and limits",
+        "additional interests",
+        "lienholder",
+        "loan/contract number",
+        "dwelling #1",
+        "named insured(s)",
+        "transaction effective date",
+        "mortgagee dec summary",
+        "insured and policy information",
+        # QBE / specialty with declaration page
+        "declaration page is attached",
+        "cert. #",
+        "effective from",
+        # EDI renewal patterns
+        "doc type - renewal",
     )):
         return "RNW"
 
@@ -740,13 +877,30 @@ def classify_policy_type(lines: List[str]) -> str:
             "purchase of flood insurance",
             "consider the purchase of flood",
             "does not provide earthquake coverage",
+            "does not have coverage for the peril of flood",
         ))
         if not fld_excluded:
             return "FLD"
-    # WND — "wind only" is specific; "hurricane" alone is too broad
+    # WND — "wind only" is specific; also detect pol. type: wind
     if any(k in full for k in ("wind only", "windstorm insurance policy",
-                                "hw-2 wind only", "wind-only policy")):
+                                "hw-2 wind only", "wind-only policy",
+                                "pol. type: wind", "pol.type: wind",
+                                "pol type: wind", "aop & hurricane")):
         return "WND"
+    # UO — Unit Owner (before HO6, more specific)
+    if any(k in full for k in ("unit owner", "master policy")) and any(
+        k in full for k in ("certificate of insurance", "condominium unit number",
+                             "unit owner mortgagee", "master policy number")):
+        return "UO"
+    # ERQ — Earthquake — guard against disclaimers
+    if any(k in full for k in ("earthquake", "erq", "eq policy")):
+        erq_excluded = any(k in full for k in (
+            "does not provide earthquake", "earthquake is excluded",
+            "does not include earthquake", "peril of earthquake",
+            "coverage for earthquake",
+        ))
+        if not erq_excluded:
+            return "ERQ"
     # FIR detection - guard against "dwelling fire" in endorsement/form titles
     fir_strong_patterns = any(k in full for k in (
                                 "dwelling fire policy",
@@ -755,18 +909,24 @@ def classify_policy_type(lines: List[str]) -> str:
                                 "cov type - dwelling fire",
                                 "cov type dwelling fire",
                                 "coverage type: dwelling fire",
-                                "coverage type dwelling fire"))
+                                "coverage type dwelling fire",
+                                # American Modern: "dwelling basic"
+                                "policy type: dwelling basic",
+                                "dwelling basic policy",
+                                "dwelling basic renewal",
+                                "dwelling basic policy declaration",
+                                # Nationwide
+                                "dwelling fire policy number",
+                                ))
     fir_dfire_match = bool(re.search(r"\bdfire\b", full)) or bool(re.search(r"\bdfir\b", full))
     fir_dwelling_fire = False
     if "dwelling fire" in full and not fir_strong_patterns:
-        # Guard: "dwelling fire provisions" or similar = endorsement, not policy type
         dfire_in_endorsement = any(k in full for k in (
             "dwelling fire provisions",
             "dwelling fire endorsement",
             "amendment of home and dwelling fire",
             "amendment of dwelling fire",
         ))
-        # Guard: "A DWELLING FIRE $..." = peril in coverage table (landlord/HO)
         dfire_as_peril = any(k in full for k in (
             "landlord", "landlord protection",
             "occupancy: tenant", "loss of rent",
@@ -775,15 +935,26 @@ def classify_policy_type(lines: List[str]) -> str:
             fir_dwelling_fire = True
     if fir_strong_patterns or fir_dfire_match or fir_dwelling_fire:
         return "FIR"
+    # HAZ — Dwelling Special (American Modern) + other commercial/non-residential
+    if any(k in full for k in ("dwelling special", "policy type: dwelling special",
+                                "dwelling special policy")):
+        return "HAZ"
     if any(k in full for k in ("house & home", "house and home",
                                 "policy type: house")):
         return "HAZ"
     if any(k in text for k in ("hazard", " haz ")):
         return "HAZ"
+    # EDI HAZ patterns
+    if any(k in full for k in ("cov type - home owners", "cov type home owners",
+                                "home-811", "home-s11", "coverage amt opt a")):
+        return "HAZ"
     if any(k in text for k in ("ho-6", "ho6")):
         return "HO6"
-    # Guard: "condominium" in form names (e.g., "Rental Condominium Unit Form 664")
-    # should NOT trigger HO6. Only match in policy type context.
+    # HO6 — condominium detection
+    if any(k in full for k in ("condominium new business", "condominium renewal",
+                                "condominium policy change", "condominium policy declaration",
+                                "policy type: condominium", "e&s multi-peril")):
+        return "HO6"
     if "condominium" in text:
         condo_in_form = bool(re.search(
             r"(rental\s+)?condominium\s+unit\s+(form|coverage\s+form)", full
@@ -794,10 +965,24 @@ def classify_policy_type(lines: List[str]) -> str:
         ))
         if not condo_in_form and not strong_ho:
             return "HO6"
+    # LL — Landlord
+    if any(k in full for k in ("landlord", "rental dwelling", "rental property",
+                                "lessor", "occupancy: tenant", "loss of rent")):
+        return "LL"
     if "dp3" in text or "dp-3" in text:
         return "DP3"
+    # HO — Manufactured home
+    if any(k in full for k in ("manufactured home", "mobile home", "mobilehome",
+                                "policy type: manufactured home")):
+        return "HO"
     if any(k in full for k in ("homeowner", "ho-3", "ho3", "home protection",
                                 "homeowners pol", "homeowner pol", "homesaver")):
+        return "HO"
+    # HO from coverage structure  
+    ho_markers = ["coverage a", "coverage b", "coverage c", "coverage d",
+                  "coverage e", "coverage f", "personal liability",
+                  "dwelling", "other structures", "deductible"]
+    if sum(1 for m in ho_markers if m in full) >= 3:
         return "HO"
     return "UNK"
 
@@ -1089,61 +1274,286 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
     if m:
         out["policy_number"] = _candidate(
             m.group(1).strip(), "dte_can_policy", 0.95)
+    # Fallback: inline "Policy TX-HOV-XXXXX" pattern
+    if "policy_number" not in out:
+        m = re.search(r'(?i)Policy\s+([A-Z]{2}[\-]?[A-Z]{2,4}[\-]?\d{5,}[\-]?\d*)', text)
+        if m:
+            out["policy_number"] = _candidate(
+                m.group(1).strip(), "dte_can_policy_inline", 0.92)
 
     # Insured name
     m = _NAME_LABEL_RE.search(text)
     if m:
-        out["insured_name"] = _candidate(
-            m.group(1).strip(), "dte_can_name", 0.93)
+        name = m.group(1).strip()
+        # Truncate at address patterns (digit + street suffix)
+        addr_m = re.search(r'\s+\d+\s+\w+\s+(?:st|street|ave|avenue|rd|road|blvd|'
+                           r'dr|drive|ln|lane|ct|cir|way)\b', name, re.I)
+        if addr_m:
+            name = name[:addr_m.start()].strip()
+        # Truncate at standalone digit blocks (address start)
+        addr_m2 = re.search(r'\s+\d{2,}\s+[A-Z]', name)
+        if addr_m2 and len(name[:addr_m2.start()].split()) >= 2:
+            name = name[:addr_m2.start()].strip()
+        if name:
+            out["insured_name"] = _candidate(
+                name, "dte_can_name", 0.93)
 
-    # Cancellation / effective date — look for specific labels
-    for line in lines:
+    # --- CANCELLATION DATE (expanded triggers) ---
+    for idx, line in enumerate(lines):
         ll = line.lower()
-
-        # Cancellation date
-        if "effective_date" not in out:
-            if any(k in ll for k in ("cancel effective", "cancellation date",
-                                      "cancelled effective",
-                                      "effective date of cancellation",
-                                      "policy will be cancel")):
+        if "cancellation_date" not in out:
+            if any(k in ll for k in (
+                "cancellation date", "cancel date", "date of cancellation",
+                "termination date", "cancellation effective",
+                "cancelled effective", "will be cancelled",
+                "policy cancellation date",
+                "terminate this policy effective",
+                "coverage will cease", "policy will cancel",
+                "cancel effective",
+            )):
                 d = _first_date(line)
                 if d:
-                    out["effective_date"] = _candidate(
-                        d, "dte_can_cancel_date", 0.96)
+                    out["cancellation_date"] = _candidate(
+                        d, "dte_can_date", 0.96)
+            # "non-renewal date" pattern
+            elif any(k in ll for k in (
+                "non-renewal date", "nonrenewal date",
+                "non-renewed as of", "will be non-renewed",
+            )):
+                d = _first_date(line)
+                if d:
+                    out["cancellation_date"] = _candidate(
+                        d, "dte_can_nrnw_date", 0.94)
+            # "cancelled...on DATE" sentence pattern
+            elif ("cancelled" in ll or "canceled" in ll) and "on " in ll:
+                d = _first_date(line)
+                if d:
+                    out["cancellation_date"] = _candidate(
+                        d, "dte_can_date_sentence", 0.90)
+            # "Eff Die" / "Eff Date" EDI pattern
+            elif re.search(r'(?i)eff\s*d(?:ie|ate|t)\s', line):
+                d = _first_date(line)
+                if d:
+                    out["cancellation_date"] = _candidate(
+                        d, "dte_can_date_edi", 0.88)
 
-        # Reason
+    # Also store cancellation_date as expiration_date for CAN documents
+    if "cancellation_date" in out and "expiration_date" not in out:
+        out["expiration_date"] = _candidate(
+            out["cancellation_date"]["value"],
+            "dte_can_exp_from_cancel", 0.90)
+
+    # --- EFFECTIVE DATE (policy inception / start date) ---
+    for line in lines:
+        ll = line.lower()
+        if "effective_date" not in out:
+            if any(k in ll for k in (
+                "inception date", "policy effective date",
+                "effective date of policy", "policy period",
+                "policy term", "pol from", "pol. from",
+                "coverage effective",
+            )):
+                d = _first_date(line)
+                if d:
+                    # Don't use cancellation date as effective date
+                    cancel_val = out.get("cancellation_date", {}).get("value", "")
+                    if d != cancel_val:
+                        out["effective_date"] = _candidate(
+                            d, "dte_can_inception", 0.90)
+
+    # --- CANCELLATION REASON (expanded) ---
+    for line in lines:
+        ll = line.lower()
         if "cancellation_reason" not in out:
-            if any(k in ll for k in ("reason", "non-payment",
-                                      "nonpayment", "borrower request",
-                                      "insured request", "underwriting")):
-                # Extract the reason text
-                if ":" in line:
-                    _, _, val = line.partition(":")
-                    val = val.strip()
-                    if val and len(val) > 3:
-                        out["cancellation_reason"] = _candidate(
-                            val, "dte_can_reason", 0.92)
-                elif "non-payment" in ll or "nonpayment" in ll:
+            # Explicit "Reason:" label
+            if "reason" in ll and ":" in line:
+                _, _, val = line.partition(":")
+                val = val.strip()
+                if val and len(val) > 3:
                     out["cancellation_reason"] = _candidate(
-                        "Non-payment of premium", "dte_can_reason", 0.90)
-                elif "borrower request" in ll:
-                    out["cancellation_reason"] = _candidate(
-                        "Borrower request", "dte_can_reason", 0.90)
-                elif "insured request" in ll:
-                    out["cancellation_reason"] = _candidate(
-                        "Insured request", "dte_can_reason", 0.90)
+                        val, "dte_can_reason", 0.92)
+            # Keyword-based reason detection
+            elif "non-payment" in ll or "nonpayment" in ll or "non pay" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Non-payment of premium", "dte_can_reason", 0.90)
+            elif "borrower request" in ll or "borrower-request" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Borrower request", "dte_can_reason", 0.90)
+            elif "insured request" in ll or "insured named below has requested" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Insured request", "dte_can_reason", 0.90)
+            elif "non-renewal" in ll or "nonrenewal" in ll or "non-renewed" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Non-renewal", "dte_can_reason", 0.90)
+            elif "underwriting" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Underwriting", "dte_can_reason", 0.88)
+            elif "building has been sold" in ll or "property sold" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Building sold/removed/destroyed", "dte_can_reason", 0.90)
+            elif "removed, destroyed" in ll or "removed or destroyed" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Building sold/removed/destroyed", "dte_can_reason", 0.88)
+            elif "insured - non pay" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Insured - Non Pay", "dte_can_reason", 0.90)
+            elif "customer initiated" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Cancellation Customer Initiated", "dte_can_reason", 0.88)
+            elif "premium payment has not been received" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "Non-payment of premium", "dte_can_reason", 0.88)
+            elif "no longer required by lender" in ll:
+                out["cancellation_reason"] = _candidate(
+                    "No longer required by lender", "dte_can_reason", 0.88)
 
-    # Carrier
+    # Carrier — try labeled first
     m = _CARRIER_LABEL_RE.search(text)
     if m:
         out["carrier_name"] = _candidate(
             m.group(1).strip().upper(), "dte_can_carrier", 0.90)
 
-    # Mortgage company
+    # Carrier — keyword fallback (scan first 20 lines for "insurance" + entity type)
+    if "carrier_name" not in out:
+        for line in lines[:25]:
+            ll = line.lower().strip()
+            if not ll or len(ll) > 120:
+                continue
+            has_ins = any(w in ll for w in ("insurance", "indemnity", "casualty",
+                                             "underwriters", "assurance"))
+            has_entity = any(w in ll for w in ("company", "co", "co.", "exchange",
+                                                "group", "mutual", "corp",
+                                                "corporation"))
+            has_abbrev = bool(re.search(r'\b(?:ins|prop|cas)\b', ll))
+            has_skip = any(w in ll for w in ("agency", "agent", "services",
+                                              "broker", "producer", "processing",
+                                              "center", "relations"))
+            if has_ins and (has_entity or has_abbrev) and not has_skip:
+                val = line.strip()
+                val = re.sub(r'\s+(?:Mortgagee|Lender|Service).*$', '',
+                             val, flags=re.I).strip()
+                val = re.sub(r'^\d+\s+', '', val).strip()  # strip leading numbers
+                if val and len(val) > 5:
+                    out["carrier_name"] = _candidate(
+                        val.upper(), "dte_can_carrier_kw", 0.85)
+                    break
+
+    # Mortgage company — try labeled first
     m = _MORTGAGE_LABEL_RE.search(text)
     if m:
-        out["mortgage_company"] = _candidate(
-            m.group(1).strip(), "dte_can_mortgage", 0.88)
+        val = m.group(1).strip()
+        # Clean ISAOA/ATIMA suffixes
+        val = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA|ITS\s+SCRS?\s*&?/?\s*OR\s+ASSIGNS?\s+ATIMA).*$',
+                     '', val, flags=re.I).strip()
+        if val and len(val) > 3:
+            out["mortgage_company"] = _candidate(
+                val, "dte_can_mortgage", 0.88)
+
+    # Mortgage — ISAOA/ATIMA fallback (scan for entity + ISAOA on same line or preceding)
+    if "mortgage_company" not in out:
+        for idx, line in enumerate(lines):
+            if re.search(r'\b(?:ISAOA|ATIMA)\b', line, re.I):
+                name = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA|ITS\s+SCRS?).*$',
+                              '', line, flags=re.I).strip()
+                name = re.sub(r'^\d+\w*\s+', '', name).strip()
+                name = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$', '',
+                              name, flags=re.I).strip()
+                if name and len(name) > 3:
+                    # Skip if this looks like an insured name block
+                    if idx > 0 and re.search(r'(?i)insured', lines[idx - 1]):
+                        continue
+                    out["mortgage_company"] = _candidate(
+                        name, "dte_can_mortgage_isaoa", 0.82)
+                    break
+    # Mortgage — "Mortgagee Copy" or "1st Mortgagee:" context
+    if "mortgage_company" not in out:
+        for idx, line in enumerate(lines):
+            ll = line.lower()
+            if any(k in ll for k in ("mortgagee copy", "1st mortgagee",
+                                      "mortgagee or interested",
+                                      "lien holder")):
+                # Check next 1-2 lines for the company name
+                for offset in range(0, 3):
+                    if idx + offset >= len(lines):
+                        break
+                    cand = lines[idx + offset].strip()
+                    # Skip the label line itself if it doesn't have a value
+                    if offset == 0 and ":" in cand:
+                        _, _, cand = cand.partition(":")
+                        cand = cand.strip()
+                    if cand and len(cand) > 3 and not re.match(r'^\d', cand):
+                        cand = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$', '',
+                                      cand, flags=re.I).strip()
+                        cand = re.sub(r'\s+(?:ISAOA|ATIMA).*$', '',
+                                      cand, flags=re.I).strip()
+                        if cand and len(cand) > 3:
+                            out["mortgage_company"] = _candidate(
+                                cand, "dte_can_mortgage_context", 0.82)
+                            break
+                if "mortgage_company" in out:
+                    break
+
+    # Property address — expanded patterns
+    if "property_address" not in out:
+        for idx, line in enumerate(lines):
+            ll = line.lower()
+            if any(k in ll for k in ("property address", "property location",
+                                      "location of property", "risk location",
+                                      "covered property", "prop loc",
+                                      "insured property", "premises")):
+                # Try inline first (after label)
+                if ":" in line:
+                    _, _, val = line.partition(":")
+                    val = val.strip()
+                    if val and re.search(r'\d+.*\b[A-Z]{2}\b', val):
+                        out["property_address"] = _candidate(
+                            val.rstrip(".,"), "dte_can_addr_inline", 0.88)
+                        continue
+                # Multi-line address collection
+                parts = []
+                for offset in range(1, 4):
+                    if idx + offset >= len(lines):
+                        break
+                    addr = lines[idx + offset].strip()
+                    if not addr or re.match(r'(?i)^(primary|building|contents|coverage)', addr):
+                        break
+                    parts.append(addr)
+                    if re.search(r'\b[A-Z]{2}\s*\d{5}', addr):
+                        break
+                if parts:
+                    full_addr = ", ".join(parts).rstrip(".,")
+                    out["property_address"] = _candidate(
+                        full_addr, "dte_can_addr_multi", 0.85)
+
+    # Property address — scan for "Named Insured and Address" block
+    if "property_address" not in out:
+        for idx, line in enumerate(lines):
+            ll = line.lower()
+            if "named insured and address" in ll or "name and address of insured" in ll:
+                # Scan next lines for street address
+                for offset in range(1, 5):
+                    if idx + offset >= len(lines):
+                        break
+                    addr = lines[idx + offset].strip()
+                    if re.search(r'\d+\s+.+?\b(st|street|ave|avenue|rd|road|blvd|'
+                                 r'ln|lane|dr|drive|ct|cir|way)\b', addr, re.I):
+                        # Collect address + city/state/zip
+                        addr_parts = [addr]
+                        nxt = lines[idx + offset + 1].strip() if idx + offset + 1 < len(lines) else ""
+                        if nxt and re.search(r'\b[A-Z]{2}\s*\d{5}', nxt):
+                            addr_parts.append(nxt)
+                        out["property_address"] = _candidate(
+                            ", ".join(addr_parts).rstrip(".,"),
+                            "dte_can_addr_insured_block", 0.82)
+                        break
+
+    # Loan number
+    m = _LOAN_LABEL_RE.search(text)
+    if m:
+        digits = re.sub(r"[\s\-]", "", m.group(1))
+        if len(digits) >= 5:
+            out["loan_number"] = _candidate(
+                digits, "dte_can_loan", 0.90)
 
     return out
 
@@ -1169,32 +1579,103 @@ def _dte_nonrenewal(lines: List[str]) -> Dict[str, Dict]:
         out["insured_name"] = _candidate(
             m.group(1).strip(), "dte_nrnw_name", 0.93)
 
-    # Expiration date
+    # Non-renewal / Expiration date
     for line in lines:
         ll = line.lower()
         if "expiration_date" not in out:
             if any(k in ll for k in ("expiration", "expire", "will not renew",
-                                      "policy end", "coverage end")):
+                                      "policy end", "coverage end",
+                                      "non-renewal date", "nonrenewal date",
+                                      "will be non-renewed")):
                 d = _first_date(line)
                 if d:
                     out["expiration_date"] = _candidate(
                         d, "dte_nrnw_expiration", 0.95)
+                    # Also store as cancellation_date
+                    if "cancellation_date" not in out:
+                        out["cancellation_date"] = _candidate(
+                            d, "dte_nrnw_cancel_date", 0.93)
 
-    # Effective date (sometimes present as "non-renewal effective")
+    # Effective date (sometimes present as "effective date" or "policy period")
     for line in lines:
         ll = line.lower()
         if "effective_date" not in out:
-            if any(k in ll for k in ("effective date", "policy period")):
+            if any(k in ll for k in ("effective date", "policy period",
+                                      "inception date", "pol from")):
                 d = _first_date(line)
                 if d:
-                    out["effective_date"] = _candidate(
-                        d, "dte_nrnw_effective", 0.90)
+                    # Don't confuse with cancellation/expiration date
+                    cancel_val = out.get("cancellation_date", {}).get("value", "")
+                    exp_val = out.get("expiration_date", {}).get("value", "")
+                    if d != cancel_val and d != exp_val:
+                        out["effective_date"] = _candidate(
+                            d, "dte_nrnw_effective", 0.90)
 
-    # Carrier
+    # Cancellation reason — always "Non-renewal" for NRNW docs
+    if "cancellation_reason" not in out:
+        out["cancellation_reason"] = _candidate(
+            "Non-renewal", "dte_nrnw_reason", 0.92)
+
+    # Carrier — try label first, then keyword
     m = _CARRIER_LABEL_RE.search(text)
     if m:
         out["carrier_name"] = _candidate(
             m.group(1).strip().upper(), "dte_nrnw_carrier", 0.90)
+    if "carrier_name" not in out:
+        for line in lines[:25]:
+            ll = line.lower().strip()
+            if not ll or len(ll) > 120:
+                continue
+            has_ins = any(w in ll for w in ("insurance", "indemnity", "casualty"))
+            has_entity = any(w in ll for w in ("company", "co", "exchange",
+                                                "group", "mutual", "corp"))
+            has_skip = any(w in ll for w in ("agency", "agent", "services",
+                                              "broker", "producer"))
+            if has_ins and has_entity and not has_skip:
+                val = line.strip()
+                val = re.sub(r'\s+\d+\s+.*$', '', val).strip()  # strip address
+                if val and len(val) > 5:
+                    out["carrier_name"] = _candidate(
+                        val.upper(), "dte_nrnw_carrier_kw", 0.85)
+                    break
+
+    # Property address
+    if "property_address" not in out:
+        for idx, line in enumerate(lines):
+            ll = line.lower()
+            if any(k in ll for k in ("location of property", "property location",
+                                      "property address", "risk location",
+                                      "covered property")):
+                parts = []
+                for offset in range(1, 4):
+                    if idx + offset >= len(lines):
+                        break
+                    addr = lines[idx + offset].strip()
+                    if not addr:
+                        break
+                    parts.append(addr)
+                    if re.search(r'\b[A-Z]{2}\s*\d{5}', addr):
+                        break
+                if parts:
+                    out["property_address"] = _candidate(
+                        ", ".join(parts).rstrip(".,"),
+                        "dte_nrnw_addr", 0.85)
+
+    # Mortgage — ISAOA/ATIMA detection
+    if "mortgage_company" not in out:
+        for idx, line in enumerate(lines):
+            if re.search(r'\b(?:ISAOA|ATIMA)\b', line, re.I):
+                name = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA).*$',
+                              '', line, flags=re.I).strip()
+                name = re.sub(r'^\d+\w*\s+', '', name).strip()
+                name = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$', '',
+                              name, flags=re.I).strip()
+                if name and len(name) > 3:
+                    if idx > 0 and re.search(r'(?i)insured', lines[idx - 1]):
+                        continue
+                    out["mortgage_company"] = _candidate(
+                        name, "dte_nrnw_mortgage_isaoa", 0.82)
+                    break
 
     return out
 
@@ -1470,6 +1951,70 @@ def extract_lorh(lines: List[str]) -> Dict[str, Dict]:
                 if m:
                     out["total_premium"] = _candidate(
                         "$" + m.group(1), "lorh_premium", 0.85)
+
+    # --- Balance Due (INV-specific) ---
+    for label, value in kv_pairs:
+        if "balance_due" not in out:
+            if any(k in label for k in ("balance", "amount due",
+                                         "to pay in full", "pay in full",
+                                         "current balance due")):
+                m = _MONEY_RE.search(value)
+                if m:
+                    out["balance_due"] = _candidate(
+                        "$" + m.group(1), "lorh_balance", 0.88)
+    # Also scan lines for "Balance (to pay in full)" pattern
+    if "balance_due" not in out:
+        for line in lines:
+            ll = line.lower()
+            if any(k in ll for k in ("balance (to pay", "balance due",
+                                      "to pay in full amount due",
+                                      "current balance due",
+                                      "amount due")):
+                m = _MONEY_RE.search(line)
+                if m:
+                    out["balance_due"] = _candidate(
+                        "$" + m.group(1), "lorh_balance_scan", 0.85)
+                    break
+
+    # --- Issue Date (INV-specific) ---
+    for label, value in kv_pairs:
+        if "issue_date" not in out:
+            if any(k in label for k in ("bill date", "issue date",
+                                         "invoice date", "statement date",
+                                         "information as of",
+                                         "billing date", "due date")):
+                d = _first_date(value)
+                if d:
+                    out["issue_date"] = _candidate(
+                        d, "lorh_issue_date", 0.88)
+    # Also scan for "Information as of DATE" pattern (Allstate)
+    if "issue_date" not in out:
+        for line in lines:
+            ll = line.lower()
+            if "information as of" in ll:
+                d = _first_date(line)
+                if d:
+                    out["issue_date"] = _candidate(
+                        d, "lorh_issue_date_scan", 0.85)
+                    break
+
+    # --- Remit Info (INV-specific) ---
+    if "remit_info" not in out:
+        for line in lines:
+            ll = line.lower()
+            m = re.search(r'(?i)(?:make\s+checks?\s+payable\s+to|payable\s+to|'
+                          r'remit\s+to|mail\s+to|send\s+payment\s+to)\s*:?\s*(.+)',
+                          line)
+            if m:
+                entity = m.group(1).strip()
+                # Remove PO Box and address from the entity name
+                entity = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$', '',
+                                entity, flags=re.I).strip()
+                entity = re.sub(r'\.\s*$', '', entity).strip()
+                if entity and len(entity) > 3:
+                    out["remit_info"] = _candidate(
+                        entity, "lorh_remit", 0.85)
+                    break
 
     # --- Carrier (scan first 15 lines for "insurance" + company type) ---
     if "carrier_name" not in out:

@@ -332,8 +332,14 @@ def classify_policy(lines: List[str]) -> str:
         "cov type dwelling fire",
         "covtype - dwelling fire",
         "covtype dwelling fire",
+        # American Modern / Nationwide formats
+        "policy type: dwelling basic",
+        "dwelling basic policy",
+        "dwelling basic renewal",
+        "dwelling basic policy declaration",
+        # Nationwide Allied format
+        "dwelling fire policy number",
     ))
-    
     # "dwelling fire" as standalone policy indicator — but NOT in endorsement/form titles
     # or coverage peril entries within other policy types (landlord, HO)
     # Guard: "dwelling fire provisions" = form title, not policy type
@@ -440,6 +446,10 @@ def classify_policy(lines: List[str]) -> str:
             "no earthquake coverage",
             "earthquake is not covered",
             "does not include earthquake",
+            # American Modern format: "does not have coverage for the peril of earthquake"
+            "peril of earthquake",
+            "coverage for earthquake",
+            "not have coverage for",
         ))
         if not erq_excluded:
             return "ERQ"
@@ -459,8 +469,29 @@ def classify_policy(lines: List[str]) -> str:
         "hw-2 wind only",
         "hw2 wind only",
         "wind only",
+        # Wind/specialty formats
+        "pol. type: wind",
+        "pol type: wind",
+        "pol.type: wind",
+        "aop & hurricane",
+        "hurricane deductible",
     )):
         return "WND"
+
+    # ==========================================================
+    # 6a. UNIT OWNER (UO) — BEFORE HO6, more specific
+    # Unit owner = condo certificate with master policy + unit context
+    # ==========================================================
+    if any(k in text for k in (
+        "unit owner",
+        "master policy",
+    )) and any(k in text for k in (
+        "certificate of insurance",
+        "condominium unit number",
+        "unit owner mortgagee",
+        "master policy number",
+    )):
+        return "UO"
 
     # ==========================================================
     # 6. HO6 / CONDO (before HO — more specific)
@@ -474,6 +505,17 @@ def classify_policy(lines: List[str]) -> str:
         "ho-6",
         "condo unit owner",
         "condo unit-owner",
+        # Policy type labels
+        "policy type: condominium",
+        "condominium owners",
+        "condominium policy declaration",
+        "condominium policy",
+        # American Modern format
+        "condominium new business",
+        "condominium renewal",
+        "condominium policy change",
+        # QBE / multi-peril with condo
+        "e&s multi-peril",
     ))
     
     if not ho6_strong:
@@ -507,14 +549,7 @@ def classify_policy(lines: List[str]) -> str:
     if ho6_strong:
         return "HO6"
 
-    # ==========================================================
-    # 7. UNIT OWNER (UO) — COI context
-    # ==========================================================
-    if "certificate of insurance" in text and any(k in text for k in (
-        "unit owner",
-        "master policy",
-    )):
-        return "UO"
+    # (UO detection moved to step 6a above HO6)
 
     # ==========================================================
     # 8. LANDLORD (LL)
@@ -532,6 +567,17 @@ def classify_policy(lines: List[str]) -> str:
         return "LL"
 
     # ==========================================================
+    # 9a. DWELLING SPECIAL → HAZ (American Modern format)
+    # "Dwelling Special" is a commercial/non-residential dwelling policy
+    # ==========================================================
+    if any(k in text for k in (
+        "dwelling special",
+        "policy type: dwelling special",
+        "dwelling special policy",
+    )):
+        return "HAZ"
+
+    # ==========================================================
     # 9. HAZ / COMMERCIAL — check BEFORE HO
     # HAZ is for commercial/non-residential property with
     # property-specific language but NO residential coverage letters.
@@ -547,6 +593,13 @@ def classify_policy(lines: List[str]) -> str:
         "amount of insurance",
         "property deductible",
         "buildings - replacement cost",
+        # EDI format HAZ indicators
+        "cov type - home owners",
+        "cov type home owners",
+        "home-811",
+        "home-s11",
+        "coverage amt opt a",
+        "premium amt opt a",
     ))
     if haz_signals:
         # HAZ wins if NO strong residential signals
@@ -652,6 +705,7 @@ def classify_policy(lines: List[str]) -> str:
         "mobile home",
         "mobilehome",
         "manufactured home",
+        "policy type: manufactured home",
     )):
         return "HO"
 

@@ -92,12 +92,25 @@ def merge_page_results(results: list) -> dict:
     }
 
 def render_extracted_text(seg: dict) -> str:
+    """Render extracted fields, filtered to only show fields allowed
+    by get_allowed_fields() so the count matches the summary tab
+    and the field limitation reason.
+    """
+    from agents.insurance_segmentation import get_allowed_fields
+
     fields = seg.get("fields", {})
     if not fields:
         return "No fields extracted"
 
+    doc_type = seg.get("document_type", "UNK")
+    policy_type = seg.get("policy_type", "UNK")
+    allowed = get_allowed_fields(doc_type, policy_type)
+
     out = []
     for k, v in fields.items():
+        # Only show fields that are in the allowed set for this doc+policy type
+        if allowed and k not in allowed:
+            continue
         val = v.get("value") if isinstance(v, dict) else v
         if val:
             out.append(f"{prettify(k)}: {val}")
@@ -329,16 +342,18 @@ def draw_preview_boxes(image, fields, page_index, ocr_data=None, bbox_mode="fiel
 
 
 def build_field_limitation_reason(document_type: str, policy_type: str):
-    """Build explanation for why only certain fields are shown"""
-    doc_fields = FIELD_RULES.get(document_type, set())
-    policy_fields = POLICY_FIELD_RULES.get(policy_type, set())
+    """Build explanation for why only certain fields are shown.
+    
+    Uses get_allowed_fields() as the single source of truth so that
+    the field count here matches extraction and the summary tab.
+    """
+    from agents.insurance_segmentation import get_allowed_fields
 
-    if policy_fields:
-        allowed = sorted(set(doc_fields) & set(policy_fields))
-        scope = "Document + Policy rules"
-    else:
-        allowed = sorted(doc_fields)
-        scope = "Document rules"
+    allowed_set = get_allowed_fields(document_type, policy_type)
+    allowed = sorted(allowed_set)
+
+    policy_fields = POLICY_FIELD_RULES.get(policy_type, set())
+    scope = "Document + Policy rules" if policy_fields else "Document rules"
 
     text = (
         f"Based on {scope}\n\n"
@@ -352,16 +367,24 @@ def build_field_limitation_reason(document_type: str, policy_type: str):
     return html.escape(text).replace("\n", "&#10;")
 
 def classify_extracted_fields(seg_result: dict):
+    """Classify extracted fields as perfect/partial/failed.
+    
+    Uses get_allowed_fields() as the single source of truth so that
+    the field list here matches the extraction tab and the limitation reason.
+    """
+    from agents.insurance_segmentation import get_allowed_fields
+
     fields = seg_result.get("fields", {})
     doc_type = seg_result.get("document_type", "OTH")
+    policy_type = seg_result.get("policy_type", "UNK")
 
-    required = FIELD_RULES.get(doc_type)
+    required = get_allowed_fields(doc_type, policy_type)
     if not required:
-        required = list(fields.keys())
+        required = set(fields.keys())
 
     perfect, partial, failed = [], [], []
 
-    for f in required:
+    for f in sorted(required):
         data = fields.get(f)
         value = data.get("value") if isinstance(data, dict) else None
 
@@ -486,11 +509,14 @@ for f in st.session_state.files:
             vision = VisionAgent(use_layoutxlm=True)
             ocr_data_by_page = {}
 
+            # for page_idx, img in enumerate(pages, 1):
+            #     processed = preprocess(img)
+            #     ocr = vision.ocr_engine.run_with_boxes(processed)
+            #     page_key = f"{f.name}_page_{page_idx}"
+            #     ocr_data_by_page[page_key] = ocr
+
             for page_idx, img in enumerate(pages, 1):
-                processed = preprocess(img)
-                ocr = vision.ocr_engine.run_with_boxes(processed)
-                page_key = f"{f.name}_page_{page_idx}"
-                ocr_data_by_page[page_key] = ocr
+                ocr = vision.ocr_engine.run_with_boxes(img)
 
             # Store OCR data in session state
             if "ocr_data_by_page" not in st.session_state:
@@ -581,7 +607,11 @@ for f in st.session_state.files:
             )
 
         # ---------- FIELD LIMITATION (ℹ️ hover) ----------
-        with st.expander(f"Why only {len(seg['fields'])} fields? ℹ️"):
+        from agents.insurance_segmentation import get_allowed_fields as _get_allowed
+        _allowed = _get_allowed(seg["document_type"], seg["policy_type"])
+        _allowed_count = len(_allowed) if _allowed else len(seg["fields"])
+
+        with st.expander(f"Why only {_allowed_count} fields? ℹ️"):
             st.markdown(
                 build_field_limitation_reason(
                     seg["document_type"],

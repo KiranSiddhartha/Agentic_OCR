@@ -132,6 +132,13 @@ DOC_TYPES = {
         "amount remit to",
         "make check payable",
         "minimum due",
+        "policy bill",
+        "premium bill",
+        "premium statement",
+        "renewal premium bill",
+        "homeowners policy bill",
+        "landlords policy bill",
+        "condominium policy bill",
         "the document only contains premium amount and due date without the balance due"
     ],
 
@@ -420,6 +427,11 @@ def classify_document(lines: List[str]) -> str:
             "renewal notice",
             "declarations page",
             "agent issued declarations",
+            "flood policy declarations",
+            "total premium paid",
+            "property location:",
+            "premium summary",
+            "coverage detail",
         ))
         if rns_is_just_field_label or rns_in_declaration:
             pass  # Skip RNS — it's just a field label in a declaration
@@ -453,6 +465,20 @@ def classify_document(lines: List[str]) -> str:
             "cancelled",
         )):
             return "CAN"
+
+        # If renewal context → treat as RNW
+        if any(k in text for k in (
+            "doc type - renewal",
+            "doc type renewal",
+            "transaction desc: renewal",
+            "transaction dese: renewal",
+            "renewal policy",
+            "rnw-s11",
+            "rnw-811",
+            "rwl-s11",
+            "rwl-811",
+        )) or bool(re.search(r"doc\s*type.*renewal", text)):
+            return "RNW"
 
         # Otherwise do NOT classify as EDI
         return "OTH"
@@ -504,7 +530,14 @@ def classify_document(lines: List[str]) -> str:
     if inv_signals:
         # 🔒 GUARD: declarations with coverage tables are RNW, not INV
         # Also guard: "this is not an invoice/bill" (LexisNexis format)
-        inv_guard = any(g in text for g in (
+        # Detect if "policy bill" is the primary document title
+        # If it is, the document IS an invoice — don't let guards block it
+        is_policy_bill = any(k in text for k in (
+            "policy bill",
+            "premium bill",
+            "premium statement",
+        ))
+        inv_guard = not is_policy_bill and (any(g in text for g in (
             "policy declarations",
             "declaration page",
             "declarations page",
@@ -519,23 +552,29 @@ def classify_document(lines: List[str]) -> str:
             "insurance coverage notification",
             # Additional guards for declaration documents
             "premium notice state farm",
-            "homeowners policy",
-            "homeowner policy",
+            "homeowners policy declarations",
+            "homeowner policy declarations",
             "dwelling (coverage a)",
             "dwelling coverage a",
             "limit of liability",
             "forms & endorsements",
             "forms and endorsements",
-            "policy type",
             "location of premises",
             "mortgagee copy",
+            # QBE / Orchid / specialty multi-page docs with invoice + declarations
+            "declaration page is attached",
+            "cert. #",
+            "coverage forms",
+            "total due",
+            "premium must be received by",
         )) or (
             "declarations" in text and re.search(r"\bcoverage a\b", text)
         ) or (
             "declarations" in text and "premium" in text and "policy" in text
+            and "bill" not in text and "statement" not in text
         ) or (
             "premium notice" in text and "declarations" in text
-        )
+        ))
         if inv_guard:
             pass
         else:
@@ -621,6 +660,42 @@ def classify_document(lines: List[str]) -> str:
         # Agent-issued declarations
         "agent issued declarations",
         "premium notice state farm",
+
+        # Wind / Specialty declarations (First Protective, etc.)
+        "total policy premium",
+        "pol. from:",
+        "pol. to:",
+        "prop. loc:",
+        "prop. loc",
+        "carrier:",
+        "eff. date:",
+
+        # American Modern / Nationwide formats
+        "policy coverages",
+        "coverage detail",
+        "dwelling #1",
+        "dwelling #1:",
+        "named insured(s)",
+        "named insured(s):",
+        "lienholder",
+        "loan/contract number",
+        "additional interests",
+        "additional named insureds",
+
+        # QBE / Orchid / specialty declaration formats
+        "declaration page is attached",
+        "cert. #",
+        "coverages - insurance is effective with",
+        "effective from",
+        "mortgagee(s)",
+
+        # Progressive format
+        "progressive",
+
+        # Generic declaration indicators
+        "policy type:",
+        "insured and policy information",
+        "mortgagee dec summary",
         
     )):
         return "RNW"
@@ -635,6 +710,7 @@ def classify_document(lines: List[str]) -> str:
         "certificate holder",
     )):
         # 🔒 Guard: RNW / DOI must beat COI
+        # Also: unit owner certificates with coverage tables are effectively RNW
         if any(r in text for r in (
             "policy declarations",
             "declarations page",
@@ -658,6 +734,17 @@ def classify_document(lines: List[str]) -> str:
             "deletion of interest",
             "mortgage deleted",
             "mortgage removed",
+            # Unit owner / condo certificate with coverage → RNW
+            "master policy",
+            "unit owner",
+            "condominium unit",
+            "coverage amount",
+            "certificate period",
+            "policy inception date",
+            "coverage summary",
+            "general liability insurance",
+            "property insurance",
+            "deductible",
         )):
             pass
         else:

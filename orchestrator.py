@@ -634,6 +634,8 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
                 "primary": primary_result,
                 "fallback": fallback_result,
             },
+            doc_type=routing.doc_type,
+            policy_type=routing.policy_type,
         )
 
         if debug:

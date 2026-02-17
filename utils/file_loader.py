@@ -10,9 +10,11 @@ ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".pdf")
 # ============================================================
 # ZIP EXPANSION
 # ============================================================
+
 def expand_uploaded_files(files):
     """
-    Expand ZIP files into individual file-like objects.
+    Expand ZIP files into independent in-memory file objects.
+    Fixes closed ZipFile lambda bug.
     """
     expanded = []
 
@@ -20,20 +22,26 @@ def expand_uploaded_files(files):
         name = f.name.lower()
 
         if name.endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(f.read())) as z:
+            zip_bytes = f.getvalue()
+
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
                 for fname in z.namelist():
-                    if fname.lower().endswith(ALLOWED_EXT):
-                        expanded.append(
-                            type(
-                                "UploadedFile",
-                                (),
-                                {
-                                    "name": fname,
-                                    "type": _guess_mime(fname),
-                                    "getvalue": lambda z=z, fname=fname: z.read(fname),
-                                },
-                            )
+                    if not fname.lower().endswith(ALLOWED_EXT):
+                        continue
+
+                    file_bytes = z.read(fname)  # ✅ READ WHILE OPEN
+
+                    expanded.append(
+                        type(
+                            "UploadedFile",
+                            (),
+                            {
+                                "name": fname,
+                                "type": _guess_mime(fname),
+                                "getvalue": lambda b=file_bytes: b,  # safe closure
+                            },
                         )
+                    )
         else:
             expanded.append(f)
 
@@ -61,7 +69,7 @@ def load_input(data: bytes, mime_type: str):
         doc = fitz.open(stream=data, filetype="pdf")
 
         # 🔒 ALWAYS rasterize
-        zoom = 300 / 72  # High-quality OCR
+        zoom = 450 / 72  # High-quality OCR
         mat = fitz.Matrix(zoom, zoom)
 
         for page in doc:
