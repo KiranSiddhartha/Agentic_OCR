@@ -65,7 +65,7 @@ class Approach(Enum):
 
 ALLOWED_DOC_TYPES = {
     "BIN", "CAN", "OTH", "RNW",
-    "RNS", "INV", "DOI", "COI", "UNK"
+    "RNS", "INV", "DOI", "COI" 
 }
 
 # ============================================================
@@ -118,7 +118,6 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
     "BIN":  ["carrier_name", "policy_number", "insured_name",
              "effective_date"],
     "OTH":  ["policy_number"],
-    "UNK":  ["policy_number"],
 }
 
 OPTIONAL_FIELDS: Dict[str, List[str]] = {
@@ -133,13 +132,12 @@ OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "BIN":  ["expiration_date", "property_address"],
     "OTH":  ["insured_name", "carrier_name", "property_address",
              "loan_number"],
-    "UNK":  ["insured_name", "carrier_name"],
 }
 
 # Policy types with coverage/premium tables → triggers + LATE
 TABLE_POLICY_TYPES = {
     "HO", "HO3", "HO6", "FIR", "FLD", "HAZ", "DP3", "WND", "AUTO", "ERQ", "LL", "UO",
-    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", "UNK"
+    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", "OTH"
 }
 
 # ============================================================
@@ -344,7 +342,7 @@ def classify_doc_type(lines: List[str]) -> str:
     Specific patterns must be checked in strict priority order.
     """
     if not lines:
-        return "UNK"
+        return "OTH"
 
     head = " ".join(lines[:50]).lower()
     full = " ".join(lines).lower()
@@ -697,7 +695,7 @@ def classify_doc_type(lines: List[str]) -> str:
             "mortgagees",
         ))
         if not strong_doc_signals:
-            return "UNK"
+            return "OTH"
 
     # ============================================================
     # 1️⃣2️⃣ Renewal (LAST — broadest)
@@ -767,12 +765,12 @@ def classify_doc_type(lines: List[str]) -> str:
     )):
         return "RNW"
 
-    return "UNK"
+    return "OTH"
 
 def classify_policy_type(lines: List[str]) -> str:
     """Rule-based policy-type classification."""
     if not lines:
-        return "UNK"
+        return "OTH"
     text = " ".join(lines[:60]).lower()
     full = " ".join(lines).lower()
 
@@ -984,7 +982,7 @@ def classify_policy_type(lines: List[str]) -> str:
                   "dwelling", "other structures", "deductible"]
     if sum(1 for m in ho_markers if m in full) >= 3:
         return "HO"
-    return "UNK"
+    return "OTH"
 
 
 # ============================================================
@@ -1004,12 +1002,12 @@ def route(
     Output: RoutingResult with approach, target fields, and fallback info
     """
     # --- Auto-classify if not provided ---
-    if not doc_type or doc_type == "UNK":
+    if not doc_type or doc_type == "OTH":
         doc_type = classify_document(lines) 
     if doc_type not in ALLOWED_DOC_TYPES:
-        doc_type = "UNK"
+        doc_type = "OTH"
     # Enforce business-allowed document types only
-    if not policy_type or policy_type == "UNK":
+    if not policy_type or policy_type == "OTH":
         policy_type = classify_policy(lines)
 
     # --- Structural signals ---
@@ -1024,8 +1022,8 @@ def route(
     carrier    = _detect_carrier_hint(lines)
 
     # --- Field requirements ---
-    req = REQUIRED_FIELDS.get(doc_type, REQUIRED_FIELDS["UNK"])
-    opt = OPTIONAL_FIELDS.get(doc_type, OPTIONAL_FIELDS["UNK"])
+    req = REQUIRED_FIELDS.get(doc_type, REQUIRED_FIELDS["OTH"])
+    opt = OPTIONAL_FIELDS.get(doc_type, OPTIONAL_FIELDS["OTH"])
 
     def _r(approach, reason, **kw):
         return RoutingResult(
@@ -1062,8 +1060,8 @@ def route(
             )
         # COI inside PQ → SC+TE → DTE
         if inner == "COI":
-            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS.get("UNK", []))
-            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS.get("UNK", []))
+            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS.get("OTH", []))
+            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS.get("OTH", []))
             return RoutingResult(
                 approach=Approach.SC_TE_DTE,
                 doc_type=inner,
@@ -1142,7 +1140,7 @@ def route(
         if has_tables:
             return _r(Approach.SC_TE_LATE,
                       "Invoice with tables → SC+TE + LATE")
-        if is_simple and policy_type in ("HO6", "UNK"):
+        if is_simple and policy_type in ("HO6", "OTH"):
             return _r(Approach.LORH,
                       "Simple invoice → LORH")
         return _r(Approach.SC_TE,

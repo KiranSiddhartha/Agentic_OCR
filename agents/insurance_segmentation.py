@@ -17,7 +17,6 @@ VALID_DOC_TYPES = {
     "RNW",  # Renewal/Declarations
     "CAN",  # Cancellation
     "OTH",  # Other
-    "UNK",  # Unknown
 }
 
 # ============================================================
@@ -47,7 +46,7 @@ CANCELLATION_SUBTYPES = {
     "CEL",   # Generic Cancellation
 }
 
-ALL_POLICY_TYPES = COVERAGE_TYPES | CANCELLATION_SUBTYPES | {"UNK"}
+ALL_POLICY_TYPES = COVERAGE_TYPES | CANCELLATION_SUBTYPES | {"OTH"}
 
 # ============================================================
 # FIELD RULES BY DOCUMENT TYPE
@@ -131,13 +130,8 @@ FIELD_RULES = {
         "policy_number",
         "insured_name",
         "property_address",
-        "loan_number",
-    },
-    "UNK": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-    },
+        "loan_number", 
+    } 
 }
 
 # ============================================================
@@ -309,7 +303,7 @@ POLICY_FIELD_RULES = {
     },
     
     # UNKNOWN
-    "UNK": {
+    "OTH": {
         "carrier_name",
         "policy_number",
         "loan_number",
