@@ -58,10 +58,17 @@ _POLICY_NUMBER_SKIP = re.compile(
 _INSURED_NAME_LABELS = [
     (r"(?i)(?:named\s+)?insured\s*(?:name)?\s*:", "inline_or_next"),
     (r"(?i)insured\s+(?:name\s+and\s+)?mailing\s+(?:name\s+and\s+)?address\s*:", "next"),
-    (r"(?i)policyholder(?:\s*/\s*named\s+insured)?\s*:?", "inline_or_next"),
+    (r"(?i)policyholder(?:\s*/\s*named\s+insured)?(?:\(s\))?\s*:?", "inline_or_next"),
     (r"(?i)^INSURED$", "next"),
+    (r"(?i)name\s+of\s+insured\s*:?\s+", "inline_or_next"),
+    # DOI-specific: "Name and address of Insured:" → next line is name
+    (r"(?i)name\s+and\s+address\s+of\s+(?:the\s+)?insured\s*:", "next"),
+    # DOI: "Primary Name:" (EDI format)
+    (r"(?i)primary\s+name\s*:", "inline_or_next"),
+    # DOI: "Customer Name:" (various formats)
+    (r"(?i)customer\s+name\s*:", "inline_or_next"),
 ]
-_INSURED_NAME_SKIP = re.compile(r"(?i)property\s+insured")
+_INSURED_NAME_SKIP = re.compile(r"(?i)property\s+insured|payor\s*[:\.]")
 
 _CARRIER_WORDS = ("insurance", "indemnity", "casualty", "underwriters",
                   "surety", "assurance")
@@ -126,6 +133,7 @@ _PREMIUM_LABELS = [
     (r"(?i)total\s+(?:policy\s+)?premium\s*:?", "dollar"),
     (r"(?i)total\s+premium\s+paid\s*:", "dollar"),
     (r"(?i)base\s+policy\s+premium\s*:", "dollar"),
+    (r"(?i)premium\s+balance\s*:?", "dollar"),
 ]
 
 _BALANCE_LABELS = [
@@ -137,6 +145,7 @@ _BALANCE_LABELS = [
     (r"(?i)total\s+balance\s*:?", "dollar"),
     (r"(?i)(?:amount|balance)\s+due\s+(?:no\s+later|by)", "dollar"),
     (r"(?i)minimum\s+(?:amount\s+)?due\s+no\s+later", "dollar"),
+    (r"(?i)total\s+amount\s+due\s*:?", "dollar"),
 ]
 _BALANCE_SKIP = re.compile(r"(?i)(?:includes|past\s+due\s+amount)")
 
@@ -239,7 +248,20 @@ def _extract_with_rules(
                     out["carrier_name"] = _r(val, "sc_carrier_label", 0.85)
             elif re.search(r'(?i)policy\s+provided\s+by', ll):
                 if nxt and len(nxt) > 3 and len(nxt) < 80:
-                    out["carrier_name"] = _r(nxt, "sc_carrier_provided", 0.82)
+                    # Try to merge multi-line carrier name
+                    carrier_val = nxt.strip()
+                    if nxt2 and len(nxt2) < 60 and any(
+                        w in nxt2.lower() for w in (
+                            "insurance", "company", "co.", "corp",
+                            "indemnity", "casualty", "mutual",
+                        )):
+                        carrier_val = carrier_val + " " + nxt2.strip()
+                    out["carrier_name"] = _r(carrier_val, "sc_carrier_provided", 0.82)
+            # DOI: "Carrier Cd-Name:" (EDI format)
+            elif re.search(r'(?i)carrier\s+cd[\-\s]*name\s*:', ll):
+                val = re.split(r'(?i)carrier\s+cd[\-\s]*name\s*:', line, maxsplit=1)
+                if len(val) > 1 and val[1].strip():
+                    out["carrier_name"] = _r(val[1].strip(), "sc_carrier_edi", 0.82)
 
         # --- EFFECTIVE DATE ---
         if "effective_date" in missing_fields and "effective_date" not in out:
@@ -345,6 +367,26 @@ def _extract_with_rules(
         val = _extract_remit_fuzzy(lines)
         if val:
             out["remit_info"] = val
+
+    # ---- DOI-specific: extract insured name + address from "Name and address of Insured:" ----
+    if ("insured_name" in missing_fields and "insured_name" not in out) or \
+       ("property_address" in missing_fields and "property_address" not in out):
+        _extract_doi_name_address(lines, missing_fields, out)
+    # Also try if property_address still missing (insured_name may have been found by main loop)
+    if "property_address" in missing_fields and "property_address" not in out:
+        _extract_doi_name_address(lines, ["property_address"], out)
+
+    # ---- Column-header format: "Policy number" header + values 2 lines below ----
+    if "policy_number" in missing_fields and "policy_number" not in out:
+        _extract_column_policy_number(lines, out)
+
+    # ---- "Named insured" column header ----
+    if "insured_name" in missing_fields and "insured_name" not in out:
+        _extract_column_named_insured(lines, out)
+
+    # ---- "Loan number" column/labeled pattern ----
+    if "loan_number" in missing_fields and "loan_number" not in out:
+        _extract_doi_loan_number(lines, out)
 
     return out
 
@@ -482,6 +524,9 @@ def _after_match(line: str, m) -> Optional[str]:
     # If colon immediately follows
     if rest.startswith(":"):
         return rest[1:].strip()
+    # Handle period-as-colon OCR artifact: "Policy Number. 000000"
+    if rest.startswith("."):
+        return rest[1:].strip()
     return rest if rest else None
 
 
@@ -502,6 +547,9 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
         has_abbrev = bool(re.search(r'\b(?:ins|prop|cas)\b', ll))
         if has_carrier and (has_entity or has_abbrev) and not has_skip:
             val = line.strip()
+            # Strip common label prefixes: "Company:", "Carrier:", "Insurer:", etc.
+            val = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
+                         '', val, flags=re.I).strip()
             # Strip common trailing suffixes
             val = re.sub(r'\s+(?:Mortgagee|Dec\s*Summary|Declarations?|'
                          r'Summary|Page\s*\d).*$', '', val, flags=re.I).strip()
@@ -596,6 +644,192 @@ def _extract_remit_fuzzy(lines: List[str]) -> Optional[Dict]:
     return None
 
 
+def _extract_column_policy_number(lines: List[str], out: Dict) -> None:
+    """
+    Column-header layout: 'Policy number' as header, value 2 lines below.
+    American Family format:
+        Policy number        Policy period        Billing account number
+        41044-67747-94       5/30/2020...         622-278-039-84
+    Also: standalone 'Policy No:' or 'Policy No' with value on same or next line.
+    """
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        # "Policy number" as standalone header (no value on same line)
+        if re.match(r'(?i)^policy\s+number\s*$', line.strip()):
+            # Look ahead 1-5 lines for a value that looks like a policy number
+            for offset in range(1, 6):
+                if idx + offset >= len(lines):
+                    break
+                candidate = lines[idx + offset].strip()
+                # Skip other column headers and sub-headers
+                if re.search(r'(?i)policy\s+period|billing|cancellation|named\s+insured|third party', candidate):
+                    continue
+                clean = _clean_policy(candidate.split()[0] if candidate.split() else "")
+                # Also try full first token group (e.g., "48-K09368-01-0020")
+                first_token = re.match(r'^([\w\-]+)', candidate)
+                if first_token:
+                    clean = _clean_policy(first_token.group(1))
+                if clean and _valid_policy_number(clean):
+                    out["policy_number"] = _r(clean, "sc_col_policy", 0.82)
+                    return
+
+        # "Policy No:" or "Policy No" on EDI format
+        m = re.match(r'(?i)policy\s+no\.?\s*:\s*(.+)', line.strip())
+        if m:
+            val = m.group(1).strip()
+            # Take first token (may have "Term Dates" etc. after)
+            first = re.match(r'^([\w\-]+)', val)
+            if first:
+                clean = _clean_policy(first.group(1))
+                if _valid_policy_number(clean):
+                    out["policy_number"] = _r(clean, "sc_edi_policy", 0.85)
+                    return
+
+
+def _extract_column_named_insured(lines: List[str], out: Dict) -> None:
+    """
+    Column-header format: 'Named insured' header with value below.
+    American Family DOI:
+        Policy number    Cancellation date/time    Named insured
+        48-K09368-01-0020    9/17/2020             RIEMER, LINDA M
+    """
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        if re.match(r'(?i)^named\s+insured\s*$', line.strip()):
+            # Value is typically 2 lines below (after sub-header)
+            for offset in range(1, 4):
+                if idx + offset >= len(lines):
+                    break
+                candidate = lines[idx + offset].strip()
+                # Skip other headers/labels
+                if re.search(r'(?i)third party|we are|you no longer|policy number|cancellation', candidate):
+                    continue
+                # Try to find a name-like value (at least 2 words, no digits)
+                # In column layout, values may be on same line separated by spaces
+                # Look for name-like tokens at end of line
+                parts = candidate.split()
+                # Try last 2-4 words as name
+                for start in range(max(0, len(parts)-4), len(parts)-1):
+                    name_candidate = " ".join(parts[start:])
+                    if _valid_name(name_candidate):
+                        out["insured_name"] = _r(
+                            _clean_isaoa(name_candidate), "sc_col_insured", 0.78)
+                        return
+
+
+def _extract_doi_loan_number(lines: List[str], out: Dict) -> None:
+    """
+    DOI-specific loan number patterns:
+    - 'Loan number (if available)' + value below
+    - 'LOAN NO.:' inline
+    - 'Loan No:' inline
+    """
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        # "Loan number" standalone or with "(if available)"
+        if re.match(r'(?i)^loan\s+number', ll):
+            # Check for inline value first
+            m = re.search(r'(?i)loan\s+number[^:]*:\s*(\S+)', line)
+            if m and _valid_loan_number(m.group(1)):
+                out["loan_number"] = _r(m.group(1).strip(), "sc_doi_loan", 0.82)
+                return
+            # Look ahead for value (skip non-digit lines)
+            for offset in range(1, 6):
+                if idx + offset >= len(lines):
+                    break
+                candidate = lines[idx + offset].strip()
+                if re.match(r'(?i)\(?if\s+available\)?', candidate):
+                    continue
+                # Pure digit string = loan number
+                if candidate and re.match(r'^[\d]+$', candidate):
+                    if _valid_loan_number(candidate):
+                        out["loan_number"] = _r(candidate, "sc_doi_loan", 0.80)
+                        return
+                # Continue scanning (address lines, etc. may appear between header and value)
+
+
+def _extract_doi_name_address(lines: List[str], missing_fields: List[str],
+                               out: Dict) -> None:
+    """
+    DOI-specific: extract insured name + property address from
+    'Name and address of Insured:' or 'Policyholder(s):' blocks.
+    Prioritize 'Name and address of Insured:' since it has both name AND address.
+    """
+    # First pass: look for "Name and address of Insured:" (has both name + address)
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        if re.search(r'(?i)name\s+and\s+address\s+of\s+(?:the\s+)?insured', ll):
+            _doi_extract_from_label(lines, idx, missing_fields, out)
+            return
+
+    # Second pass: look for "Policyholder(s)" (name only, address may follow)
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        if re.search(r'(?i)policyholder', ll):
+            _doi_extract_from_label(lines, idx, missing_fields, out)
+            return
+
+
+def _doi_extract_from_label(lines: List[str], idx: int,
+                             missing_fields: List[str], out: Dict) -> None:
+    """Helper: extract name + address starting from label at idx."""
+    # Name is on next non-empty line
+    name_idx = idx + 1
+    while name_idx < len(lines) and not lines[name_idx].strip():
+        name_idx += 1
+    if name_idx >= len(lines):
+        return
+
+    name_line = lines[name_idx].strip()
+
+    # Skip if it's "Page X of Y" or other noise
+    if re.search(r'(?i)^page\s+\d|^\d+$|^policy|^loan|^your', name_line):
+        name_idx += 1
+        while name_idx < len(lines) and not lines[name_idx].strip():
+            name_idx += 1
+        if name_idx >= len(lines):
+            return
+        name_line = lines[name_idx].strip()
+
+    # Validate name: not starting with digit, not a label
+    if name_line and not re.match(r'^\d', name_line):
+        if not re.search(r'(?i)^page|^policy|^loan|^your|^information', name_line):
+            if "insured_name" in missing_fields and "insured_name" not in out:
+                clean_name = _clean_isaoa(name_line)
+                if _valid_name(clean_name):
+                    out["insured_name"] = _r(clean_name, "sc_doi_insured", 0.80)
+
+    # Address lines after the name
+    if "property_address" in missing_fields and "property_address" not in out:
+        addr_start = name_idx + 1
+        addr_lines = []
+        for ai in range(addr_start, min(addr_start + 3, len(lines))):
+            if ai >= len(lines):
+                break
+            aline = lines[ai].strip()
+            if not aline:
+                break
+            # Address: starts with digit, PO BOX, state+zip, or city+state+zip
+            is_addr = (
+                re.match(r'^\d', aline)
+                or re.search(r'[A-Z]{2}\s+\d{5}', aline)
+                or re.search(r'(?i)^(po\s+box|p\.?o\.?\s*box)', aline)
+                or re.search(r'^[A-Z][a-zA-Z\s]+[A-Z]{2}\s+\d{5}', aline)
+            )
+            # Stop at labels or section headers
+            is_label = re.search(
+                r'(?i)^(policy|terminate|mortgag|loan|the insured|name and)', aline)
+            if is_addr and not is_label:
+                addr_lines.append(aline)
+            elif addr_lines:
+                break
+            else:
+                break
+        if addr_lines:
+            addr = ", ".join(addr_lines)
+            out["property_address"] = _r(addr, "sc_doi_addr", 0.78)
+
+
 # ============================================================
 # GLINER WRAPPER
 # ============================================================
@@ -632,9 +866,13 @@ def _extract_date(text: str) -> Optional[str]:
 def _clean_policy(val: str) -> str:
     if not val:
         return val
-    val = val.strip().rstrip(".,;:")
-    # Stop at common separators: REASON, Policy, AR, INS, etc.
-    val = re.split(r'\s+(?:REASON|Policy|AR\b|INS\b)', val, flags=re.I)[0].strip()
+    val = val.strip().lstrip(":").strip().rstrip(".,;:")
+    # Stop at common separators: REASON, Policy, AR, INS, Loan, etc.
+    val = re.split(r'\s+(?:REASON|Policy|AR\b|INS\b|Loan|Mortgag|Name|Address|Type)', val, flags=re.I)[0].strip()
+    # Remove leading type codes like "ADP", "HO" before actual policy number
+    m = re.match(r'^[A-Z]{2,4}\s+(\d[\d\s\-]+\w*)$', val)
+    if m:
+        val = m.group(1)
     # Remove trailing single characters (artifact codes)
     val = re.sub(r'\s+[A-Za-z0-9]$', '', val).strip()
     # Remove spaces between digit groups: "826 139 329" → "826139329"
