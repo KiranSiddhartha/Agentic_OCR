@@ -1548,6 +1548,10 @@ def _is_mortgage_company_address(value: str) -> bool:
 def validate_carrier(value: str) -> Tuple[bool, str, float]:
     """Validate carrier name"""
     v = _normalize_whitespace(value)
+    
+    # Strip label prefixes that leaked into the value
+    v = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
+               '', v, flags=re.I).strip()
 
     if _is_section_header_value(v):
         return False, v, 0.0
@@ -1599,6 +1603,9 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
 def validate_policy_number(value: str) -> Tuple[bool, str, float]:
     """Validate policy number with strict filtering"""
     v = value.strip()
+    
+    # Strip leading punctuation/OCR artifacts (e.g. ". 000000" from "Policy Number.")
+    v = re.sub(r'^[.\s:;,]+', '', v).strip()
 
     if _is_section_header_value(v):
         return False, v, 0.0

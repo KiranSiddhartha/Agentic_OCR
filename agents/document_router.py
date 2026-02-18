@@ -65,7 +65,7 @@ class Approach(Enum):
 
 ALLOWED_DOC_TYPES = {
     "BIN", "CAN", "OTH", "RNW",
-    "RNS", "INV", "DOI", "COI" 
+    "RNS", "INV", "DOI", "COI", "UNK"
 }
 
 # ============================================================
@@ -118,12 +118,15 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
     "BIN":  ["carrier_name", "policy_number", "insured_name",
              "effective_date"],
     "OTH":  ["policy_number"],
+    "UNK":  ["policy_number"],
 }
 
 OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "RNW":  ["property_address", "mailing_address", "mortgage_company",
              "loan_number", "total_premium"],
-    "INV":  ["balance_due", "issue_date", "remit_info"],
+    "INV":  ["balance_due", "issue_date", "remit_info",
+             "effective_date", "expiration_date", "property_address",
+             "mortgage_company", "loan_number", "total_premium"],
     "CAN":  ["expiration_date", "cancellation_date", "cancellation_reason",
              "property_address", "mortgage_company", "loan_number"],
     "DOI":  ["carrier_name", "insured_name", "property_address"],
@@ -132,12 +135,13 @@ OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "BIN":  ["expiration_date", "property_address"],
     "OTH":  ["insured_name", "carrier_name", "property_address",
              "loan_number"],
+    "UNK":  ["insured_name", "carrier_name"],
 }
 
 # Policy types with coverage/premium tables → triggers + LATE
 TABLE_POLICY_TYPES = {
     "HO", "HO3", "HO6", "FIR", "FLD", "HAZ", "DP3", "WND", "AUTO", "ERQ", "LL", "UO",
-    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", "OTH"
+    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", "UNK"
 }
 
 # ============================================================
@@ -257,11 +261,22 @@ def _detect_inner_doc_type(lines: List[str]) -> Optional[str]:
     # LexisNexis notification with cancellation
     if "insurance coverage notification" in text and "cancellation" in text:
         return "CAN"
-    # Borrower request or third party notice → CAN
+    # Borrower request or customer initiated → CAN
     if "borrower request" in text or "customer initiated" in text:
         return "CAN"
     if "third party notice" in text:
-        # Third party notice is a CAN if it mentions termination/cancellation
+        # Check if it's interest-only termination → DOI
+        if "third party notice of termination" in text:
+            has_policy_terminate = bool(re.search(
+                r"terminate this policy effective[:\s]*\d", text))
+            has_interest_terminate = (
+                "terminate the interest" in text
+                or bool(re.search(
+                    r"terminate the interest.*?(third party|hereon)", text))
+            )
+            if has_interest_terminate and not has_policy_terminate:
+                return "DOI"
+        # Third party notice with termination/cancellation → CAN
         if any(k in text for k in ("terminate", "termination", "cancel", "cancellation")):
             return "CAN"
         else:
@@ -342,7 +357,7 @@ def classify_doc_type(lines: List[str]) -> str:
     Specific patterns must be checked in strict priority order.
     """
     if not lines:
-        return "OTH"
+        return "UNK"
 
     head = " ".join(lines[:50]).lower()
     full = " ".join(lines).lower()
@@ -387,6 +402,37 @@ def classify_doc_type(lines: List[str]) -> str:
                 r"terminate the interest.*?(third party|hereon)", full))
         )
         if has_interest_terminate and not has_policy_terminate:
+            return "DOI"
+
+    # OCR-robust DOI: "terminate the interest" alone (even without TPN header)
+    # If we see "terminate the interest" + NO policy termination date → DOI
+    if "terminate the interest" in full:
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", full))
+        if not has_policy_terminate:
+            return "DOI"
+
+    # OCR-robust: garbled TPN detection
+    # "third party" + "terminat" + "interest" = likely DOI
+    if ("third party" in full 
+        and "interest" in full
+        and any(k in full for k in ("terminat", "termin", "notice"))):
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", full))
+        if not has_policy_terminate:
+            return "DOI"
+
+    # OCR-robust: "indentified hereon" (appears in Allstate TPN docs)
+    # This phrase only appears in interest termination context
+    if any(k in full for k in (
+        "indentified hereon",
+        "identified hereon",
+        "party indentified",
+        "party identified",
+    )):
+        has_policy_terminate = bool(re.search(
+            r"terminate this policy effective[:\s]*\d", full))
+        if not has_policy_terminate:
             return "DOI"
 
     # ============================================================
@@ -462,6 +508,13 @@ def classify_doc_type(lines: List[str]) -> str:
                     "amount enclosed", "make check or money order",
                     "make check payable", "minimum amount due",
                     "minimum premium amount due",
+                    "payment due date", "total amount due",
+                    "payment options", "account statement",
+                    "premium balance", "invoice number",
+                    "detach and return", "please detach",
+                    "pay online", "amount due",
+                    "if payment is not received",
+                    "if you have already made your payment",
                 ) if k in full) >= 2
             )
             if not is_payment_notice:
@@ -521,6 +574,10 @@ def classify_doc_type(lines: List[str]) -> str:
         "premium bill",
         "premium statement",
         "renewal premium bill",
+        "account statement",
+        "total amount due",
+        "payment due date",
+        "invoice number",
     )):
         # Guard: declarations with invoice header should be RNW, not INV
         # But "policy bill" / "premium statement" as title should always be INV
@@ -695,7 +752,7 @@ def classify_doc_type(lines: List[str]) -> str:
             "mortgagees",
         ))
         if not strong_doc_signals:
-            return "OTH"
+            return "UNK"
 
     # ============================================================
     # 1️⃣2️⃣ Renewal (LAST — broadest)
@@ -765,12 +822,12 @@ def classify_doc_type(lines: List[str]) -> str:
     )):
         return "RNW"
 
-    return "OTH"
+    return "UNK"
 
 def classify_policy_type(lines: List[str]) -> str:
     """Rule-based policy-type classification."""
     if not lines:
-        return "OTH"
+        return "UNK"
     text = " ".join(lines[:60]).lower()
     full = " ".join(lines).lower()
 
@@ -982,7 +1039,7 @@ def classify_policy_type(lines: List[str]) -> str:
                   "dwelling", "other structures", "deductible"]
     if sum(1 for m in ho_markers if m in full) >= 3:
         return "HO"
-    return "OTH"
+    return "UNK"
 
 
 # ============================================================
@@ -1002,12 +1059,12 @@ def route(
     Output: RoutingResult with approach, target fields, and fallback info
     """
     # --- Auto-classify if not provided ---
-    if not doc_type or doc_type == "OTH":
+    if not doc_type or doc_type == "UNK":
         doc_type = classify_document(lines) 
     if doc_type not in ALLOWED_DOC_TYPES:
-        doc_type = "OTH"
+        doc_type = "UNK"
     # Enforce business-allowed document types only
-    if not policy_type or policy_type == "OTH":
+    if not policy_type or policy_type == "UNK":
         policy_type = classify_policy(lines)
 
     # --- Structural signals ---
@@ -1022,8 +1079,8 @@ def route(
     carrier    = _detect_carrier_hint(lines)
 
     # --- Field requirements ---
-    req = REQUIRED_FIELDS.get(doc_type, REQUIRED_FIELDS["OTH"])
-    opt = OPTIONAL_FIELDS.get(doc_type, OPTIONAL_FIELDS["OTH"])
+    req = REQUIRED_FIELDS.get(doc_type, REQUIRED_FIELDS["UNK"])
+    opt = OPTIONAL_FIELDS.get(doc_type, OPTIONAL_FIELDS["UNK"])
 
     def _r(approach, reason, **kw):
         return RoutingResult(
@@ -1060,8 +1117,8 @@ def route(
             )
         # COI inside PQ → SC+TE → DTE
         if inner == "COI":
-            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS.get("OTH", []))
-            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS.get("OTH", []))
+            inner_req = REQUIRED_FIELDS.get(inner, REQUIRED_FIELDS.get("UNK", []))
+            inner_opt = OPTIONAL_FIELDS.get(inner, OPTIONAL_FIELDS.get("UNK", []))
             return RoutingResult(
                 approach=Approach.SC_TE_DTE,
                 doc_type=inner,
@@ -1140,7 +1197,7 @@ def route(
         if has_tables:
             return _r(Approach.SC_TE_LATE,
                       "Invoice with tables → SC+TE + LATE")
-        if is_simple and policy_type in ("HO6", "OTH"):
+        if is_simple and policy_type in ("HO6", "UNK"):
             return _r(Approach.LORH,
                       "Simple invoice → LORH")
         return _r(Approach.SC_TE,
@@ -1918,7 +1975,8 @@ def extract_lorh(lines: List[str]) -> Dict[str, Dict]:
             if any(k in label for k in ("insured", "policyholder",
                                          "name")):
                 if not any(k in label for k in ("mortgagee", "company",
-                                                 "agent", "loss payee")):
+                                                 "agent", "loss payee",
+                                                 "payor")):
                     words = value.split()
                     if 2 <= len(words) <= 6 and not any(
                             c.isdigit() for c in value):
@@ -1955,7 +2013,8 @@ def extract_lorh(lines: List[str]) -> Dict[str, Dict]:
         if "balance_due" not in out:
             if any(k in label for k in ("balance", "amount due",
                                          "to pay in full", "pay in full",
-                                         "current balance due")):
+                                         "current balance due",
+                                         "total amount due")):
                 m = _MONEY_RE.search(value)
                 if m:
                     out["balance_due"] = _candidate(
@@ -2022,8 +2081,12 @@ def extract_lorh(lines: List[str]) -> Dict[str, Dict]:
                 w in ll for w in ("company", "co", "exchange", "group",
                                    "mutual", "corp")):
                 if not any(w in ll for w in ("agency", "agent", "services")):
+                    val = line.strip()
+                    # Strip label prefixes
+                    val = re.sub(r'^(?:Company|Carrier|Insurer)\s*:\s*',
+                                 '', val, flags=re.I).strip()
                     out["carrier_name"] = _candidate(
-                        line.strip().upper(), "lorh_carrier", 0.85)
+                        val.upper(), "lorh_carrier", 0.85)
                     break
 
     # --- Fallback: scan all lines for unlabeled dates ---

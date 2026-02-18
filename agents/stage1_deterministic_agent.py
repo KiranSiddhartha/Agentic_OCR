@@ -639,7 +639,9 @@ def _looks_like_carrier(line: str) -> bool:
 
 def _clean_carrier_name(name: str) -> str:
     """Strip noise prefixes/suffixes from carrier names"""
-    # Strip prefixes that aren't part of the actual carrier name
+    # Strip label prefixes that aren't part of the actual carrier name
+    name = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
+                  '', name, flags=re.I).strip()
     noise_prefixes = (
         "member ", "a member of ", "subsidiary of ",
         "underwritten by ", "issued by ", "your insurer ",
@@ -716,7 +718,7 @@ class StatefulExtractor:
         elif any(k in ll for k in MAILING_TRIGGERS):
             self._flush_accumulators()
             self.role, self.window = Role.MAILING_BLOCK, 8
-        elif any(k in ll for k in INSURED_LABELS):
+        elif any(k in ll for k in INSURED_LABELS) and "payor" not in ll:
             self._flush_accumulators()
             self.role, self.window = Role.INSURED_BLOCK, 12
         elif any(k in ll for k in PROPERTY_TRIGGERS):
@@ -1665,4 +1667,3 @@ def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
 def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     """Alias for backward compatibility"""
     return extract_fields(lines, layout_elements)
- 

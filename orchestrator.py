@@ -483,8 +483,8 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         # ============================
         # STAGE 1 — CLASSIFY
         # ============================
-        doc_type = "UNK"
-        policy_type = "UNK"
+        doc_type = "OTH"
+        policy_type = "OTH"
 
         if CLASSIFICATION_AVAILABLE:
             try:
@@ -496,7 +496,7 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             except Exception:
                 pass
 
-        # If classify_document returned OTH, treat it as OTH so the
+        # If classify_document returned OTH, treat it as UNK so the
         # router's classify_doc_type gets a second chance.  OTH is the
         # default/"I don't know" bucket — the router's classifier uses
         # different heuristics and may succeed where document_classifier

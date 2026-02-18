@@ -17,7 +17,7 @@ def classify_policy(lines: List[str]) -> str:
     Classify insurance policy type (coverage OR cancellation subtype).
     
     Returns COVERAGE TYPES:
-        AUTO, ERQ, FIR, FLD, HAZ, HO, HO6, LL, UO, WND, OTH
+        AUTO, ERQ, FIR, FLD, HAZ, HO, HO6, LL, UO, WND, UNK
     
     Returns CANCELLATION SUBTYPES (reasons for CAN/DOI docs):
         BREQ - Borrower Request / Customer Initiated
@@ -34,9 +34,6 @@ def classify_policy(lines: List[str]) -> str:
     This allows proper segregation:
     - document_type = CAN (structure)
     - policy_type = BREQ (reason) or FLD (coverage)
-    
-    Does NOT return:
-      UNK - Unknown (merged into OTH)
     """
 
     text = " ".join(lines).lower()
@@ -354,7 +351,7 @@ def classify_policy(lines: List[str]) -> str:
             "amendment of home and dwelling fire",
             "amendment of dwelling fire",
         ))
-        # "dwelling fire" as a peril in a coverage table (e.g., "A DWELLING FIRE \$308,800")
+        # "dwelling fire" as a peril in a coverage table (e.g., "A DWELLING FIRE $308,800")
         # This appears in landlord/HO policies where FIRE is a peril, not the policy type
         dfire_as_peril = any(k in text for k in (
             "landlord",
@@ -713,7 +710,7 @@ def classify_policy(lines: List[str]) -> str:
         return "HO"
 
     # ==========================================================
-    # DEFAULT: All unclassified policies return OTH
+    # DEFAULT
     # ==========================================================
     return "OTH"
 
@@ -760,7 +757,7 @@ def classify_cancellation_reason(lines):
         for keyword in keywords:
             if keyword in text:
                 return reason_type
-    return "unknown"
+    return "other"
 
 
 def get_policy_explanation(policy_type: str) -> str:
@@ -781,6 +778,6 @@ def get_policy_explanation(policy_type: str) -> str:
         "BREQ": "Borrower request cancellation occurs when the insured/borrower requests or triggers termination of the policy.",
         "CEL": "Generic cancellation where the specific reason for policy termination is not categorized.",
         "UNWR": "Underwriting cancellation occurs when the carrier cancels due to underwriting guidelines, property changes, or risk assessment.",
-        "OTH": "If policy-related information is not available in the document or the policy type could not be determined, it will be considered as Other.",
+        "OTH": "If policy-related information is not available in the document it will be considered as Unknown."
     }
     return explanations.get(policy_type, "Unknown policy type")
