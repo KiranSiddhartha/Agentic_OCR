@@ -474,7 +474,7 @@ def classify_policy(lines: List[str]) -> str:
         "pol type: wind",
         "pol.type: wind",
         "aop & hurricane",
-        "hurricane deductible",
+        # "hurricane deductible",
     )):
         return "WND"
 

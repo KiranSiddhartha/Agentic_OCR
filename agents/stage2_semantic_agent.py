@@ -86,6 +86,8 @@ _EFF_DATE_LABELS = [
     (r"(?i)^from\s*:", "date"),
     (r"(?i)inception\s+date\s*:", "date"),
     (r"(?i)coverage\s+effective\s*:", "date"),
+    # Date range line: "NOV 09 2021 to NOV 09 2022" — pick first date
+    (r"(?i)(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s+to\s+", "date_range_start"),
 ]
 
 _EXP_DATE_LABELS = [
@@ -94,6 +96,8 @@ _EXP_DATE_LABELS = [
     (r"(?i)pol\.?\s*to\s*:", "date"),
     (r"(?i)^to\s*:", "date"),
     (r"(?i)through\s+", "date"),
+    # Date range line: pick the second date after "to"
+    (r"(?i)\bto\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\b", "date_range_end"),
 ]
 
 _PROP_ADDR_LABELS = [
@@ -105,6 +109,7 @@ _PROP_ADDR_LABELS = [
     (r"(?i)^address\s*:", "addr"),
     (r"(?i)risk\s+location\s*:", "addr"),
     (r"(?i)location\s+of\s+property\s*:?", "addr"),
+    (r"(?i)^location\s*:", "inline"),  # State Farm: "Location: 2971 GA HIGHWAY 93 S"
 ]
 
 _MAIL_ADDR_LABELS = [
@@ -121,6 +126,7 @@ _MORTGAGE_LABELS = [
     (r"(?i)mortgage(?:e)?(?:\s*/\s*add\.?\s*party)?\s*:", "inline"),
     (r"(?i)loss\s+payee\s*:?", "next"),
     (r"(?i)mortgagee\s+(?:wailing|mailing)\s+name\s+and\s+address\s*:", "next"),
+    (r"(?i)^holder\s*:", "inline_or_next"),  # State Farm: "holder: CAPITAL CITY BANK"
 ]
 
 _LOAN_LABELS = [
@@ -851,9 +857,16 @@ def _extract_with_gliner_safe(text, missing_fields):
 # ============================================================
 
 def _extract_date(text: str) -> Optional[str]:
+    # Full month names: January 15, 2024
     m = re.search(
         r"((?:January|February|March|April|May|June|July|August|"
         r"September|October|November|December)\s+\d{1,2},?\s+\d{4})",
+        text, re.I)
+    if m:
+        return m.group(1)
+    # Abbreviated month names: NOV 09 2021
+    m = re.search(
+        r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4})\b",
         text, re.I)
     if m:
         return m.group(1)
