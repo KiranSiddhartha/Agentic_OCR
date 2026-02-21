@@ -323,6 +323,54 @@ def classify_policy(lines: List[str]) -> str:
     # Must indicate actual policy type, not endorsement wording.
     # ==========================================================
 
+    # --- INS observation batch: Section 1 - Additional subtypes ---
+    # DB (Dwelling Basic) - distinct from FIR
+    if any(k in text for k in (
+        "dwelling basic",
+        "policy type: dwelling basic",
+        "dwelling basic policy",
+        "dwelling basic renewal",
+    )):
+        return "FIR"  # Map DB → FIR per extraction taxonomy
+
+    # DS (Dwelling Special) - distinct from HAZ
+    if any(k in text for k in (
+        "dwelling special",
+        "policy type: dwelling special",
+        "dwelling special policy",
+    )):
+        return "HAZ"  # Map DS → HAZ per extraction taxonomy
+
+    # MH (Manufactured Home) - check before HO
+    if any(k in text for k in (
+        "manufactured home",
+        "mobile home",
+        "mobilehome",
+        "policy type: manufactured home",
+        "manufactured housing",
+    )):
+        return "HO"  # Map MH → HO per extraction taxonomy
+
+    # COMMERCIAL_BOP (Businessowners Policy)
+    if any(k in text for k in (
+        "businessowners policy",
+        "business owners policy",
+        "commercial property coverage part",
+        "common declarations",
+        "compak",
+    )):
+        return "HAZ"  # Map COMMERCIAL_BOP → HAZ per extraction taxonomy
+
+    # FARM
+    if any(k in text for k in (
+        "farm ranch",
+        "farm policy",
+        "farm and ranch",
+        "farmowners",
+        "farm owners",
+    )):
+        return "HAZ"  # Map FARM → HAZ per extraction taxonomy
+
     fir_strong = any(k in text for k in (
         "dwelling fire policy",
         "policy type: dwelling fire",

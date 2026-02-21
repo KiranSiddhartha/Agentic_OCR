@@ -19,10 +19,17 @@ CRITICAL_FIELDS_FOR_GLINER = {
     "carrier_name",
     "policy_number",
     "insured_name",
-    "mortgage_company",  # KEEP THIS - it's critical
-    "loan_number",       # ADDED - also critical
+    "mortgage_company",      # KEEP THIS - it's critical
+    "loan_number",           # ADDED - also critical
     "effective_date",
-    "expiration_date"
+    "expiration_date",
+    # CAN doc-type fields
+    "cancellation_date",     # ADDED - required for CAN
+    "cancellation_reason",   # ADDED - required for CAN
+    # INV doc-type fields
+    "balance_due",           # ADDED - required for INV
+    "issue_date",            # ADDED - required for INV
+    "remit_info",            # ADDED - required for INV
 }
 
 # NEVER run GLiNER for these (Stage1 handles them perfectly)
@@ -101,6 +108,13 @@ FIELD_TO_LABEL = {
     "agent_phone": "agent phone number",
     "property_address": "property address location",
     "mailing_address": "mailing address location",
+    # CAN doc-type fields
+    "cancellation_date": "policy cancellation date",
+    "cancellation_reason": "reason for policy cancellation",
+    # INV doc-type fields
+    "balance_due": "balance due amount owed",
+    "issue_date": "invoice or bill issue date",
+    "remit_info": "payment remit to address or payee",
 }
 
 # Reverse mapping: label → field name

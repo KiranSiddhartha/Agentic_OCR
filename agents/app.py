@@ -1,3 +1,7 @@
+"""
+# Toggle this to True to show filenames, False to hide them
+SHOW_FILENAMES = True 
+"""
 import streamlit as st
 import cv2
 import sys
@@ -87,6 +91,12 @@ for _k, _v in _DEFAULTS.items():
 
 ALLOWED_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".pdf", ".zip")
 PREVIEW_MAX_WIDTH = 1000
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+# Toggle this to True to show filenames, False to hide them
+SHOW_FILENAMES = True 
 
 # ============================================================
 # PERFORMANCE CACHING (CRITICAL FOR SPEED)
@@ -607,8 +617,12 @@ for i, f in enumerate(st.session_state.files):
         st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
 
     # WRAPPER: Use Expander to isolate each file's UI
-    # HIDE FILENAME FOR PRIVACY
-    with st.expander(f"📁 **Document {i + 1}**", expanded=True):
+    # HIDE FILENAME FOR PRIVACY OR SHOW BASED ON CONFIG
+    label_text = f"📁 **Document {i + 1}**"
+    if SHOW_FILENAMES:
+        label_text += f" — {f.name}"
+    
+    with st.expander(label_text, expanded=True):
 
         # 1. IMMEDIATE DECODE
         page_png_list = decode_pages(f.getvalue(), f.type)

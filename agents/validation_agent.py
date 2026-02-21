@@ -99,7 +99,72 @@ ALLOWED_FIELDS_BY_DOC_POLICY = {
     
     # Add other combinations as needed per business rules
     # If not specified, allow all fields (default behavior)
+    
+    # --- INS observation batch: DOI allowed fields include third-party events ---
+    ("DOI", "HO"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+        "cancellation_effective_date",
+    ],
+    ("DOI", "HAZ"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    ("DOI", "FIR"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    ("DOI", "UNK"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    
+    # CAN + subtypes: include cancellation event fields
+    ("CAN", "BREQ"): [
+        "carrier_name", "policy_number", "insured_name",
+        "effective_date", "expiration_date", "cancellation_date",
+        "cancellation_reason", "property_address",
+        "mortgage_company", "loan_number",
+        "cancellation_effective_date",
+    ],
+    ("CAN", "NPAY"): [
+        "carrier_name", "policy_number", "insured_name",
+        "effective_date", "cancellation_date",
+        "cancellation_reason", "property_address",
+        "mortgage_company", "loan_number",
+    ],
 }
+
+# ---- DYNAMICALLY GENERATED: CAN + RNW + DOI for all common policy types ----
+_CAN_FIELDS_ALL = [
+    "carrier_name", "policy_number", "insured_name",
+    "effective_date", "expiration_date", "cancellation_date",
+    "cancellation_reason", "property_address",
+    "mortgage_company", "loan_number",
+]
+_RNW_FIELDS_ALL = [
+    "carrier_name", "policy_number", "insured_name",
+    "effective_date", "expiration_date",
+    "property_address", "mailing_address",
+    "mortgage_company", "loan_number", "total_premium",
+]
+_DOI_FIELDS_ALL = [
+    "policy_number", "mortgage_company", "loan_number",
+    "carrier_name", "insured_name", "property_address",
+]
+_COMMON_POLICY_TYPES = [
+    "HO", "HO3", "HO6", "HAZ", "FIR", "FLD", "WND",
+    "DP3", "AUTO", "LL", "UO", "ERQ", "UNK",
+    "NRNW", "UNWR", "CEL",
+]
+for _pt in _COMMON_POLICY_TYPES:
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("CAN", _pt), _CAN_FIELDS_ALL)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("RNW", _pt), _RNW_FIELDS_ALL)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("DOI", _pt), _DOI_FIELDS_ALL)
 
 
 # ============================================================
@@ -517,6 +582,17 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
     if len(v) < 5:
         return False, v, 0.0
 
+    # Block if too long — carrier names are typically < 60 chars
+    # Sentences like "THE INSURANCE AFFORDED BY THIS ENDORSEMENT..." are not carriers
+    if len(v) > 60:
+        return False, v, 0.0
+
+    # Block if starts with common sentence starters
+    if re.match(r'(?i)^(the |this |in |we |you |if |any |all |for |it )', v):
+        # Exception: "The Hartford" etc.
+        if not re.match(r'(?i)^the\s+\w+\s+(insurance|indemnity|casualty|mutual)', v):
+            return False, v, 0.0
+
     # Clean up common OCR artifacts
     v_clean = v.replace('*', '').replace('/', '').strip()
     vl_clean = v_clean.lower()
@@ -577,7 +653,15 @@ def validate_policy_number(value: str) -> Tuple[bool, str, float]:
         return False, v, 0.0
 
     # Block garbage patterns with specific keywords
-    if re.search(r'(date|time|page|due|liability\$|ozark)', v, re.I):
+    if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I):
+        return False, v, 0.0
+    
+    # Block values containing dollar signs
+    if '$' in v:
+        return False, v, 0.0
+    
+    # Block values containing periods followed by digits (looks like dollar amounts)
+    if re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v):
         return False, v, 0.0
     
     # Block state abbreviation + number patterns (like MI48007, NC27102)
@@ -653,8 +737,12 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     # Extract digits
     digits = ''.join(c for c in v if c.isdigit())
 
-    # Loan numbers are typically 8-16 digits
-    if len(digits) < 7 or len(digits) > 16:
+    # Loan numbers are typically 7-12 digits
+    if len(digits) < 7 or len(digits) > 12:
+        return False, v, 0.0
+    
+    # Block 13+ digit pure numbers (barcode artifacts)
+    if len(digits) >= 13:
         return False, v, 0.0
 
     # Block obvious page reference patterns (underscore separated)
@@ -687,6 +775,18 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
 
     if not v or len(v) < 2:
         return False, v, 0.0
+
+    # Strip single-letter prefixes that are OCR/barcode artifacts
+    # e.g., "L JOHN CRENSHAW" → "JOHN CRENSHAW"
+    # But keep legitimate initials like "J. SMITH" or "A BABCOCK"
+    words = v.split()
+    if len(words) >= 3 and len(words[0]) == 1 and words[0].isalpha():
+        # Only strip if the single letter doesn't look like a middle initial
+        # (middle initials come AFTER first name, not before)
+        # Check: is words[1] a normal first name (2+ chars)?
+        if len(words[1]) >= 2:
+            v = " ".join(words[1:])
+            words = v.split()
 
     if _is_section_header_value(v):
         return False, v, 0.0
@@ -822,8 +922,15 @@ def validate_address(value: str) -> Tuple[bool, str, float]:
         "premium", "deductible", "page ", " of ", "building type",
         "construction", "roof", "single family", "owner occupied",
         "ph 87", "_8s$", "$$", "##",  # OCR garbage patterns
+        "exclusion", "poisoning", "liability", "inflation",
+        "protection", "provisions", "amendment", "special form",
+        "fungi", "ordinance", "personal property", "loss payee",
     ]
     if any(kw in vl for kw in bad_patterns):
+        return False, v, 0.0
+    
+    # Block lines that contain date patterns like "03/93" or "01/77" (endorsement codes)
+    if re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v):
         return False, v, 0.0
 
     # Block document references
@@ -1103,4 +1210,4 @@ def validate_and_arbitrate(
 
 def validate_output(structured: Dict, confidence: float):
     """Backward compatible wrapper"""
-    return validate_and_arbitrate(structured, confidence, {"stage1": structured}) 
+    return validate_and_arbitrate(structured, confidence, {"stage1": structured})

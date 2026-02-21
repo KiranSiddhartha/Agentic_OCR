@@ -50,6 +50,8 @@ _POLICY_NUMBER_LABELS = [
     (r"(?i)(?:dwelling\s+(?:fire\s+)?)?policy\s*(?:number|no|#|num)\s*:?", "inline_or_next"),
     (r"(?i)^policy\s*:", "inline"),
     (r"(?i)nfip\s+policy\s*(?:number|no|#)\s*:", "inline"),
+    # Nationwide: "DWELLING FIRE POLICY NUMBER" followed by "DPC 0076173896-1"
+    (r"(?i)dwelling\s+fire\s+policy\s+number\s*:?", "inline_or_next"),
 ]
 _POLICY_NUMBER_SKIP = re.compile(
     r"(?i)(?:write|please|include|allow|change\s+request|refer\s+to|"
@@ -71,7 +73,7 @@ _INSURED_NAME_LABELS = [
 _INSURED_NAME_SKIP = re.compile(r"(?i)property\s+insured|payor\s*[:\.]")
 
 _CARRIER_WORDS = ("insurance", "indemnity", "casualty", "underwriters",
-                  "surety", "assurance")
+                  "surety", "assurance", "ins")
 _CARRIER_ENTITY = ("company", "co", "co.", "exchange", "group", "mutual",
                    "corp", "corporation")
 _CARRIER_SKIP = ("agency", "agent", "services", "broker", "producer",
@@ -88,6 +90,10 @@ _EFF_DATE_LABELS = [
     (r"(?i)coverage\s+effective\s*:", "date"),
     # Date range line: "NOV 09 2021 to NOV 09 2022" — pick first date
     (r"(?i)(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s+to\s+", "date_range_start"),
+    # Encompass: "Beginning July 1, 2020"
+    (r"(?i)beginning\s+", "date"),
+    # AAA: "Effective September 09, 2020"
+    (r"(?i)effective\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)", "date"),
 ]
 
 _EXP_DATE_LABELS = [
@@ -98,6 +104,8 @@ _EXP_DATE_LABELS = [
     (r"(?i)through\s+", "date"),
     # Date range line: pick the second date after "to"
     (r"(?i)\bto\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\b", "date_range_end"),
+    # Encompass: "through July 1, 2021"
+    (r"(?i)through\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)", "date"),
 ]
 
 _PROP_ADDR_LABELS = [
@@ -110,6 +118,18 @@ _PROP_ADDR_LABELS = [
     (r"(?i)risk\s+location\s*:", "addr"),
     (r"(?i)location\s+of\s+property\s*:?", "addr"),
     (r"(?i)^location\s*:", "inline"),  # State Farm: "Location: 2971 GA HIGHWAY 93 S"
+    # Encompass: "Coverage Detail for 136 Old Altamont Ridge Rd,Greenville,SC 29609"
+    (r"(?i)coverage\s+detail\s+for\s+", "inline"),
+    # Nationwide: "DESCRIPTION OF PROPERTY:"
+    (r"(?i)description\s+of\s+property\s*:", "addr"),
+    # Generic: "Location of Insured Property"
+    (r"(?i)location\s+of\s+insured\s+property\s*:", "addr"),
+    # AAA: "Location of Insured Property"
+    (r"(?i)location\s+of\s+insured\s+property", "addr"),
+    # Nationwide: "Described Location:" 
+    (r"(?i)described\s+location\s*:", "addr"),
+    # Adirondack: "LOCATED AT:"
+    (r"(?i)located\s+at\s*:", "addr"),
 ]
 
 _MAIL_ADDR_LABELS = [
@@ -127,11 +147,30 @@ _MORTGAGE_LABELS = [
     (r"(?i)loss\s+payee\s*:?", "next"),
     (r"(?i)mortgagee\s+(?:wailing|mailing)\s+name\s+and\s+address\s*:", "next"),
     (r"(?i)^holder\s*:", "inline_or_next"),  # State Farm: "holder: CAPITAL CITY BANK"
+    # --- INS observation batch additions (Section 4) ---
+    (r"(?i)mortgage\s*\(s\)\s*:", "inline_or_next"),
+    (r"(?i)mortgage\s+holder\s*:", "inline_or_next"),
+    (r"(?i)additional\s+interest\s*\(s?\)\s*:", "inline_or_next"),
+    (r"(?i)other\s+interests?\s*:", "inline_or_next"),
+    (r"(?i)mortgage\s+servicing\s+agency\s*:", "inline_or_next"),
+    (r"(?i)lien\s*holder\s*:", "inline_or_next"),
+    (r"(?i)unit\s+owner\s+mortgagee\s*:", "inline_or_next"),
+    (r"(?i)second\s+mortgage\s*:", "inline_or_next"),
+    (r"(?i)(?:2nd)\s+mortgage\s*:", "inline_or_next"),
+    (r"(?i)mortgage\s+or\s+interested\s+party\s*:", "inline_or_next"),
+    (r"(?i)additional\s+interest/mortgage/trust\s*:", "inline_or_next"),
+    (r"(?i)mortgagee/loss\s+payee\s*:", "inline_or_next"),
+    (r"(?i)mortgage\s+clause\s*:", "inline_or_next"),
 ]
 
 _LOAN_LABELS = [
     (r"(?i)loan\s*(?:number|no|#|num|id)\s*:?", "inline_or_next"),
     (r"(?i)loan#\s*:?", "inline"),
+    # --- INS observation batch additions (Section 3) ---
+    (r"(?i)loan/contract\s*(?:number|#)\s*:?", "inline_or_next"),
+    (r"(?i)mortgage\s+loan\s*no\.?\s*:?", "inline_or_next"),
+    (r"(?i)loan\s+no\.\s*:?", "inline_or_next"),
+    (r"(?i)^loan\s*:", "inline"),
 ]
 
 _PREMIUM_LABELS = [
@@ -140,6 +179,12 @@ _PREMIUM_LABELS = [
     (r"(?i)total\s+premium\s+paid\s*:", "dollar"),
     (r"(?i)base\s+policy\s+premium\s*:", "dollar"),
     (r"(?i)premium\s+balance\s*:?", "dollar"),
+    # Encompass: "Total Residence Premium"
+    (r"(?i)total\s+residence\s+premium\s*:?", "dollar"),
+    # Adirondack mortgagee certificate: "Mortgagee Premium"
+    (r"(?i)mortgagee\s+premium\s*:?", "dollar"),
+    # AAA: "Total Premium:"
+    (r"(?i)total\s+premium\s*:", "dollar"),
 ]
 
 _BALANCE_LABELS = [
@@ -373,6 +418,36 @@ def _extract_with_rules(
         val = _extract_remit_fuzzy(lines)
         if val:
             out["remit_info"] = val
+
+    # ---- Total Premium: table format (label on one line, dollar on next) ----
+    if "total_premium" in missing_fields and "total_premium" not in out:
+        val = _extract_total_premium_table(lines)
+        if val:
+            out["total_premium"] = val
+
+    # ---- Mortgage Company from "Other Interests" table (AAA format) ----
+    if "mortgage_company" in missing_fields and "mortgage_company" not in out:
+        val = _extract_mortgage_from_interests_table(lines)
+        if val:
+            out["mortgage_company"] = val
+
+    # ---- Loan Number from "Other Interests" table (AAA format) ----
+    if "loan_number" in missing_fields and "loan_number" not in out:
+        val = _extract_loan_from_interests_table(lines)
+        if val:
+            out["loan_number"] = val
+
+    # ---- Property address from "Coverage Detail for XXX" inline (Encompass) ----
+    if "property_address" in missing_fields and "property_address" not in out:
+        val = _extract_property_from_coverage_detail(lines)
+        if val:
+            out["property_address"] = val
+
+    # ---- Property address from "LOCATED AT:" or "DESCRIPTION OF PROPERTY:" (Adirondack/Nationwide) ----
+    if "property_address" in missing_fields and "property_address" not in out:
+        val = _extract_property_from_located_at(lines)
+        if val:
+            out["property_address"] = val
 
     # ---- DOI-specific: extract insured name + address from "Name and address of Insured:" ----
     if ("insured_name" in missing_fields and "insured_name" not in out) or \
