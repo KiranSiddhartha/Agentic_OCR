@@ -369,6 +369,9 @@ from agents.document_router import (
     classify_doc_type,
     classify_policy_type,
     REQUIRED_FIELDS,
+    filter_artifact_pages,
+    _find_declaration_start,
+    _detect_doc_subtype,
 )
 
 # ================= CLASSIFICATION (optional, may not be installed) =======
@@ -400,7 +403,22 @@ ALL_KNOWN_FIELDS = [
     "total_premium", "deductible",
     "agent_name", "agent_phone",
     "cancellation_reason",
+    # --- INS batch Section 11: Third-party event fields ---
+    "third_party_removed", "third_party_cancellation_date",
+    "cancellation_effective_date",
 ]
+
+# --- INS batch Section 5: Subtypes requiring multi-page aggregation ---
+# When these doc/policy types are detected, ALL pages must be aggregated
+# before extraction (loan on page 2, mortgage on page 2/3, etc.)
+MULTI_PAGE_SUBTYPES = {
+    "FLD",   # Flood: 2-page minimum, loan often on page 2
+    "HO6",   # Condo: coverage + mortgage across pages
+    "WND",   # Wind: multi-page declarations
+    "LL",    # Landlord: multi-page
+    "HAZ",   # Commercial/hazard: mortgage on page 3+
+    "UO",    # Unit owner: certificate + coverage pages
+}
 
 
 # ============================================================
@@ -480,6 +498,12 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         if not lines:
             return _empty_result("OCR produced no usable lines")
 
+        # --- INS batch Section 6: Page Filtering ---
+        # Filter out fax cover sheets, advisory notices, blank pages, etc.
+        lines = filter_artifact_pages(lines)
+        if not lines:
+            return _empty_result("All content filtered as artifacts")
+
         # ============================
         # STAGE 1 — CLASSIFY
         # ============================
@@ -521,6 +545,23 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             print(f"[ROUTER] required={routing.required_fields}")
             print(f"[ROUTER] has_tables={routing.has_tables} "
                   f"fallback={routing.fallback}")
+            if routing.doc_subtype:
+                print(f"[ROUTER] doc_subtype={routing.doc_subtype}")
+            if routing.is_multi_page:
+                print(f"[ROUTER] is_multi_page=True")
+
+        # ============================
+        # STAGE 2.5 — BUNDLE RESOLUTION  (INS Validation §8)
+        # ============================
+        # For fax/multi-doc bundles, skip noise pages and start
+        # extraction from the actual declaration page.
+        if routing.doc_subtype in ("FAX_ARTIFACT",) or routing.doc_type == "PQ":
+            decl_start = _find_declaration_start(lines)
+            if decl_start > 0:
+                if debug:
+                    print(f"[BUNDLE] Declaration starts at line {decl_start}, "
+                          f"skipping {decl_start} noise lines")
+                lines = lines[decl_start:]
 
         # ============================
         # STAGE 3 — EXECUTE PRIMARY APPROACH
@@ -648,6 +689,8 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             "confidence": confidence,
             "document_type": routing.doc_type,
             "policy_type": routing.policy_type,
+            "doc_subtype": routing.doc_subtype,
+            "is_multi_page": routing.is_multi_page,
             "approach": routing.approach.value,
             "routing_reason": routing.reason,
             "fallback_used": routing.fallback.value if (

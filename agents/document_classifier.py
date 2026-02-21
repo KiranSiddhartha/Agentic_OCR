@@ -518,6 +518,18 @@ def classify_document(lines: List[str]) -> str:
             return "OTH"
 
     # ==========================================================
+    # PRIORITY 7a: MORTGAGE DEC SUMMARY (INS batch Section 1)
+    # Standalone document subtype for mortgagee-specific declarations
+    # ==========================================================
+    if any(k in text for k in (
+        "mortgagee dec summary",
+        "mortgagee declarations summary",
+        "mortgage dec summary",
+    )):
+        # These are declarations — classify as RNW
+        return "RNW"
+
+    # ==========================================================
     # PRIORITY 7: INVOICE (INV) — check BEFORE RNW to catch
     # "policy bill" documents that also contain "effective date"
     # ==========================================================
