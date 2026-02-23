@@ -72,6 +72,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
+# KEEP-ALIVE HEARTBEAT (prevents session timeout on idle)
+# ============================================================
+components.html(
+    """
+    <script>
+    (function() {
+        if (window._stKeepAlive) clearInterval(window._stKeepAlive);
+        window._stKeepAlive = setInterval(function() {
+            window.parent.document.dispatchEvent(new Event('mousemove'));
+        }, 25000);
+    })();
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
+# ============================================================
 # SESSION STATE DEFAULTS
 # ============================================================
 _DEFAULTS = {
@@ -254,7 +272,27 @@ def page_matches(field_page, display_page_0based):
     return True if field_page is None else field_page == display_page_0based
 
 # ============================================================
-# IMAGE PREVIEW BUILDERS
+# IMAGE FORMAT CONVERTERS (PNG bytes <-> RGB array)
+# ============================================================
+def _rgb_to_png_bytes(rgb_array):
+    """Convert an RGB numpy array to PNG bytes for stable caching."""
+    if rgb_array is None:
+        return None
+    bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+    success, buf = cv2.imencode(".png", bgr)
+    return buf.tobytes() if success else None
+
+def _png_bytes_to_rgb(png_bytes):
+    """Decode PNG bytes back to an RGB numpy array for drawing."""
+    if png_bytes is None:
+        return None
+    arr = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        return None
+    return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+
+# ============================================================
+# IMAGE PREVIEW BUILDERS (now return PNG bytes, not arrays)
 # ============================================================
 def build_base_preview_for_page(png_bytes, fields, page_idx_0based):
     img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -280,7 +318,7 @@ def build_base_preview_for_page(png_bytes, fields, page_idx_0based):
                 continue
             dark_green = (0, 100, 0)
             cv2.rectangle(rgb, (x1, y1), (x2, y2), dark_green, 1)
-    return rgb
+    return _rgb_to_png_bytes(rgb)
 
 def get_or_build_base_preview(file_key, page_idx_0based, png_bytes, fields, fields_hash):
     cache = st.session_state.get("base_preview_cache", {})
@@ -298,9 +336,9 @@ def get_or_build_base_preview(file_key, page_idx_0based, png_bytes, fields, fiel
     st.session_state["highlight_preview_cache"] = {}
     return base
 
-def get_cached_highlight_image(file_key, base_rgb, fields, selected_field, page_idx_0based):
+def get_cached_highlight_image(file_key, base_png_bytes, fields, selected_field, page_idx_0based):
     if not selected_field:
-        return base_rgb
+        return base_png_bytes
     cache_key = f"{file_key}_{page_idx_0based}_{selected_field}"
     h_cache = st.session_state.get("highlight_preview_cache", {})
     if cache_key in h_cache:
@@ -308,16 +346,20 @@ def get_cached_highlight_image(file_key, base_rgb, fields, selected_field, page_
 
     v = fields.get(selected_field)
     if not isinstance(v, dict):
-        return base_rgb
+        return base_png_bytes
     bbox, fp = v.get("bbox"), v.get("page")
     if not bbox or not page_matches(fp, page_idx_0based):
-        return base_rgb
+        return base_png_bytes
 
-    img = base_rgb.copy()
+    rgb = _png_bytes_to_rgb(base_png_bytes)
+    if rgb is None:
+        return base_png_bytes
+
+    img = rgb.copy()
     h, w = img.shape[:2]
     x1, y1, x2, y2 = bbox_to_pixels(bbox, w, h)
     if x2 - x1 < 2 or y2 - y1 < 2:
-        return base_rgb
+        return base_png_bytes
 
     cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 3)
     label = f">> {prettify(selected_field)} <<"
@@ -327,9 +369,10 @@ def get_cached_highlight_image(file_key, base_rgb, fields, selected_field, page_
     cv2.rectangle(img, (x1, ly - th_ - 6), (x1 + tw + 8, ly + 2), (255, 0, 0), -1)
     cv2.putText(img, label, (x1 + 4, ly - 2), font, f_scale, (255, 255, 255), 2)
 
-    h_cache[cache_key] = img
+    result_bytes = _rgb_to_png_bytes(img)
+    h_cache[cache_key] = result_bytes
     st.session_state["highlight_preview_cache"] = h_cache
-    return img
+    return result_bytes
 
 # ============================================================
 # COPY HELPERS (FIXED)
@@ -361,10 +404,6 @@ def copy_button_js(text_to_copy, button_label="📋 Copy to Clipboard", key="cop
         .replace("\n", "\\n")
         .replace("'", "\\'")
     )
-    # FIX:
-    # 1. Reset body margin (margin:0) to prevent iframe padding from pushing button down.
-    # 2. Use flexbox centering.
-    # 3. Add white-space: nowrap to prevent text from wrapping and cutting off.
     component_html = f"""
     <style>
         body {{ margin: 0; padding: 0; overflow: hidden; }}
@@ -438,7 +477,6 @@ def render_clickable_fields(seg, fields_with_bbox, file_name, num_pages):
     total_visible = len(visible_fields)
     total_bbox = sum(1 for k in visible_fields if field_has_bbox(k, fields_with_bbox))
 
-    # ── LAYOUT CHANGE: Ratio 4:1 to make the button smaller horizontally ──
     col_info, col_copy = st.columns([4, 1])
 
     with col_info:
@@ -453,9 +491,7 @@ def render_clickable_fields(seg, fields_with_bbox, file_name, num_pages):
         )
 
     with col_copy:
-        # Note: Keys must be unique, we use file_name for internal ID
         copy_text = format_all_fields_as_text(fields, allowed)
-        # Shortened label to fit better in corner
         copy_button_js(copy_text, "📋 Copy List", key=f"cptext_{file_name}")
 
     st.markdown("---")
@@ -608,16 +644,12 @@ if not st.session_state.get("uploaded", False):
 # ============================================================
 # EXECUTION
 # ============================================================
-# Use enumerate to track file index for better spacing and unique keys
 for i, f in enumerate(st.session_state.files):
     file_key = f"result_{f.name}"
 
-    # Separation space between files if multiple are uploaded
     if i > 0:
         st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
 
-    # WRAPPER: Use Expander to isolate each file's UI
-    # HIDE FILENAME FOR PRIVACY OR SHOW BASED ON CONFIG
     label_text = f"📁 **Document {i + 1}**"
     if SHOW_FILENAMES:
         label_text += f" — {f.name}"
@@ -653,20 +685,24 @@ for i, f in enumerate(st.session_state.files):
                     st.warning(f"⚠️ **{prettify(selected_field)}** – position not found")
 
             for page_idx, png_bytes in enumerate(page_png_list):
-                base_rgb = get_or_build_base_preview(file_key, page_idx, png_bytes, fields_with_bbox, f_hash)
+                base_png = get_or_build_base_preview(file_key, page_idx, png_bytes, fields_with_bbox, f_hash)
 
                 if (
                     selected_field
                     and field_has_bbox(selected_field, fields_with_bbox)
                     and page_matches(field_page_number(selected_field, fields_with_bbox), page_idx)
                 ):
-                    display_rgb = get_cached_highlight_image(
-                        file_key, base_rgb, fields_with_bbox, selected_field, page_idx
+                    display_png = get_cached_highlight_image(
+                        file_key, base_png, fields_with_bbox, selected_field, page_idx
                     )
                 else:
-                    display_rgb = base_rgb
+                    display_png = base_png
 
-                st.image(display_rgb, caption=f"Page {page_idx + 1}", use_container_width=True)
+                if display_png:
+                    st.image(display_png, caption=f"Page {page_idx + 1}", use_container_width=True)
+                else:
+                    st.error(f"Could not render page {page_idx + 1}")
+
                 if page_idx < num_pages - 1:
                     st.markdown("---")
 
@@ -753,7 +789,6 @@ for i, f in enumerate(st.session_state.files):
                         )
                         json_output = format_all_fields_as_json(fields_for_json, allowed_for_json)
                         
-                        # ── LAYOUT CHANGE: Ratio 4:1 for small corner button ──
                         c_fill, c_btn = st.columns([4, 1])
                         with c_btn:
                             copy_button_js(json_output, "📋 Copy JSON", key=f"cpjson_tab_{f.name}")
