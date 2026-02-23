@@ -70,14 +70,16 @@
 
 #     return merged
  
-
 # utils/text_utils.py
-# OCR-safe text utilities (NO aggressive cleaning)
+# OCR-safe text utilities (STRUCTURE-PRESERVING, DROP-IN)
 
 import re
 import unicodedata
 
 
+# ------------------------------------------------------------
+# VERY LIGHT OCR NORMALIZATION
+# ------------------------------------------------------------
 def light_normalize_ocr(lines):
     """
     VERY LIGHT OCR normalization.
@@ -89,13 +91,8 @@ def light_normalize_ocr(lines):
         if not line:
             continue
 
-        # Unicode normalize
         l = unicodedata.normalize("NFKD", line)
-
-        # Normalize dashes
         l = l.replace("–", "-").replace("—", "-")
-
-        # Keep printable characters only
         l = "".join(c for c in l if c.isprintable()).strip()
 
         if l:
@@ -104,6 +101,9 @@ def light_normalize_ocr(lines):
     return normalized
 
 
+# ------------------------------------------------------------
+# LEGACY SINGLE-LINE NORMALIZATION (SAFE)
+# ------------------------------------------------------------
 def normalize_text(text):
     """
     Legacy single-line normalization (SAFE).
@@ -121,45 +121,104 @@ def normalize_text(text):
     return text.strip()
 
 
+# ------------------------------------------------------------
+# STRUCTURE-AWARE FIELD SPLITTER
+# ------------------------------------------------------------
+_FIELD_LABELS = [
+    "policy number",
+    "policyholder/named insured",
+    "policyholder since",
+    "mailing address",
+    "policy period",
+    "24-hour claim reporting",
+    "agent",
+    "insurance provided by",
+    "customer assistance number",
+    "policy effective date",
+]
+
+
+def _split_structured_fields(lines):
+    """
+    Split known 'Label: value' lines into:
+        Label:
+        value
+    """
+    output = []
+
+    for line in lines:
+        l = line.strip()
+        if not l:
+            output.append("")
+            continue
+
+        lower = l.lower()
+        matched = False
+
+        for label in _FIELD_LABELS:
+            if lower.startswith(label) and ":" in l:
+                parts = re.split(r":\s*", l, maxsplit=1)
+                output.append(parts[0].strip() + ":")
+                if len(parts) > 1 and parts[1].strip():
+                    output.append(parts[1].strip())
+                matched = True
+                break
+
+        if not matched:
+            output.append(l)
+
+    return output
+
+
+# ------------------------------------------------------------
+# OCR-SAFE LINE MERGING (FINAL)
+# ------------------------------------------------------------
 def merge_broken_lines(lines):
     """
-    Layout-aware line merge.
+    OCR-safe line merge.
+    Preserves label/value separation.
+    DROP-IN SAFE.
     """
-    if not lines or len(lines) < 2:
-        return lines
+    if not lines:
+        return []
+
+    # Step 1: split structured fields first
+    lines = _split_structured_fields(lines)
 
     merged = []
-    i = 0
+    buffer = ""
 
-    while i < len(lines):
-        current = lines[i]
+    for line in lines:
+        line = line.strip()
 
-        if i + 1 < len(lines):
-            next_line = lines[i + 1]
+        # Preserve blank lines
+        if not line:
+            if buffer:
+                merged.append(buffer)
+                buffer = ""
+            merged.append("")
+            continue
 
-            # Preserve tables
-            if "  " in current or "  " in next_line:
-                merged.append(current)
-                i += 1
-                continue
+        # NEVER merge after a label
+        if buffer.endswith(":"):
+            merged.append(buffer)
+            buffer = line
+            continue
 
-            # Label continuation
-            if current.endswith(":"):
-                merged.append(current + " " + next_line)
-                i += 2
-                continue
+        # Merge only true sentence continuations
+        if (
+            buffer
+            and buffer[-1].isalnum()
+            and line[0].islower()
+            and len(buffer) < 60
+        ):
+            buffer += " " + line
+        else:
+            if buffer:
+                merged.append(buffer)
+            buffer = line
 
-            # Broken sentence
-            if (
-                len(current) < 40
-                and current[-1].isalnum()
-                and next_line[0].islower()
-            ):
-                merged.append(current + " " + next_line)
-                i += 2
-                continue
-
-        merged.append(current)
-        i += 1
+    if buffer:
+        merged.append(buffer)
 
     return merged

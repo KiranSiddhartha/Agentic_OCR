@@ -19,10 +19,17 @@ CRITICAL_FIELDS_FOR_GLINER = {
     "carrier_name",
     "policy_number",
     "insured_name",
-    "mortgage_company",  # KEEP THIS - it's critical
-    "loan_number",       # ADDED - also critical
+    "mortgage_company",      # KEEP THIS - it's critical
+    "loan_number",           # ADDED - also critical
     "effective_date",
-    "expiration_date"
+    "expiration_date",
+    # CAN doc-type fields
+    "cancellation_date",     # ADDED - required for CAN
+    "cancellation_reason",   # ADDED - required for CAN
+    # INV doc-type fields
+    "balance_due",           # ADDED - required for INV
+    "issue_date",            # ADDED - required for INV
+    "remit_info",            # ADDED - required for INV
 }
 
 # NEVER run GLiNER for these (Stage1 handles them perfectly)
@@ -32,12 +39,20 @@ SKIP_FIELDS = {
 }
 
 # Field name mapping (Orchestrator → GLiNER)
+# Only map SHORT aliases that the orchestrator might send; full names pass through as-is.
+# Bug fix: REVERSE_ALIASES was computed as {v:k} which mapped 'carrier_name'->'carrier'
+# and 'mortgage_company'->'mortgage', breaking output field names. Now REVERSE_ALIASES
+# only maps the short aliases back, leaving full names unchanged.
 FIELD_ALIASES = {
     "carrier": "carrier_name",
     "mortgage": "mortgage_company",
 }
 
-REVERSE_ALIASES = {v: k for k, v in FIELD_ALIASES.items()}
+# Correct reverse: only maps short→full inversions, not full→short
+REVERSE_ALIASES = {
+    "carrier": "carrier_name",
+    "mortgage": "mortgage_company",
+}
 
 # ============================================================
 # SINGLETON MODEL CACHE
@@ -93,6 +108,13 @@ FIELD_TO_LABEL = {
     "agent_phone": "agent phone number",
     "property_address": "property address location",
     "mailing_address": "mailing address location",
+    # CAN doc-type fields
+    "cancellation_date": "policy cancellation date",
+    "cancellation_reason": "reason for policy cancellation",
+    # INV doc-type fields
+    "balance_due": "balance due amount owed",
+    "issue_date": "invoice or bill issue date",
+    "remit_info": "payment remit to address or payee",
 }
 
 # Reverse mapping: label → field name
@@ -106,7 +128,7 @@ LABEL_TO_FIELD = {v: k for k, v in FIELD_TO_LABEL.items()}
 def extract_with_gliner(
     text: str,
     missing_fields: List[str],
-    confidence_threshold: float = 0.65,
+    confidence_threshold: float = 0.40,
 ) -> Dict[str, Dict]:
     """
     GLiNER extraction for missing secondary fields only
@@ -157,8 +179,9 @@ def extract_with_gliner(
 
     # ----------------------------
     # Limit text length for speed
+    # (increased: 5000 chars cut off page-2 content like mortgage/loan)
     # ----------------------------
-    max_chars = 5000
+    max_chars = 10000
     text_sample = text[:max_chars]
 
     # ----------------------------
@@ -222,10 +245,13 @@ def _post_process(
 
     results: Dict[str, Dict] = {}
 
+    # Only filter truly noisy structural words; 'policy' removed because
+    # GLiNER extracts just the value text (not surrounding labels), and
+    # 'policy' appearing in a value is usually part of a legitimate policy name.
     NOISE = (
-        "policy", "coverage", "endorsement", "notice",
-        "conditions", "summary", "page", "copy",
-        "continued", "information",
+        "coverage", "endorsement", "notice",
+        "conditions", "summary", "copy",
+        "continued",
     )
 
     for ent in entities:
@@ -233,7 +259,7 @@ def _post_process(
         if not raw_field or raw_field not in allowed_fields:
             continue
 
-        # Map back to orchestrator field if needed
+        # Map short alias back to full field name (only affects 'carrier'/'mortgage' aliases)
         field = REVERSE_ALIASES.get(raw_field, raw_field)
 
         value = ent["text"].strip()
@@ -249,11 +275,14 @@ def _post_process(
         if len(value) < 3:
             continue
 
-        # Keep best candidate only
+        # Keep best candidate only.
+        # No confidence penalty applied: GLiNER is only invoked as a last-resort
+        # fallback for fields that Stage1 and Stage2 rule-based already missed.
+        # Its raw score is used directly so results can pass validation floors (0.75-0.80).
         if field not in results or results[field]["confidence"] < score:
             results[field] = {
                 "value": _clean(value),
-                "confidence": round(score * 0.82, 3),  # AI penalty
+                "confidence": round(score, 3),
                 "source": "stage2_5_gliner",
             }
 

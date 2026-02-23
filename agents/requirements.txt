@@ -1,7 +1,6 @@
 # Core OCR
 paddleocr==2.7.0.3
-paddlepaddle==2.5.2
-
+paddlepaddle==2.6.2 
 # Image Processing
 opencv-python==4.8.1.78
 Pillow==10.1.0

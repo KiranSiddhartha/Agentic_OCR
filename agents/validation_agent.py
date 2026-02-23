@@ -57,6 +57,117 @@ DEFAULT_FLOOR = 0.65
 
 
 # ============================================================
+# FIELD REQUIREMENTS BY DOCUMENT + POLICY TYPE
+# ============================================================
+
+# Field requirements by document type + policy type combination
+# This implements business rules for which fields are allowed
+# for specific document+policy combinations
+#
+# INV fields: core 3 + invoice-specific + context fields
+_INV_FIELDS = [
+    "carrier_name", "insured_name", "policy_number",
+    "balance_due", "issue_date", "remit_info",
+    "effective_date", "expiration_date",
+    "property_address", "loan_number", "mortgage_company",
+    "total_premium",
+]
+
+ALLOWED_FIELDS_BY_DOC_POLICY = {
+    # Invoice + Policy Type combinations
+    ("INV", "HAZ"): _INV_FIELDS,
+    ("INV", "HO"): _INV_FIELDS,
+    ("INV", "HO3"): _INV_FIELDS,
+    ("INV", "HO6"): _INV_FIELDS,
+    ("INV", "FIR"): _INV_FIELDS,
+    ("INV", "FLD"): _INV_FIELDS,
+    ("INV", "WND"): _INV_FIELDS,
+    ("INV", "DP3"): _INV_FIELDS,
+    ("INV", "AUTO"): _INV_FIELDS,
+    ("INV", "LL"): _INV_FIELDS,
+    ("INV", "UO"): _INV_FIELDS,
+    ("INV", "ERQ"): _INV_FIELDS,
+    # For unknown policy types with INV, still allow all INV fields
+    ("INV", "UNK"): _INV_FIELDS,
+    
+    # Cancellation subtypes with INV
+    ("INV", "BREQ"): _INV_FIELDS,
+    ("INV", "NPAY"): _INV_FIELDS,
+    ("INV", "NRNW"): _INV_FIELDS,
+    ("INV", "UNWR"): _INV_FIELDS,
+    ("INV", "CEL"): _INV_FIELDS,
+    
+    # Add other combinations as needed per business rules
+    # If not specified, allow all fields (default behavior)
+    
+    # --- INS observation batch: DOI allowed fields include third-party events ---
+    ("DOI", "HO"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+        "cancellation_effective_date",
+    ],
+    ("DOI", "HAZ"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    ("DOI", "FIR"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    ("DOI", "UNK"): [
+        "policy_number", "mortgage_company", "loan_number",
+        "carrier_name", "insured_name", "property_address",
+        "third_party_removed", "third_party_cancellation_date",
+    ],
+    
+    # CAN + subtypes: include cancellation event fields
+    ("CAN", "BREQ"): [
+        "carrier_name", "policy_number", "insured_name",
+        "effective_date", "expiration_date", "cancellation_date",
+        "cancellation_reason", "property_address",
+        "mortgage_company", "loan_number",
+        "cancellation_effective_date",
+    ],
+    ("CAN", "NPAY"): [
+        "carrier_name", "policy_number", "insured_name",
+        "effective_date", "cancellation_date",
+        "cancellation_reason", "property_address",
+        "mortgage_company", "loan_number",
+    ],
+}
+
+# ---- DYNAMICALLY GENERATED: CAN + RNW + DOI for all common policy types ----
+_CAN_FIELDS_ALL = [
+    "carrier_name", "policy_number", "insured_name",
+    "effective_date", "expiration_date", "cancellation_date",
+    "cancellation_reason", "property_address",
+    "mortgage_company", "loan_number",
+]
+_RNW_FIELDS_ALL = [
+    "carrier_name", "policy_number", "insured_name",
+    "effective_date", "expiration_date",
+    "property_address", "mailing_address",
+    "mortgage_company", "loan_number", "total_premium",
+]
+_DOI_FIELDS_ALL = [
+    "policy_number", "mortgage_company", "loan_number",
+    "carrier_name", "insured_name", "property_address",
+]
+_COMMON_POLICY_TYPES = [
+    "HO", "HO3", "HO6", "HAZ", "FIR", "FLD", "WND",
+    "DP3", "AUTO", "LL", "UO", "ERQ", "UNK",
+    "NRNW", "UNWR", "CEL",
+]
+for _pt in _COMMON_POLICY_TYPES:
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("CAN", _pt), _CAN_FIELDS_ALL)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("RNW", _pt), _RNW_FIELDS_ALL)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("DOI", _pt), _DOI_FIELDS_ALL)
+
+
+# ============================================================
 # BLOCK LISTS - EXPANDED
 # ============================================================
 
@@ -159,6 +270,10 @@ PRODUCT_NAMES: Set[str] = {
 # These are often mortgage companies, agents, or other entities
 BAD_INSURED_COMPANY_NAMES: Set[str] = {
     "allied trust",
+    "aegis",
+    "aegis security",
+    "aegis security insurance",
+    "a egis",  # OCR error variant
     "properiy insurance",  # Typo
     "property insurance",
     "insurance corporation",
@@ -213,6 +328,55 @@ PREFIX_STRIP = [
     "policyholder(s)",
     "policyholder:",
 ]
+
+
+# ============================================================
+# FIELD FILTERING BY DOCUMENT + POLICY TYPE
+# ============================================================
+
+def filter_allowed_fields(
+    validated: Dict,
+    doc_type: str,
+    policy_type: str
+) -> Dict:
+    """
+    Filter extracted fields to only those allowed for the 
+    specific document_type + policy_type combination.
+    
+    This implements business rules that restrict which fields
+    should be extracted for certain document+policy combinations.
+    For example, INV+HAZ documents should only extract 3 fields:
+    carrier_name, insured_name, and policy_number.
+    
+    Args:
+        validated: Dictionary of validated fields
+        doc_type: Document type (INV, RNW, CAN, DOI, COI, BIN, RNS, OTH, UNK)
+        policy_type: Policy type (HAZ, HO, FIR, FLD, BREQ, NPAY, etc.)
+    
+    Returns:
+        Filtered dictionary with only allowed fields
+    """
+    # Check if there's a specific allowlist for this combination
+    key = (doc_type, policy_type)
+    allowed = ALLOWED_FIELDS_BY_DOC_POLICY.get(key)
+    
+    if allowed is None:
+        # No restriction - return all fields
+        return validated
+    
+    # Filter to only allowed fields
+    filtered = {
+        field: data 
+        for field, data in validated.items() 
+        if field in allowed
+    }
+    
+    # Add metadata about filtering
+    if len(filtered) < len(validated):
+        removed_fields = set(validated.keys()) - set(filtered.keys())
+        # Could log this for debugging: f"Filtered out {removed_fields} for {doc_type}+{policy_type}"
+    
+    return filtered
 
 
 # ============================================================
@@ -404,6 +568,10 @@ def _is_mortgage_company_address(value: str) -> bool:
 def validate_carrier(value: str) -> Tuple[bool, str, float]:
     """Validate carrier name"""
     v = _normalize_whitespace(value)
+    
+    # Strip label prefixes that leaked into the value
+    v = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
+               '', v, flags=re.I).strip()
 
     if _is_section_header_value(v):
         return False, v, 0.0
@@ -413,6 +581,17 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
 
     if len(v) < 5:
         return False, v, 0.0
+
+    # Block if too long — carrier names are typically < 60 chars
+    # Sentences like "THE INSURANCE AFFORDED BY THIS ENDORSEMENT..." are not carriers
+    if len(v) > 60:
+        return False, v, 0.0
+
+    # Block if starts with common sentence starters
+    if re.match(r'(?i)^(the |this |in |we |you |if |any |all |for |it )', v):
+        # Exception: "The Hartford" etc.
+        if not re.match(r'(?i)^the\s+\w+\s+(insurance|indemnity|casualty|mutual)', v):
+            return False, v, 0.0
 
     # Clean up common OCR artifacts
     v_clean = v.replace('*', '').replace('/', '').strip()
@@ -427,14 +606,18 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
     if any(w in vl_clean for w in ('agency', 'agent', 'services', 'producer')):
         return False, v, 0.0
 
-    # Must contain "insurance" (or "ins" abbreviation)
-    # Check for various patterns: "insurance", " ins ", " ins.", ends with " ins"
+    # Must contain "insurance" or other carrier-type words
+    # State Farm Fire and Casualty Company, Pacific Indemnity, etc.
     has_insurance = ('insurance' in vl_clean or 
                      ' ins ' in vl_clean or 
                      vl_clean.endswith(' ins') or 
                      ' ins.' in vl_clean or
                      ' ins co' in vl_clean or
-                     vl_clean.endswith(' ins co'))
+                     vl_clean.endswith(' ins co') or
+                     'indemnity' in vl_clean or
+                     'casualty' in vl_clean or
+                     'assurance' in vl_clean or
+                     ('fire' in vl_clean and any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual'))))
     if not has_insurance:
         return False, v, 0.0
 
@@ -455,6 +638,9 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
 def validate_policy_number(value: str) -> Tuple[bool, str, float]:
     """Validate policy number with strict filtering"""
     v = value.strip()
+    
+    # Strip leading punctuation/OCR artifacts (e.g. ". 000000" from "Policy Number.")
+    v = re.sub(r'^[.\s:;,]+', '', v).strip()
 
     if _is_section_header_value(v):
         return False, v, 0.0
@@ -467,7 +653,15 @@ def validate_policy_number(value: str) -> Tuple[bool, str, float]:
         return False, v, 0.0
 
     # Block garbage patterns with specific keywords
-    if re.search(r'(date|time|page|due|liability\$|ozark)', v, re.I):
+    if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I):
+        return False, v, 0.0
+    
+    # Block values containing dollar signs
+    if '$' in v:
+        return False, v, 0.0
+    
+    # Block values containing periods followed by digits (looks like dollar amounts)
+    if re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v):
         return False, v, 0.0
     
     # Block state abbreviation + number patterns (like MI48007, NC27102)
@@ -530,6 +724,10 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     if _is_section_header_value(v):
         return False, v, 0.0
 
+    # N/A is a valid loan number indicator (no mortgage/loan on the policy)
+    if re.match(r'^n/?a$', v, re.I):
+        return True, "N/A", 0.90
+
     if v.lower() in JUNK_VALUES:
         return False, v, 0.0
 
@@ -539,8 +737,12 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     # Extract digits
     digits = ''.join(c for c in v if c.isdigit())
 
-    # Loan numbers are typically 8-16 digits
-    if len(digits) < 7 or len(digits) > 16:
+    # Loan numbers are typically 7-12 digits
+    if len(digits) < 7 or len(digits) > 12:
+        return False, v, 0.0
+    
+    # Block 13+ digit pure numbers (barcode artifacts)
+    if len(digits) >= 13:
         return False, v, 0.0
 
     # Block obvious page reference patterns (underscore separated)
@@ -574,6 +776,18 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     if not v or len(v) < 2:
         return False, v, 0.0
 
+    # Strip single-letter prefixes that are OCR/barcode artifacts
+    # e.g., "L JOHN CRENSHAW" → "JOHN CRENSHAW"
+    # But keep legitimate initials like "J. SMITH" or "A BABCOCK"
+    words = v.split()
+    if len(words) >= 3 and len(words[0]) == 1 and words[0].isalpha():
+        # Only strip if the single letter doesn't look like a middle initial
+        # (middle initials come AFTER first name, not before)
+        # Check: is words[1] a normal first name (2+ chars)?
+        if len(words[1]) >= 2:
+            v = " ".join(words[1:])
+            words = v.split()
+
     if _is_section_header_value(v):
         return False, v, 0.0
 
@@ -596,6 +810,30 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     # Block company names that shouldn't be insured names
     for company in BAD_INSURED_COMPANY_NAMES:
         if company in vl:
+            return False, v, 0.0
+    
+    # Block known carrier names that appear as text (not actual insured names)
+    # This prevents carriers from being extracted as insured names
+    CARRIER_INDICATORS = {
+        "aegis", "allstate", "state farm", "geico", 
+        "progressive", "travelers", "liberty mutual", "farmers",
+        "citizens", "universal", "federated", "nationwide",
+        "american family", "usaa", "auto-owners", "erie",
+        "encompass", "safeco", "hanover", "hartford",
+        "insurance company", "insurance co", 
+        "insurance exchange", "assurance company",
+        "property insurance", "casualty insurance",
+    }
+    # Check if the entire value is a carrier name
+    if any(indicator in vl for indicator in CARRIER_INDICATORS):
+        # Allow if it's clearly a person's name that happens to contain a word
+        # (e.g., "John Progressive" would be allowed, but "Aegis" alone would not)
+        words = vl.split()
+        # If only 1-2 words and matches carrier pattern, reject
+        if len(words) <= 2:
+            return False, v, 0.0
+        # If 3+ words but starts/ends with carrier indicator, likely still a carrier
+        if words[0] in CARRIER_INDICATORS or words[-1] in CARRIER_INDICATORS:
             return False, v, 0.0
 
     # Block bad name phrases
@@ -621,8 +859,8 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     if any(vl.endswith(w) for w in bad_ends):
         return False, v, 0.0
 
-    # Block values with weird characters
-    if re.search(r'[$%&*#@!]', v):
+    # Block values with weird characters (& is allowed for joint names like "DARRELL & KIM")
+    if re.search(r'[$%*#@!]', v):
         return False, v, 0.0
 
     # Block document reference patterns
@@ -684,8 +922,15 @@ def validate_address(value: str) -> Tuple[bool, str, float]:
         "premium", "deductible", "page ", " of ", "building type",
         "construction", "roof", "single family", "owner occupied",
         "ph 87", "_8s$", "$$", "##",  # OCR garbage patterns
+        "exclusion", "poisoning", "liability", "inflation",
+        "protection", "provisions", "amendment", "special form",
+        "fungi", "ordinance", "personal property", "loss payee",
     ]
     if any(kw in vl for kw in bad_patterns):
+        return False, v, 0.0
+    
+    # Block lines that contain date patterns like "03/93" or "01/77" (endorsement codes)
+    if re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v):
         return False, v, 0.0
 
     # Block document references
@@ -746,17 +991,27 @@ def validate_date(value: str) -> Tuple[bool, str, float]:
         "%B %d, %Y",      # January 15, 2024
         "%b %d, %Y",      # Jan 15, 2024
         "%B %d %Y",       # January 15 2024
+        "%b %d %Y",       # Jan 15 2024 (no comma)
+        "%b %d, %Y",      # Jan 15, 2024
         "%m/%d/%Y",       # 01/15/2024
         "%m-%d-%Y",       # 01-15-2024
         "%m/%d/%y",       # 01/15/24
         "%m-%d-%y",       # 01-15-24
         "%Y-%m-%d",       # 2024-01-15
         "%d %B %Y",       # 15 January 2024
+        "%d %b %Y",       # 15 Jan 2024
     ]
+
+    # Normalize: title-case the month abbreviation so strptime can parse it
+    # e.g., "NOV 09 2021" → "Nov 09 2021"
+    v_norm = v
+    m_abbrev = re.match(r'^([A-Z]{3})\s+(\d{1,2}),?\s+(\d{4})$', v)
+    if m_abbrev:
+        v_norm = f"{m_abbrev.group(1).capitalize()} {m_abbrev.group(2)} {m_abbrev.group(3)}"
 
     for fmt in date_formats:
         try:
-            dt = datetime.strptime(v, fmt)
+            dt = datetime.strptime(v_norm, fmt)
             if 1990 <= dt.year <= 2050:
                 return True, v, 0.95
         except ValueError:
@@ -860,10 +1115,22 @@ def validate_and_arbitrate(
     merged_fields: Dict,
     ocr_confidence: float,
     stage_breakdown: Dict,
+    doc_type: str = "UNK",
+    policy_type: str = "UNK",
 ) -> Tuple[Dict, float]:
     """
     Main validation entry point
-    Validates and filters extracted fields
+    Validates and filters extracted fields based on document + policy type
+    
+    Args:
+        merged_fields: Merged fields from all extraction stages
+        ocr_confidence: OCR confidence score
+        stage_breakdown: Breakdown of fields by stage
+        doc_type: Document type (INV, RNW, CAN, DOI, COI, BIN, RNS, OTH, UNK)
+        policy_type: Policy type (HAZ, HO, FIR, FLD, BREQ, NPAY, etc.)
+    
+    Returns:
+        Tuple of (validated_fields, final_confidence)
     """
     validated = {}
     scores = []
@@ -879,7 +1146,10 @@ def validate_and_arbitrate(
         "mailing_address": validate_address,
         "effective_date": validate_date,
         "expiration_date": validate_date,
+        "cancellation_date": validate_date,
         "total_premium": validate_money,
+        "balance_due": validate_money,
+        "issue_date": validate_date,
         "deductible": validate_money,
         "agent_phone": validate_phone,
     }
@@ -890,9 +1160,16 @@ def validate_and_arbitrate(
 
         value = data.get("value")
         confidence = data.get("confidence", 0.0)
+        source = data.get("source", "")
 
-        # Check confidence floor
-        floor = CONFIDENCE_FLOORS.get(field, DEFAULT_FLOOR)
+        # GLiNER is a last-resort AI fallback; its native scores (0.40-0.80)
+        # are not directly comparable to rule-based confidence scores.
+        # Use a lower floor so valid GLiNER extractions are not discarded.
+        if source == "stage2_5_gliner":
+            floor = 0.40
+        else:
+            floor = CONFIDENCE_FLOORS.get(field, DEFAULT_FLOOR)
+
         if confidence < floor or not value:
             continue
 
@@ -913,6 +1190,10 @@ def validate_and_arbitrate(
 
     # Cross-validate related fields
     validated = _cross_validate(validated)
+    
+    # Apply field filtering based on document + policy type business rules
+    # This restricts which fields are allowed for certain doc+policy combinations
+    validated = filter_allowed_fields(validated, doc_type, policy_type)
 
     # Calculate final confidence
     if scores:
@@ -930,115 +1211,3 @@ def validate_and_arbitrate(
 def validate_output(structured: Dict, confidence: float):
     """Backward compatible wrapper"""
     return validate_and_arbitrate(structured, confidence, {"stage1": structured})
-
-
-# ============================================================
-# TESTING / EXAMPLES
-# ============================================================
-
-if __name__ == "__main__":
-    # Test cases based on the errors shown
-    # Format: (field, value, should_pass)
-    test_cases = [
-        # Insured names that should be REJECTED
-        ("insured_name", "You're in good hands..", False),
-        ("insured_name", "HOMESAVER POLCY", False),
-        ("insured_name", "policy payment quickly & easily ONLINE", False),
-        ("insured_name", "POCKet eXPENSES TO yOU.", False),
-        ("insured_name", "and Policy Information", False),
-        ("insured_name", "ALLIED TRUST", False),  # Insurance company, not insured
-        ("insured_name", "PROPERIY INSURANCE CORPORAION", False),  # Malformed carrier
-        
-        # Insured names that should be ACCEPTED
-        ("insured_name", "JAMES BROSTRON", True),
-        ("insured_name", "HEATHER A BABCOCK", True),
-        ("insured_name", "YOKO MATSUMOTO", True),
-        ("insured_name", "Michael K Lani, Michelle Lani", True),
-        ("insured_name", "JOHN CRENSHAW", True),
-        ("insured_name", "SARAH JONGSMA", True),
-        ("insured_name", "CHAD MEYER", True),  # Could be agent or insured - allow it
-        
-        # Policy numbers that should be REJECTED
-        ("policy_number", "DueDate:10/10/20OZARK,AR72949", False),
-        ("policy_number", "100000889100011L0030", False),  # Too long, junk
-        ("policy_number", "NC27102", False),  # State + number
-        ("policy_number", "L-PersonalLiability$500,000", False),  # Coverage text
-        ("policy_number", "MI48007", False),  # State + ZIP
-        
-        # Policy numbers that should be ACCEPTED
-        ("policy_number", "DPC 0076173896-1", True),
-        ("policy_number", "2004939477", True),
-        ("policy_number", "602732135 664 1", True),
-        ("policy_number", "04038598 - 1", True),
-        ("policy_number", "757051", True),
-        ("policy_number", "987 673 277", True),
-        ("policy_number", "PolicyNumber:757051", True),
-        
-        # Addresses that should be REJECTED
-        ("property_address", "Page 2 of 2", False),
-        ("property_address", "1966o_8s$H PH 87 01 11", False),  # OCR garbage
-        ("property_address", "PO BOX 7083", False),  # Short PO Box without city
-        
-        # Addresses that should be ACCEPTED
-        ("property_address", "3605 ROYAL DR FORT COLLINS, CO 80526-2939", True),
-        ("property_address", "908 MEADOW LN NISKAYUNA, NY 12309-6514", True),
-        ("property_address", "1682 GREEN MEADOW AVE TUSTIN CA 92780-6659", True),
-        ("property_address", "15300 SUGAR BOWL RD MYAKKA CITY, FL 34251", True),
-        
-        # Loan numbers that should be REJECTED
-        ("loan_number", "00008088910000120003", False),  # Too many zeros
-        ("loan_number", "00033300333333333303", False),  # Too many zeros
-        ("loan_number", "062920201906872915019", False),  # Too long (date + reference)
-        
-        # Loan numbers that should be ACCEPTED
-        ("loan_number", "0400004466", True),
-        ("loan_number", "7000654501", True),
-        ("loan_number", "1161870386", True),
-        ("loan_number", "297200525511", True),
-        
-        # Carrier names that should be REJECTED
-        ("carrier_name", "NANCY BOND INSURANCE SERVICES", False),  # Agency
-        ("carrier_name", "PROPERIY INSURANCE CORPORAION", False),  # Malformed
-        ("carrier_name", "EVERETT FINANCIAL INC", False),  # Not a carrier
-        
-        # Carrier names that should be ACCEPTED
-        ("carrier_name", "ALLIED PROP AND CAS INS CO", True),
-        ("carrier_name", "ADIRONDACK INSURANCE EXCHANGE", True),
-        ("carrier_name", "TRAVELERS PROPERTY CASUALTY INSURANCE COMPANY", True),
-        ("carrier_name", "CITIZENS PROPERTY INSURANCE CORPORATION", True),
-        ("carrier_name", "ALLSTATE INSURANCE COMPANY", True),
-    ]
-    
-    validators = {
-        "insured_name": validate_name,
-        "policy_number": validate_policy_number,
-        "property_address": validate_address,
-        "loan_number": validate_loan_number,
-        "carrier_name": validate_carrier,
-    }
-    
-    print("=" * 70)
-    print("VALIDATION TEST RESULTS")
-    print("=" * 70)
-    
-    passed = 0
-    failed = 0
-    
-    for field, value, should_pass in test_cases:
-        validator = validators[field]
-        ok, norm_value, score = validator(value)
-        
-        if ok == should_pass:
-            status = "✓ PASS"
-            passed += 1
-        else:
-            status = "✗ FAIL"
-            failed += 1
-            expected = "ACCEPT" if should_pass else "REJECT"
-            actual = "ACCEPTED" if ok else "REJECTED"
-            status += f" (expected {expected}, got {actual})"
-        
-        print(f"{status} | {field}: {value[:50]}")
-    
-    print("=" * 70)
-    print(f"Results: {passed} passed, {failed} failed")
