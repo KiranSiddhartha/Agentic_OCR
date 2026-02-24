@@ -813,8 +813,8 @@ for i, f in enumerate(st.session_state.files):
                             try:
                                 ocr = vision.ocr_engine.run_with_boxes(img)
                                 ocr_data_by_page[f"{f.name}_page_{page_idx}"] = ocr
-                            except:
-                                pass
+                            except Exception as ocr_err:
+                                print(f"[APP] OCR pre-scan failed page {page_idx}: {ocr_err}")
 
                         results = run_pipeline_batch(pages)
 

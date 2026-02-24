@@ -725,6 +725,131 @@ def _extract_remit_fuzzy(lines: List[str]) -> Optional[Dict]:
     return None
 
 
+
+# ============================================================
+# TABLE / LAYOUT HELPERS (added — were referenced but missing)
+# ============================================================
+
+def _extract_total_premium_table(lines: List[str]) -> Optional[Dict]:
+    """
+    Extract total premium from table layouts where the label is on one line
+    and the dollar amount is on the next line, or from columnar formats.
+    Handles: 'Total Premium' / '$1,088.00' style layouts.
+    """
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        # Check for total premium labels
+        if re.search(r'(?i)\b(?:total\s+(?:annual\s+)?premium|'
+                     r'full\s+payment|total\s+policy\s+premium|'
+                     r'annual\s+premium|premium\s+amount)\b', ll):
+            # Try same line first
+            m = re.search(r'\$\s*([\d,]+\.?\d*)', line)
+            if m:
+                return _r("$" + m.group(1).replace(" ", ""), "sc_premium_table", 0.80)
+            # Try next 1-3 lines
+            for offset in range(1, 4):
+                if idx + offset >= len(lines):
+                    break
+                nxt = lines[idx + offset].strip()
+                m = re.search(r'\$\s*([\d,]+\.?\d*)', nxt)
+                if m:
+                    return _r("$" + m.group(1).replace(" ", ""), "sc_premium_table", 0.78)
+    return None
+
+
+def _extract_mortgage_from_interests_table(lines: List[str]) -> Optional[Dict]:
+    """
+    Extract mortgage company from 'Other Interests' or 'Additional Interests'
+    table sections (AAA, Nationwide, etc.).
+    """
+    in_section = False
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        if re.search(r'(?i)\b(?:other\s+interests|additional\s+interests|'
+                     r'mortgagee|lienholder|loss\s+payee)\b', ll):
+            in_section = True
+            # Check if the name is on the same line after a colon/separator
+            m = re.search(r'(?:mortgagee|lienholder|loss\s+payee)\s*[:\-]?\s*(.+)',
+                          line, re.I)
+            if m:
+                val = m.group(1).strip()
+                if len(val) > 3 and not re.match(r'^[\d\s/\-]+$', val):
+                    return _r(val, "sc_interests_table", 0.75)
+            continue
+        if in_section:
+            # Look for a company name (all caps, or contains ISAOA/ATIMA/BANK/MORTGAGE)
+            stripped = line.strip()
+            if not stripped:
+                in_section = False
+                continue
+            if re.search(r'(?i)\b(?:isaoa|atima|bank|mortgage|credit\s+union|'
+                         r'lending|servicing|funding)\b', stripped):
+                val = re.sub(r'\s+', ' ', stripped).strip()
+                return _r(val, "sc_interests_table", 0.75)
+            if re.match(r'^[A-Z\s&,\.]+$', stripped) and len(stripped) > 5:
+                return _r(stripped, "sc_interests_table", 0.72)
+    return None
+
+
+def _extract_loan_from_interests_table(lines: List[str]) -> Optional[Dict]:
+    """
+    Extract loan number from 'Other Interests' or 'Additional Interests'
+    table sections. Often near mortgage company info.
+    """
+    for idx, line in enumerate(lines):
+        ll = line.lower().strip()
+        # Direct loan number labels in interests sections
+        m = re.search(r'(?i)(?:loan|acct|account|contract)\s*(?:#|no\.?|number)\s*'
+                      r'[:\-]?\s*([\w\-]+)', line)
+        if m:
+            val = m.group(1).strip()
+            if len(val) >= 4 and re.search(r'\d', val):
+                return _r(val, "sc_interests_loan", 0.75)
+        # "Loan: XXXXXXX" format
+        m = re.search(r'(?i)\bloan\s*[:\-]\s*([\d\-]+)', line)
+        if m:
+            val = m.group(1).strip()
+            if len(val) >= 4:
+                return _r(val, "sc_interests_loan", 0.75)
+    return None
+
+
+def _extract_property_from_coverage_detail(lines: List[str]) -> Optional[Dict]:
+    """
+    Extract property address from 'Coverage Detail for [address]' inline format.
+    Common in Encompass, Safeco, and similar carriers.
+    """
+    for line in lines:
+        m = re.search(r'(?i)coverage\s+detail\s+for\s+(.+)', line)
+        if m:
+            addr = m.group(1).strip()
+            addr = re.sub(r'\s*-\s*$', '', addr)
+            if _looks_like_address(addr):
+                return _r(addr, "sc_coverage_detail", 0.78)
+    return None
+
+
+def _extract_property_from_located_at(lines: List[str]) -> Optional[Dict]:
+    """
+    Extract property address from 'LOCATED AT:' or 'DESCRIPTION OF PROPERTY:'
+    patterns (Adirondack, Nationwide, etc.).
+    """
+    for idx, line in enumerate(lines):
+        m = re.search(r'(?i)(?:located\s+at|description\s+of\s+property|'
+                      r'property\s+location|insured\s+property)\s*[:\-]?\s*(.*)',
+                      line)
+        if m:
+            addr = m.group(1).strip()
+            if addr and _looks_like_address(addr):
+                return _r(addr, "sc_located_at", 0.78)
+            # Try next line
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1].strip()
+                if nxt and _looks_like_address(nxt):
+                    return _r(nxt, "sc_located_at", 0.76)
+    return None
+
+
 def _extract_column_policy_number(lines: List[str], out: Dict) -> None:
     """
     Column-header layout: 'Policy number' as header, value 2 lines below.
@@ -1053,6 +1178,9 @@ def _valid_address(text: str) -> bool:
     if re.search(r"\b[A-Z]{2}\s*\d{5}", text):
         return True
     return bool(re.search(r"\d+", text)) and len(text.split()) >= 3
+
+# Alias used by table/layout helpers
+_looks_like_address = _valid_address
 
 
 def _semantic_cleanup(text: str) -> str:

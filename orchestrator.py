@@ -456,6 +456,20 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         vision = _vision_agent
 
         ocr = vision.ocr_engine.run_with_boxes(processed)
+
+        # ── OCR RECOVERY ──────────────────────────────────────────
+        # If PaddleOCR returns empty (possible singleton corruption
+        # from use_mp / mkldnn), recreate the engine and retry once.
+        if not ocr or not ocr.get("text"):
+            print("[PIPELINE] OCR returned empty — recreating OCR engine and retrying")
+            try:
+                from api.ocr_engine import OCREngine
+                vision.ocr_engine = OCREngine()
+                ocr = vision.ocr_engine.run_with_boxes(processed)
+            except Exception as retry_err:
+                print(f"[PIPELINE] OCR retry failed: {retry_err}")
+        # ──────────────────────────────────────────────────────────
+
         if not ocr or not ocr.get("text"):
             return _empty_result("No OCR text")
 
@@ -698,10 +712,10 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         }
 
     except Exception as e:
-        if debug:
-            import traceback
-            print(f"[ERROR] Pipeline failed: {e}")
-            traceback.print_exc()
+        # FIXED: Always log pipeline errors (not just in debug mode)
+        import traceback
+        print(f"[PIPELINE ERROR] {e}")
+        traceback.print_exc()
         return _empty_result(str(e))
 
 
