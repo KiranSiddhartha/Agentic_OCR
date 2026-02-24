@@ -1,1213 +1,285 @@
-"""
-Stage 4 – Validation & Arbitration Agent (IMPROVED VERSION)
-============================================================
-Major improvements to address common extraction errors:
-
-1. INSURED NAME VALIDATION:
-   - Block marketing slogans ("You're in good hands", "policy payment quickly & easily ONLINE")
-   - Block product names ("HOMESAVER POLCY", "PROPERTY INSURANCE CORPORAION")
-   - Block document headers and structural text
-   - Require proper name patterns
-
-2. POLICY NUMBER VALIDATION:
-   - Block page reference numbers and document codes
-   - Block phone numbers more aggressively
-   - Validate alphanumeric patterns correctly
-
-3. ADDRESS VALIDATION:
-   - Distinguish between insured addresses and mortgage company addresses
-   - Block PO Box addresses that belong to mortgage companies (Troy MI pattern)
-   - Block document reference text disguised as addresses
-
-4. LOAN NUMBER VALIDATION:
-   - Block page numbers and document reference codes
-   - Require proper loan number patterns
-
-5. CARRIER NAME VALIDATION:
-   - Block truncated or malformed carrier names
-   - Block product names being captured as carriers
-"""
-
 import re
 from datetime import datetime
-from typing import Dict, Tuple, Set
-
+from typing import Dict, Tuple, Set, List, Optional
 
 # ============================================================
-# CONFIDENCE FLOORS
+# CONFIGURATION
 # ============================================================
-
 CONFIDENCE_FLOORS = {
-    "carrier_name": 0.80,
-    "policy_number": 0.80,
-    "loan_number": 0.80,
-    "insured_name": 0.75,
-    "property_address": 0.75,
-    "mailing_address": 0.70,
-    "mortgage_company": 0.75,
-    "total_premium": 0.70,
-    "deductible": 0.70,
-    "effective_date": 0.75,
-    "expiration_date": 0.75,
-    "agent_phone": 0.75,
-    "agent_name": 0.70,
+    "carrier_name": 0.80, "policy_number": 0.80, "loan_number": 0.80, "insured_name": 0.75,
+    "property_address": 0.75, "mailing_address": 0.70, "mortgage_company": 0.75, "total_premium": 0.70,
+    "deductible": 0.70, "effective_date": 0.75, "expiration_date": 0.75, "agent_phone": 0.75, "agent_name": 0.70
 }
-
 DEFAULT_FLOOR = 0.65
 
+# Field Groups
+_INV_FIELDS = ["carrier_name", "insured_name", "policy_number", "balance_due", "issue_date", "remit_info", "effective_date", "expiration_date", "property_address", "loan_number", "mortgage_company", "total_premium"]
+_CAN_FIELDS = ["carrier_name", "policy_number", "insured_name", "effective_date", "expiration_date", "cancellation_date", "cancellation_reason", "property_address", "mortgage_company", "loan_number", "cancellation_effective_date"]
+_RNW_FIELDS = ["carrier_name", "policy_number", "insured_name", "effective_date", "expiration_date", "property_address", "mailing_address", "mortgage_company", "loan_number", "total_premium"]
+_DOI_FIELDS = ["policy_number", "mortgage_company", "loan_number", "carrier_name", "insured_name", "property_address", "third_party_removed", "third_party_cancellation_date"]
 
-# ============================================================
-# FIELD REQUIREMENTS BY DOCUMENT + POLICY TYPE
-# ============================================================
+# Allowed Fields Map
+ALLOWED_FIELDS_BY_DOC_POLICY = {}
+for pt in ["HAZ", "HO", "HO3", "HO6", "FIR", "FLD", "WND", "DP3", "AUTO", "LL", "UO", "ERQ", "UNK", "BREQ", "NPAY", "NRNW", "UNWR", "CEL"]:
+    ALLOWED_FIELDS_BY_DOC_POLICY[("INV", pt)] = _INV_FIELDS
+for pt in ["HO", "HO3", "HO6", "HAZ", "FIR", "FLD", "WND", "DP3", "AUTO", "LL", "UO", "ERQ", "UNK", "NRNW", "UNWR", "CEL", "BREQ", "NPAY"]:
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("CAN", pt), _CAN_FIELDS)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("RNW", pt), _RNW_FIELDS)
+    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("DOI", pt), _DOI_FIELDS)
 
-# Field requirements by document type + policy type combination
-# This implements business rules for which fields are allowed
-# for specific document+policy combinations
-#
-# INV fields: core 3 + invoice-specific + context fields
-_INV_FIELDS = [
-    "carrier_name", "insured_name", "policy_number",
-    "balance_due", "issue_date", "remit_info",
-    "effective_date", "expiration_date",
-    "property_address", "loan_number", "mortgage_company",
-    "total_premium",
-]
-
-ALLOWED_FIELDS_BY_DOC_POLICY = {
-    # Invoice + Policy Type combinations
-    ("INV", "HAZ"): _INV_FIELDS,
-    ("INV", "HO"): _INV_FIELDS,
-    ("INV", "HO3"): _INV_FIELDS,
-    ("INV", "HO6"): _INV_FIELDS,
-    ("INV", "FIR"): _INV_FIELDS,
-    ("INV", "FLD"): _INV_FIELDS,
-    ("INV", "WND"): _INV_FIELDS,
-    ("INV", "DP3"): _INV_FIELDS,
-    ("INV", "AUTO"): _INV_FIELDS,
-    ("INV", "LL"): _INV_FIELDS,
-    ("INV", "UO"): _INV_FIELDS,
-    ("INV", "ERQ"): _INV_FIELDS,
-    # For unknown policy types with INV, still allow all INV fields
-    ("INV", "UNK"): _INV_FIELDS,
-    
-    # Cancellation subtypes with INV
-    ("INV", "BREQ"): _INV_FIELDS,
-    ("INV", "NPAY"): _INV_FIELDS,
-    ("INV", "NRNW"): _INV_FIELDS,
-    ("INV", "UNWR"): _INV_FIELDS,
-    ("INV", "CEL"): _INV_FIELDS,
-    
-    # Add other combinations as needed per business rules
-    # If not specified, allow all fields (default behavior)
-    
-    # --- INS observation batch: DOI allowed fields include third-party events ---
-    ("DOI", "HO"): [
-        "policy_number", "mortgage_company", "loan_number",
-        "carrier_name", "insured_name", "property_address",
-        "third_party_removed", "third_party_cancellation_date",
-        "cancellation_effective_date",
-    ],
-    ("DOI", "HAZ"): [
-        "policy_number", "mortgage_company", "loan_number",
-        "carrier_name", "insured_name", "property_address",
-        "third_party_removed", "third_party_cancellation_date",
-    ],
-    ("DOI", "FIR"): [
-        "policy_number", "mortgage_company", "loan_number",
-        "carrier_name", "insured_name", "property_address",
-        "third_party_removed", "third_party_cancellation_date",
-    ],
-    ("DOI", "UNK"): [
-        "policy_number", "mortgage_company", "loan_number",
-        "carrier_name", "insured_name", "property_address",
-        "third_party_removed", "third_party_cancellation_date",
-    ],
-    
-    # CAN + subtypes: include cancellation event fields
-    ("CAN", "BREQ"): [
-        "carrier_name", "policy_number", "insured_name",
-        "effective_date", "expiration_date", "cancellation_date",
-        "cancellation_reason", "property_address",
-        "mortgage_company", "loan_number",
-        "cancellation_effective_date",
-    ],
-    ("CAN", "NPAY"): [
-        "carrier_name", "policy_number", "insured_name",
-        "effective_date", "cancellation_date",
-        "cancellation_reason", "property_address",
-        "mortgage_company", "loan_number",
-    ],
+# Smart Hints for Missing Logic
+FIELD_LABEL_HINTS = {
+    "policy_number": ["policy number", "policy #", "policy no", "pol num", "policy id"],
+    "loan_number": ["loan number", "loan #", "mortgage number", "loan no", "account number"],
+    "insured_name": ["insured", "named insured", "policyholder", "customer name"],
+    "carrier_name": ["insurance company", "carrier", "insurer", "company name", "underwriter"],
+    "property_address": ["property address", "location", "risk address", "insured location", "premises"],
+    "mailing_address": ["mailing address", "mail to", "billing address"],
+    "effective_date": ["effective date", "policy period", "period begins", "eff date", "from"],
+    "expiration_date": ["expiration date", "period ends", "valid until", "exp date", "to"],
+    "total_premium": ["total premium", "premium", "policy total", "annual premium"],
+    "balance_due": ["balance due", "amount due", "pay this amount", "total due", "min due"],
+    "mortgage_company": ["mortgagee", "mortgage company", "lender", "lienholder", "interested party"],
+    "cancellation_date": ["cancellation date", "cancel date", "effective date of cancellation"],
+    "cancellation_reason": ["reason", "reason for cancellation", "reason for non-renewal"],
+    "deductible": ["deductible", "all perils", "wind/hail"],
 }
 
-# ---- DYNAMICALLY GENERATED: CAN + RNW + DOI for all common policy types ----
-_CAN_FIELDS_ALL = [
-    "carrier_name", "policy_number", "insured_name",
-    "effective_date", "expiration_date", "cancellation_date",
-    "cancellation_reason", "property_address",
-    "mortgage_company", "loan_number",
-]
-_RNW_FIELDS_ALL = [
-    "carrier_name", "policy_number", "insured_name",
-    "effective_date", "expiration_date",
-    "property_address", "mailing_address",
-    "mortgage_company", "loan_number", "total_premium",
-]
-_DOI_FIELDS_ALL = [
-    "policy_number", "mortgage_company", "loan_number",
-    "carrier_name", "insured_name", "property_address",
-]
-_COMMON_POLICY_TYPES = [
-    "HO", "HO3", "HO6", "HAZ", "FIR", "FLD", "WND",
-    "DP3", "AUTO", "LL", "UO", "ERQ", "UNK",
-    "NRNW", "UNWR", "CEL",
-]
-for _pt in _COMMON_POLICY_TYPES:
-    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("CAN", _pt), _CAN_FIELDS_ALL)
-    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("RNW", _pt), _RNW_FIELDS_ALL)
-    ALLOWED_FIELDS_BY_DOC_POLICY.setdefault(("DOI", _pt), _DOI_FIELDS_ALL)
-
+# Block Lists & Regex
+SECTION_TITLES = {"summary", "home protection", "coverage", "coverages", "limits", "policy mortgage declarations summary", "declarations", "declarations summary", "mortgage/other interested parties", "applicable deductible(s)", "premiums", "forms and endorsements", "policy period", "policyholder since", "billing information", "payment plan", "discount information", "for your information", "important notice", "thank you", "office use space", "message(s)", "mortgagee(s)", "endorsements", "schedule", "notice", "rating information", "additional coverages", "discounts"}
+JUNK_VALUES = {"type", "interest", "policy", "coverage", "summary", "n/a", "none", "see attached", "continued", "page", "na", "tbd", "pending", "unknown", "included", "see policy"}
+MARKETING_SLOGANS = {"you're in good hands", "you're in good hands.", "youre in good hands", "on your side", "like a good neighbor", "we're all in this together", "nationwide is on your side", "for all that matters", "the promise", "keep the promise"}
+BAD_NAME_PHRASES = {"policy payment", "quickly & easily", "quickly and easily", "online", "pocket expenses", "out of pocket", "out-of-pocket", "and policy information", "policy information", "page 1 of", "page 2 of", "page 3 of", "mortgagee copy", "declarations page", "your policy", "our policy", "this policy", "policy conditions", "policy type", "policy period", "coverage detail", "coverage info", "premium info", "building type", "single family", "construction type", "roof-wall connection", "roof connection", "roof deck", "additional insured", "first named insured", "named insured:", "location id", "location of", "described location", "effective date", "expiration date", "endorsement", "deductible", "important notice", "special provisions"}
+PRODUCT_NAMES = {"homesaver polcy", "homesaver policy", "homeowners policy", "dwelling policy", "mobilehome policy", "mobilehomeowners", "special form policy", "wind only policy", "condominium policy", "condominium owners", "rental unit owners", "ultrapack plus", "encompassone", "encompass one"}
+BAD_INSURED_COMPANY_NAMES = {"allied trust", "aegis", "aegis security", "aegis security insurance", "a egis", "properiy insurance", "property insurance", "insurance corporation", "insurance company", "insurance exchange", "mortgage company", "mortgage corp", "financial inc", "lending llc", "bank na"}
+BAD_CARRIER_PATTERNS = {"properiy insurance", "property insurance corporaion", "property insurance corporaiion", "insurance exchange*", "insurance company*", "insurance agency", "insurance services", "insurance center", "everett financial", "broker solutions", "nancy bond insurance", "geico ins agency", "allstate mortgage"}
+MORTGAGE_PO_BOX_PATTERNS = [r"p\.?o\.?\s*box\s*\d+.*troy.*mi", r"p\.?o\.?\s*box\s*\d+.*48007", r"p\.?o\.?\s*box\s*\d+.*miami.*fl.*33197", r"p\.?o\.?\s*box\s*\d+.*dallas.*tx.*75266"]
+PREFIX_STRIP = ["coverage detail for", "policy effective date is", "effective date is", "your policy effective date is", "your policy effective date:", "location:", "address:", "name:", "insured:", "named insured:", "property:", "mailing:", "first named insured:", "policyholder(s)", "policyholder:"]
+PHONE_RE = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'); DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}'); ZIP_RE = re.compile(r'\b\d{5}(-\d{4})?\b'); PO_BOX_RE = re.compile(r'p\.?o\.?\s*box', re.I)
+STREET_TYPES = ['street', 'st', 'avenue', 'ave', 'road', 'rd', 'boulevard', 'blvd', 'lane', 'ln', 'drive', 'dr', 'court', 'ct', 'circle', 'cir', 'way', 'place', 'pl', 'terrace', 'ter', 'highway', 'hwy', 'parkway', 'pkwy', 'ridge']
 
 # ============================================================
-# BLOCK LISTS - EXPANDED
+# HELPERS & LOGIC
 # ============================================================
-
-SECTION_TITLES = {
-    "summary", "home protection", "coverage", "coverages", "limits",
-    "policy mortgage declarations summary", "declarations",
-    "declarations summary", "mortgage/other interested parties",
-    "applicable deductible(s)", "premiums", "forms and endorsements",
-    "policy period", "policyholder since", "billing information",
-    "payment plan", "discount information", "for your information",
-    "important notice", "thank you", "office use space", "message(s)",
-    "mortgagee(s)", "endorsements", "schedule", "notice",
-    "rating information", "additional coverages", "discounts",
-}
-
-JUNK_VALUES = {
-    "type", "interest", "policy", "coverage", "summary",
-    "n/a", "none", "see attached", "continued", "page",
-    "na", "tbd", "pending", "unknown", "included", "see policy",
-}
-
-# Marketing slogans and taglines to block as names
-MARKETING_SLOGANS = {
-    "you're in good hands",
-    "you're in good hands.",
-    "youre in good hands",
-    "on your side",
-    "like a good neighbor",
-    "we're all in this together",
-    "nationwide is on your side",
-    "for all that matters",
-    "the promise",
-    "keep the promise",
-}
-
-# Phrases that indicate document structure, not actual names
-BAD_NAME_PHRASES = {
-    "policy payment",
-    "quickly & easily",
-    "quickly and easily",
-    "online",
-    "pocket expenses",
-    "out of pocket",
-    "out-of-pocket",
-    "and policy information",
-    "policy information",
-    "page 1 of",
-    "page 2 of",
-    "page 3 of",
-    "mortgagee copy",
-    "declarations page",
-    "your policy",
-    "our policy",
-    "this policy",
-    "policy conditions",
-    "policy type",
-    "policy period",
-    "coverage detail",
-    "coverage info",
-    "premium info",
-    "building type",
-    "single family",
-    "construction type",
-    "roof-wall connection",
-    "roof connection",
-    "roof deck",
-    "additional insured",
-    "first named insured",
-    "named insured:",
-    "location id",
-    "location of",
-    "described location",
-    "effective date",
-    "expiration date",
-    "endorsement",
-    "deductible",
-    "important notice",
-    "special provisions",
-}
-
-# Product names that should not be captured as insured names
-PRODUCT_NAMES: Set[str] = {
-    "homesaver polcy",
-    "homesaver policy",
-    "homeowners policy",
-    "dwelling policy",
-    "mobilehome policy",
-    "mobilehomeowners",
-    "special form policy",
-    "wind only policy",
-    "condominium policy",
-    "condominium owners",
-    "rental unit owners",
-    "ultrapack plus",
-    "encompassone",
-    "encompass one",
-}
-
-# Company names that should NOT be captured as insured names
-# These are often mortgage companies, agents, or other entities
-BAD_INSURED_COMPANY_NAMES: Set[str] = {
-    "allied trust",
-    "aegis",
-    "aegis security",
-    "aegis security insurance",
-    "a egis",  # OCR error variant
-    "properiy insurance",  # Typo
-    "property insurance",
-    "insurance corporation",
-    "insurance company",
-    "insurance exchange",
-    "mortgage company",
-    "mortgage corp",
-    "financial inc",
-    "lending llc",
-    "bank na",
-}
-
-# Truncated/malformed carrier names to reject
-BAD_CARRIER_PATTERNS = {
-    "properiy insurance",  # Typo
-    "property insurance corporaion",  # Missing T
-    "property insurance corporaiion",  # Double I
-    "insurance exchange*",  # Has asterisk
-    "insurance company*",
-    "insurance agency",  # Agency, not carrier
-    "insurance services",  # Services, not carrier
-    "insurance center",
-    "everett financial",  # Not a carrier, it's a lender
-    "broker solutions",
-    "nancy bond insurance",  # Agent, not carrier
-    "geico ins agency",
-    "allstate mortgage",
-}
-
-# Common mortgage company PO Box addresses (Troy MI is most common)
-MORTGAGE_PO_BOX_PATTERNS = [
-    r"p\.?o\.?\s*box\s*\d+.*troy.*mi",
-    r"p\.?o\.?\s*box\s*\d+.*48007",  # Troy MI ZIP
-    r"p\.?o\.?\s*box\s*\d+.*miami.*fl.*33197",
-    r"p\.?o\.?\s*box\s*\d+.*dallas.*tx.*75266",
-]
-
-PREFIX_STRIP = [
-    "coverage detail for",
-    "policy effective date is",
-    "effective date is",
-    "your policy effective date is",
-    "your policy effective date:",
-    "location:",
-    "address:",
-    "name:",
-    "insured:",
-    "named insured:",
-    "property:",
-    "mailing:",
-    "first named insured:",
-    "policyholder(s)",
-    "policyholder:",
-]
-
-
-# ============================================================
-# FIELD FILTERING BY DOCUMENT + POLICY TYPE
-# ============================================================
-
-def filter_allowed_fields(
-    validated: Dict,
-    doc_type: str,
-    policy_type: str
-) -> Dict:
-    """
-    Filter extracted fields to only those allowed for the 
-    specific document_type + policy_type combination.
-    
-    This implements business rules that restrict which fields
-    should be extracted for certain document+policy combinations.
-    For example, INV+HAZ documents should only extract 3 fields:
-    carrier_name, insured_name, and policy_number.
-    
-    Args:
-        validated: Dictionary of validated fields
-        doc_type: Document type (INV, RNW, CAN, DOI, COI, BIN, RNS, OTH, UNK)
-        policy_type: Policy type (HAZ, HO, FIR, FLD, BREQ, NPAY, etc.)
-    
-    Returns:
-        Filtered dictionary with only allowed fields
-    """
-    # Check if there's a specific allowlist for this combination
-    key = (doc_type, policy_type)
-    allowed = ALLOWED_FIELDS_BY_DOC_POLICY.get(key)
-    
-    if allowed is None:
-        # No restriction - return all fields
-        return validated
-    
-    # Filter to only allowed fields
-    filtered = {
-        field: data 
-        for field, data in validated.items() 
-        if field in allowed
-    }
-    
-    # Add metadata about filtering
-    if len(filtered) < len(validated):
-        removed_fields = set(validated.keys()) - set(filtered.keys())
-        # Could log this for debugging: f"Filtered out {removed_fields} for {doc_type}+{policy_type}"
-    
-    return filtered
-
-
-# ============================================================
-# REGEX PATTERNS
-# ============================================================
-
-PHONE_RE = re.compile(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
-DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
-ZIP_RE = re.compile(r'\b\d{5}(-\d{4})?\b')
-PO_BOX_RE = re.compile(r'p\.?o\.?\s*box', re.I)
-
-STREET_TYPES = [
-    'street', 'st', 'avenue', 'ave', 'road', 'rd', 'boulevard', 'blvd',
-    'lane', 'ln', 'drive', 'dr', 'court', 'ct', 'circle', 'cir',
-    'way', 'place', 'pl', 'terrace', 'ter', 'highway', 'hwy',
-    'parkway', 'pkwy', 'ridge'
-]
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _is_section_header_value(value: str) -> bool:
-    """Check if value is a section header, not actual data"""
-    if not value:
-        return False
-
-    v = value.lower().strip()
-
-    if v in SECTION_TITLES:
-        return True
-
-    for title in SECTION_TITLES:
-        if v.startswith(title) or title in v:
-            return True
-
-    # Ends with colon = likely header
-    if v.endswith(":") and len(v.split()) <= 5:
-        return True
-
-    # All uppercase multi-word WITHOUT being a typical name pattern
-    # Names are typically 2-4 words, headers are typically longer or contain structural words
-    if value.isupper() and len(value.split()) >= 3:
-        words = value.split()
-        v_lower = value.lower()
-        
-        # If it contains "insurance", "company", "corporation", etc., it's likely a company name
-        # not a header
-        company_indicators = {'insurance', 'ins', 'company', 'co', 'corporation', 'corp', 'exchange', 
-                             'mutual', 'group', 'inc', 'llc', 'ltd'}
-        if any(ind in v_lower for ind in company_indicators):
-            return False  # Likely a company name, not a header
-        
-        # Check if it looks like a header vs a name
-        # Headers often contain words like: PAGE, SECTION, COVERAGE, DECLARATIONS, NOTICE, etc.
-        header_words = {'PAGE', 'SECTION', 'COVERAGE', 'DECLARATIONS', 'NOTICE', 
-                       'INFORMATION', 'SUMMARY', 'DETAILS', 'SCHEDULE', 'ENDORSEMENT',
-                       'CONDITIONS', 'PROVISIONS', 'LIMITS', 'POLICY', 'PREMIUM',
-                       'TOTAL', 'SUBTOTAL', 'AMOUNT', 'DATE', 'NUMBER', 'TYPE'}
-        if any(w.upper() in header_words for w in words):
-            return True
-        # If it's a short all-caps phrase without header words, it might be a name
-        # Names: "JOHN SMITH", "HEATHER A BABCOCK", "MICHAEL K LANI"
-        # Allow up to 4 words if they don't contain header keywords
-        if len(words) <= 4:
-            return False  # Likely a name
-        # 5+ words all caps without digits and without company indicators = probably a header
-        if not any(c.isdigit() for c in value):
-            return True
-
-    return False
-
-
-def _strip_prefixes(value: str) -> str:
-    """Remove common prefixes from values"""
-    v = value.strip()
-    vl = v.lower()
-
+def _normalize_whitespace(v: str) -> str: return re.sub(r'\s+', ' ', v).strip()
+def _strip_prefixes(v: str) -> str:
+    v = v.strip(); vl = v.lower()
     for p in PREFIX_STRIP:
-        if vl.startswith(p):
-            v = v[len(p):].strip(" :.-")
-            vl = v.lower()
-
+        if vl.startswith(p): v = v[len(p):].strip(" :.-"); vl = v.lower()
     return v
-
-
-def _normalize_whitespace(value: str) -> str:
-    """Normalize whitespace in value"""
-    return re.sub(r'\s+', ' ', value).strip()
-
-
-def _normalize_address(value: str) -> str:
-    """Normalize address formatting"""
-    v = _normalize_whitespace(value)
-
-    replacements = {
-        r'\bSt\b': 'Street',
-        r'\bAve\b': 'Avenue',
-        r'\bRd\b': 'Road',
-        r'\bBlvd\b': 'Boulevard',
-        r'\bDr\b': 'Drive',
-        r'\bLn\b': 'Lane',
-        r'\bCt\b': 'Court',
-        r'\bCir\b': 'Circle',
-    }
-
-    for pattern, replacement in replacements.items():
-        v = re.sub(pattern, replacement, v, flags=re.I)
-
+def _normalize_address(v: str) -> str:
+    v = _normalize_whitespace(v); replacements = {r'\bSt\b': 'Street', r'\bAve\b': 'Avenue', r'\bRd\b': 'Road', r'\bBlvd\b': 'Boulevard', r'\bDr\b': 'Drive', r'\bLn\b': 'Lane', r'\bCt\b': 'Court', r'\bCir\b': 'Circle'}
+    for p, r in replacements.items(): v = re.sub(p, r, v, flags=re.I)
     return v
+def _normalize_phone(v: str) -> str:
+    d = ''.join(c for c in v if c.isdigit())
+    if len(d) == 10: return f"({d[:3]}) {d[3:6]}-{d[6:]}"
+    elif len(d) == 11 and d[0] == '1': return f"({d[1:4]}) {d[4:7]}-{d[7:]}"
+    return v
+def _is_phone_number(v: str) -> bool: d = ''.join(c for c in v if c.isdigit()); return len(d) == 10 or (len(d) == 11 and d.startswith('1')) or len(d) == 7 or bool(PHONE_RE.search(v))
+def _is_document_reference(v: str) -> bool: v = v.lower().strip(); return bool(re.match(r'^\d+_\d+_\d+$', v)) or bool(re.match(r'^page\s*\d+', v, re.I)) or ('_' in v and sum(c.isdigit() for c in v) > len(v) * 0.6)
+def _is_mortgage_company_address(v: str) -> bool: v = v.lower(); return any(re.search(p, v, re.I) for p in MORTGAGE_PO_BOX_PATTERNS) or (('troy' in v and 'mi' in v and 'box' in v) or '48007' in v)
 
-
-def _normalize_phone(value: str) -> str:
-    """Format phone number consistently"""
-    digits = ''.join(c for c in value if c.isdigit())
-
-    if len(digits) == 10:
-        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-    elif len(digits) == 11 and digits[0] == '1':
-        return f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
-
-    return value
-
-
-def _is_phone_number(value: str) -> bool:
-    """Check if value is a phone number"""
-    digits = ''.join(c for c in value if c.isdigit())
-    
-    # Exactly 10 digits = phone
-    if len(digits) == 10:
-        return True
-    
-    # 11 digits starting with 1 = phone with country code
-    if len(digits) == 11 and digits.startswith('1'):
-        return True
-    
-    # 7 digits = local phone
-    if len(digits) == 7:
-        return True
-    
-    # Has phone formatting
-    if PHONE_RE.search(value):
-        return True
-    
+def _is_section_header_value(v: str) -> bool:
+    if not v: return False
+    v_lower = v.lower().strip()
+    if v_lower in SECTION_TITLES: return True
+    for t in SECTION_TITLES:
+        if v_lower.startswith(t) or t in v_lower: return True
+    if v_lower.endswith(":") and len(v_lower.split()) <= 5: return True
+    if v.isupper() and len(v.split()) >= 3:
+        words = v.split()
+        if any(i in v_lower for i in {'insurance', 'ins', 'company', 'co', 'corporation', 'corp', 'exchange', 'mutual', 'group', 'inc', 'llc', 'ltd'}): return False
+        header_words = {'PAGE', 'SECTION', 'COVERAGE', 'DECLARATIONS', 'NOTICE', 'INFORMATION', 'SUMMARY', 'DETAILS', 'SCHEDULE', 'ENDORSEMENT', 'CONDITIONS', 'PROVISIONS', 'LIMITS', 'POLICY', 'PREMIUM', 'TOTAL', 'SUBTOTAL', 'AMOUNT', 'DATE', 'NUMBER', 'TYPE'}
+        if any(w.upper() in header_words for w in words): return True
+        if len(words) <= 4: return False
+        if not any(c.isdigit() for c in v): return True
     return False
 
+def get_missing_field_reason(field_name: str, raw_text: str) -> str:
+    hints = FIELD_LABEL_HINTS.get(field_name, [field_name.replace("_", " ")])
+    if any(h in raw_text for h in hints): return "Field value not available in the document"
+    return "Field label not found in document"
 
-def _is_document_reference(value: str) -> bool:
-    """Check if value is a document reference code, not actual data"""
-    v = value.lower().strip()
-    
-    # Page references
-    if re.match(r'^\d+_\d+_\d+$', v):  # e.g., "19312_243570_11"
-        return True
-    
-    if re.match(r'^page\s*\d+', v, re.I):
-        return True
-    
-    # Document codes with underscores
-    if '_' in v and sum(c.isdigit() for c in v) > len(v) * 0.6:
-        return True
-    
-    return False
-
-
-def _is_mortgage_company_address(value: str) -> bool:
-    """Check if address belongs to a mortgage company, not the insured"""
-    v = value.lower()
-    
-    for pattern in MORTGAGE_PO_BOX_PATTERNS:
-        if re.search(pattern, v, re.I):
-            return True
-    
-    # Generic mortgage PO Box indicators
-    if 'troy' in v and 'mi' in v and 'box' in v:
-        return True
-    
-    if '48007' in v:  # Troy MI ZIP
-        return True
-    
-    return False
-
+def attach_missing_reasons(validated_fields: Dict, required_fields: List[str], raw_text: str) -> Dict:
+    if not required_fields: return validated_fields
+    for field in required_fields:
+        if field not in validated_fields:
+            validated_fields[field] = {"reason": get_missing_field_reason(field, raw_text)}
+    return validated_fields
 
 # ============================================================
 # VALIDATORS
 # ============================================================
-
 def validate_carrier(value: str) -> Tuple[bool, str, float]:
-    """Validate carrier name"""
-    v = _normalize_whitespace(value)
-    
-    # Strip label prefixes that leaked into the value
-    v = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
-               '', v, flags=re.I).strip()
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    if v.lower() in JUNK_VALUES:
-        return False, v, 0.0
-
-    if len(v) < 5:
-        return False, v, 0.0
-
-    # Block if too long — carrier names are typically < 60 chars
-    # Sentences like "THE INSURANCE AFFORDED BY THIS ENDORSEMENT..." are not carriers
-    if len(v) > 60:
-        return False, v, 0.0
-
-    # Block if starts with common sentence starters
-    if re.match(r'(?i)^(the |this |in |we |you |if |any |all |for |it )', v):
-        # Exception: "The Hartford" etc.
-        if not re.match(r'(?i)^the\s+\w+\s+(insurance|indemnity|casualty|mutual)', v):
-            return False, v, 0.0
-
-    # Clean up common OCR artifacts
-    v_clean = v.replace('*', '').replace('/', '').strip()
-    vl_clean = v_clean.lower()
-
-    # Block known bad carrier patterns (must check before positive matches)
-    for bad in BAD_CARRIER_PATTERNS:
-        if bad in vl_clean:
-            return False, v, 0.0
-
-    # Block agencies/agents/services FIRST (before insurance check)
-    if any(w in vl_clean for w in ('agency', 'agent', 'services', 'producer')):
-        return False, v, 0.0
-
-    # Must contain "insurance" or other carrier-type words
-    # State Farm Fire and Casualty Company, Pacific Indemnity, etc.
-    has_insurance = ('insurance' in vl_clean or 
-                     ' ins ' in vl_clean or 
-                     vl_clean.endswith(' ins') or 
-                     ' ins.' in vl_clean or
-                     ' ins co' in vl_clean or
-                     vl_clean.endswith(' ins co') or
-                     'indemnity' in vl_clean or
-                     'casualty' in vl_clean or
-                     'assurance' in vl_clean or
-                     ('fire' in vl_clean and any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual'))))
-    if not has_insurance:
-        return False, v, 0.0
-
-    # Company type indicator (relaxed - many valid variations)
-    company_types = ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')
-    has_company_type = any(w in vl_clean for w in company_types)
-    
-    # If no company type, still accept if it clearly has "insurance" and is reasonably formatted
-    if not has_company_type:
-        # Must have at least 2 words and insurance
-        words = v_clean.split()
-        if len(words) < 2:
-            return False, v, 0.0
-
+    v = _normalize_whitespace(re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*', '', value, flags=re.I).strip())
+    if _is_section_header_value(v) or v.lower() in JUNK_VALUES or len(v) < 5 or len(v) > 60: return False, v, 0.0
+    if re.match(r'(?i)^(the |this |in |we |you |if |any |all |for |it )', v) and not re.match(r'(?i)^the\s+\w+\s+(insurance|indemnity|casualty|mutual)', v): return False, v, 0.0
+    v_clean = v.replace('*', '').replace('/', '').strip(); vl_clean = v_clean.lower()
+    if any(b in vl_clean for b in BAD_CARRIER_PATTERNS) or any(w in vl_clean for w in ('agency', 'agent', 'services', 'producer')): return False, v, 0.0
+    has_ins = ('insurance' in vl_clean or ' ins ' in vl_clean or vl_clean.endswith(' ins') or ' ins.' in vl_clean or 'indemnity' in vl_clean or 'casualty' in vl_clean or 'assurance' in vl_clean or 'trust' in vl_clean or ('fire' in vl_clean and any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual'))))
+    if not has_ins: return False, v, 0.0
+    if not any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')) and len(v_clean.split()) < 2: return False, v, 0.0
     return True, v_clean.upper(), 0.95
 
-
 def validate_policy_number(value: str) -> Tuple[bool, str, float]:
-    """Validate policy number with strict filtering"""
-    v = value.strip()
-    
-    # Strip leading punctuation/OCR artifacts (e.g. ". 000000" from "Policy Number.")
-    v = re.sub(r'^[.\s:;,]+', '', v).strip()
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    if _is_document_reference(v):
-        return False, v, 0.0
-
-    # Block if contains dates in the value
-    if DATE_RE.search(v):
-        return False, v, 0.0
-
-    # Block garbage patterns with specific keywords
-    if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I):
-        return False, v, 0.0
-    
-    # Block values containing dollar signs
-    if '$' in v:
-        return False, v, 0.0
-    
-    # Block values containing periods followed by digits (looks like dollar amounts)
-    if re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v):
-        return False, v, 0.0
-    
-    # Block state abbreviation + number patterns (like MI48007, NC27102)
-    # These are typically addresses, not policy numbers
-    if re.match(r'^[A-Z]{2}\d{5,}$', v):
-        return False, v, 0.0
-    
-    # Block patterns that look like page references (5+ digits underscore pattern)
-    if re.search(r'\d{5}_\d+', v):
-        return False, v, 0.0
-    
-    # Block very long numeric strings (likely document IDs)
-    digits_only = ''.join(c for c in v if c.isdigit())
-    if len(digits_only) > 18:
-        return False, v, 0.0
-
-    # Block partial phone numbers
-    if re.fullmatch(r"\d{3}[-.\s]?\d{4}", v):
-        return False, v, 0.0
-
-    # Get clean version
+    v = re.sub(r'^[.\s:;,]+', '', value.strip()).strip()
+    if _is_section_header_value(v) or _is_document_reference(v) or DATE_RE.search(v) or '$' in v: return False, v, 0.0
+    if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I): return False, v, 0.0
+    if (re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v)) or re.match(r'^[A-Z]{2}\d{5,}$', v): return False, v, 0.0
+    if re.search(r'\d{5}_\d+', v) or len(''.join(c for c in v if c.isdigit())) > 18 or re.fullmatch(r"\d{3}[-.\s]?\d{4}", v): return False, v, 0.0
     v_clean = v.replace(" ", "").replace("-", "")
-    
-    # Block very short values (less than 6 characters total)
-    if len(v_clean) < 6:
-        return False, v, 0.0
-
-    # Block ZIP codes alone
-    if ZIP_RE.fullmatch(v):
-        return False, v, 0.0
-
-    # Must have minimum digits (at least 5)
-    digit_count = sum(c.isdigit() for c in v)
-    if digit_count < 5:
-        return False, v, 0.0
-
-    # Length check
-    if not (6 <= len(v_clean) <= 30):
-        return False, v, 0.0
-
-    # If purely numeric, allow 6+ digits
-    if v_clean.isdigit():
-        if len(v_clean) < 6:
-            return False, v, 0.0
-        
-    # If contains "PolicyNumber:" prefix, strip it
+    if len(v_clean) < 6 or ZIP_RE.fullmatch(v) or sum(c.isdigit() for c in v) < 5 or not (6 <= len(v_clean) <= 30): return False, v, 0.0
+    if v_clean.isdigit() and len(v_clean) < 6: return False, v, 0.0
     if ':' in v:
         parts = v.split(':', 1)
-        label = parts[0].lower()
-        if 'policy' in label and 'number' in label:
-            v = parts[1].strip()
-
+        if 'policy' in parts[0].lower() and 'number' in parts[0].lower(): v = parts[1].strip()
     return True, v, 0.95
-
 
 def validate_loan_number(value: str) -> Tuple[bool, str, float]:
-    """Validate loan number"""
     v = value.strip()
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    # N/A is a valid loan number indicator (no mortgage/loan on the policy)
-    if re.match(r'^n/?a$', v, re.I):
-        return True, "N/A", 0.90
-
-    if v.lower() in JUNK_VALUES:
-        return False, v, 0.0
-
-    if _is_document_reference(v):
-        return False, v, 0.0
-
-    # Extract digits
+    if _is_section_header_value(v): return False, v, 0.0
+    if re.match(r'^n/?a$', v, re.I): return True, "N/A", 0.90
+    if v.lower() in JUNK_VALUES or _is_document_reference(v) or DATE_RE.search(v): return False, v, 0.0
     digits = ''.join(c for c in v if c.isdigit())
-
-    # Loan numbers are typically 7-12 digits
-    if len(digits) < 7 or len(digits) > 12:
-        return False, v, 0.0
-    
-    # Block 13+ digit pure numbers (barcode artifacts)
-    if len(digits) >= 13:
-        return False, v, 0.0
-
-    # Block obvious page reference patterns (underscore separated)
-    if re.match(r'^\d{5}_\d+', v):
-        return False, v, 0.0
-
-    # Block date patterns
-    if DATE_RE.search(v):
-        return False, v, 0.0
-    
-    # Block very long sequences of zeros (padding patterns)
-    # But allow some zeros as they're common in real loan numbers
-    if '000000' in digits:  # 6+ consecutive zeros is suspicious
-        return False, v, 0.0
-    
-    # Block if more than 60% zeros
-    zero_count = digits.count('0')
-    if len(digits) > 0 and zero_count > len(digits) * 0.6:
-        return False, v, 0.0
-
+    if not (7 <= len(digits) <= 12) or len(digits) >= 13 or re.match(r'^\d{5}_\d+', v) or '000000' in digits: return False, v, 0.0
+    if len(digits) > 0 and digits.count('0') > len(digits) * 0.6: return False, v, 0.0
     return True, digits, 0.95
 
-
 def validate_name(value: str) -> Tuple[bool, str, float]:
-    """
-    Validate person/company name - MAJOR IMPROVEMENTS
-    Block marketing slogans, product names, and document text
-    """
     v = _normalize_whitespace(_strip_prefixes(value))
-
-    if not v or len(v) < 2:
-        return False, v, 0.0
-
-    # Strip single-letter prefixes that are OCR/barcode artifacts
-    # e.g., "L JOHN CRENSHAW" → "JOHN CRENSHAW"
-    # But keep legitimate initials like "J. SMITH" or "A BABCOCK"
+    if not v or len(v) < 2: return False, v, 0.0
     words = v.split()
-    if len(words) >= 3 and len(words[0]) == 1 and words[0].isalpha():
-        # Only strip if the single letter doesn't look like a middle initial
-        # (middle initials come AFTER first name, not before)
-        # Check: is words[1] a normal first name (2+ chars)?
-        if len(words[1]) >= 2:
-            v = " ".join(words[1:])
-            words = v.split()
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    # Allow colons only if they're separating name parts (e.g., "Last, First")
-    if v.count(":") > 0:
-        return False, v, 0.0
-
+    if len(words) >= 3 and len(words[0]) == 1 and words[0].isalpha() and len(words[1]) >= 2: v = " ".join(words[1:])
+    if _is_section_header_value(v) or v.count(":") > 0: return False, v, 0.0
     vl = v.lower()
-
-    # Block marketing slogans
-    for slogan in MARKETING_SLOGANS:
-        if slogan in vl:
-            return False, v, 0.0
-
-    # Block product names
-    for product in PRODUCT_NAMES:
-        if product in vl:
-            return False, v, 0.0
-
-    # Block company names that shouldn't be insured names
-    for company in BAD_INSURED_COMPANY_NAMES:
-        if company in vl:
-            return False, v, 0.0
-    
-    # Block known carrier names that appear as text (not actual insured names)
-    # This prevents carriers from being extracted as insured names
-    CARRIER_INDICATORS = {
-        "aegis", "allstate", "state farm", "geico", 
-        "progressive", "travelers", "liberty mutual", "farmers",
-        "citizens", "universal", "federated", "nationwide",
-        "american family", "usaa", "auto-owners", "erie",
-        "encompass", "safeco", "hanover", "hartford",
-        "insurance company", "insurance co", 
-        "insurance exchange", "assurance company",
-        "property insurance", "casualty insurance",
-    }
-    # Check if the entire value is a carrier name
-    if any(indicator in vl for indicator in CARRIER_INDICATORS):
-        # Allow if it's clearly a person's name that happens to contain a word
-        # (e.g., "John Progressive" would be allowed, but "Aegis" alone would not)
-        words = vl.split()
-        # If only 1-2 words and matches carrier pattern, reject
-        if len(words) <= 2:
-            return False, v, 0.0
-        # If 3+ words but starts/ends with carrier indicator, likely still a carrier
-        if words[0] in CARRIER_INDICATORS or words[-1] in CARRIER_INDICATORS:
-            return False, v, 0.0
-
-    # Block bad name phrases
-    for phrase in BAD_NAME_PHRASES:
-        if phrase in vl:
-            return False, v, 0.0
-
-    # Block if starts with certain keywords
-    bad_starts = (
-        "policy", "coverage", "premium", "billing", "copy",
-        "page", "section", "office", "message", "declarations",
-        "effective", "expiration", "total", "subtotal", "the ",
-        "this ", "our ", "your ", "and ", "or ", "for ",
-    )
-    if any(vl.startswith(w) for w in bad_starts):
-        return False, v, 0.0
-
-    # Block if ends with certain patterns
-    bad_ends = (
-        " copy", " page", " info", " information", " type",
-        " period", " date", " number", " account",
-    )
-    if any(vl.endswith(w) for w in bad_ends):
-        return False, v, 0.0
-
-    # Block values with weird characters (& is allowed for joint names like "DARRELL & KIM")
-    if re.search(r'[$%*#@!]', v):
-        return False, v, 0.0
-
-    # Block document reference patterns
-    if _is_document_reference(v):
-        return False, v, 0.0
-
-    # Block if contains phone number
-    if _is_phone_number(v):
-        return False, v, 0.0
-
-    # Allow digits only if entity suffix present
+    if any(s in vl for s in MARKETING_SLOGANS) or any(p in vl for p in PRODUCT_NAMES) or any(c in vl for c in BAD_INSURED_COMPANY_NAMES): return False, v, 0.0
+    CARRIER_INDICATORS = {"aegis", "allstate", "state farm", "geico", "progressive", "travelers", "liberty mutual", "farmers", "citizens", "universal", "federated", "nationwide", "american family", "usaa", "auto-owners", "erie", "encompass", "safeco", "hanover", "hartford", "insurance company", "insurance co", "insurance exchange", "assurance company", "property insurance", "casualty insurance"}
+    if any(i in vl for i in CARRIER_INDICATORS):
+        if len(words) <= 2 or words[0] in CARRIER_INDICATORS or words[-1] in CARRIER_INDICATORS: return False, v, 0.0
+    if any(p in vl for p in BAD_NAME_PHRASES) or re.search(r'[$%*#@!]', v) or _is_document_reference(v) or _is_phone_number(v): return False, v, 0.0
+    bad_starts = ("policy", "coverage", "premium", "billing", "copy", "page", "section", "office", "message", "declarations", "effective", "expiration", "total", "subtotal", "the ", "this ", "our ", "your ", "and ", "or ", "for ")
+    if any(vl.startswith(w) for w in bad_starts): return False, v, 0.0
+    bad_ends = (" copy", " page", " info", " information", " type", " period", " date", " number", " account")
+    if any(vl.endswith(w) for w in bad_ends): return False, v, 0.0
     has_entity = any(w in vl for w in ["llc", "inc", "corp", "company", "trust", "ltd", "dba"])
-    if any(c.isdigit() for c in v) and not has_entity:
-        return False, v, 0.0
-
-    # Word count check
-    words = [w for w in v.split() if w and len(w) > 0]
-    if has_entity:
-        if not (2 <= len(words) <= 12):
-            return False, v, 0.0
-    else:
-        if not (2 <= len(words) <= 8):
-            return False, v, 0.0
-
-    # At least some words should be capitalized (or all caps)
-    caps = sum(1 for w in words if w and (w[0].isupper() or w.isupper()))
-    if caps < 1:
-        return False, v, 0.0
-
+    if any(c.isdigit() for c in v) and not has_entity: return False, v, 0.0
+    words = [w for w in v.split() if w]; limit = 12 if has_entity else 8
+    if not (2 <= len(words) <= limit): return False, v, 0.0
+    if sum(1 for w in words if w and (w[0].isupper() or w.isupper())) < 1: return False, v, 0.0
     return True, v, 0.95
 
+def validate_mortgage_company(value: str) -> Tuple[bool, str, float]:
+    v = _normalize_whitespace(_strip_prefixes(value))
+    if not v or len(v) < 3: return False, v, 0.0
+    vl = v.lower()
+    noise = ("copy named insured", "boss payee", "payee mortgagee listed", "page ", "section ", "coverage ", "premium ", "deductible", "declarations", "notification", "notice of")
+    if any(n in vl for n in noise): return False, v, 0.0
+    if not (1 <= len(v.split()) <= 12) or re.search(r'[$%*#@!]', v) or _is_phone_number(v): return False, v, 0.0
+    if not any(c.isupper() for c in v): return False, v, 0.0
+    return True, v, 0.95
 
 def validate_address(value: str) -> Tuple[bool, str, float]:
-    """
-    Validate address - IMPROVED VERSION
-    Distinguish insured addresses from mortgage company addresses
-    """
     v = _normalize_whitespace(_strip_prefixes(value))
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    if v.lower() in JUNK_VALUES:
-        return False, v, 0.0
-
-    if not v or len(v) < 5:
-        return False, v, 0.0
-
-    if v.endswith(":"):
-        return False, v, 0.0
-
+    if _is_section_header_value(v) or v.lower() in JUNK_VALUES or not v or len(v) < 5 or v.endswith(":"): return False, v, 0.0
     vl = v.lower()
-
-    # Block non-address content
-    bad_patterns = [
-        "policy period", "beginning", "through", "standard time",
-        "coverage", "summary", "declarations", "effective date",
-        "office use", "message", "mortgagee", "endorsement",
-        "premium", "deductible", "page ", " of ", "building type",
-        "construction", "roof", "single family", "owner occupied",
-        "ph 87", "_8s$", "$$", "##",  # OCR garbage patterns
-        "exclusion", "poisoning", "liability", "inflation",
-        "protection", "provisions", "amendment", "special form",
-        "fungi", "ordinance", "personal property", "loss payee",
-    ]
-    if any(kw in vl for kw in bad_patterns):
-        return False, v, 0.0
-    
-    # Block lines that contain date patterns like "03/93" or "01/77" (endorsement codes)
-    if re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v):
-        return False, v, 0.0
-
-    # Block document references
-    if _is_document_reference(v):
-        return False, v, 0.0
-
-    # Block mortgage company PO Box addresses
-    # (These often get captured instead of the actual insured address)
-    if _is_mortgage_company_address(v):
-        return False, v, 0.0
-    
-    # Block short PO Box addresses that are likely mortgage company addresses
+    bad_patterns = ["policy period", "beginning", "through", "standard time", "coverage", "summary", "declarations", "effective date", "office use", "message", "mortgagee", "endorsement", "premium", "deductible", "page ", " of ", "building type", "construction", "roof", "single family", "owner occupied", "ph 87", "_8s$", "$$", "##", "exclusion", "poisoning", "liability", "inflation", "protection", "provisions", "amendment", "special form", "fungi", "ordinance", "personal property", "loss payee"]
+    if any(k in vl for k in bad_patterns) or re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v): return False, v, 0.0
+    if _is_document_reference(v) or _is_mortgage_company_address(v): return False, v, 0.0
     if PO_BOX_RE.search(v):
-        # If it's JUST a PO Box with no city/state, be suspicious
-        words = v.split()
-        if len(words) <= 4:  # "PO BOX 7083" - too short, likely mortgage
-            # Check if it has a city/state
-            if not re.search(r'\b[A-Z]{2}\s*\d{5}', v):
-                return False, v, 0.0
+        if len(v.split()) <= 4 and not re.search(r'\b[A-Z]{2}\s*\d{5}', v): return False, v, 0.0
         return True, _normalize_address(v), 0.90
-
-    # Street address with number and street type
-    street_pattern = re.compile(
-        r'\d+\s+.+?\b(' + '|'.join(STREET_TYPES) + r')\b',
-        re.I
-    )
-    if street_pattern.search(v):
-        return True, _normalize_address(v), 0.95
-
-    # Has state abbreviation + ZIP
-    if re.search(r'\b[A-Z]{2}\s*\d{5}(-\d{4})?\b', v):
-        return True, _normalize_address(v), 0.92
-
-    # Has street number at start
-    if re.match(r'^\d+\s+\w', v):
-        word_count = len(v.split())
-        if word_count >= 3:
-            return True, _normalize_address(v), 0.88
-
-    # Fallback: has numbers and reasonable length
-    has_number = bool(re.search(r'\d+', v))
-    word_count = len(v.split())
-    if has_number and word_count >= 4:
-        return True, _normalize_address(v), 0.80
-
+    if re.search(r'\d+\s+.+?\b(' + '|'.join(STREET_TYPES) + r')\b', v, re.I): return True, _normalize_address(v), 0.95
+    if re.search(r'\b[A-Z]{2}\s*\d{5}(-\d{4})?\b', v): return True, _normalize_address(v), 0.92
+    if re.match(r'^\d+\s+\w', v) and len(v.split()) >= 3: return True, _normalize_address(v), 0.88
+    if bool(re.search(r'\d+', v)) and len(v.split()) >= 4: return True, _normalize_address(v), 0.80
     return False, v, 0.0
-
 
 def validate_date(value: str) -> Tuple[bool, str, float]:
-    """Validate date value"""
     v = _normalize_whitespace(_strip_prefixes(value))
-
-    if _is_section_header_value(v):
-        return False, v, 0.0
-
-    # Try various date formats
-    date_formats = [
-        "%B %d, %Y",      # January 15, 2024
-        "%b %d, %Y",      # Jan 15, 2024
-        "%B %d %Y",       # January 15 2024
-        "%b %d %Y",       # Jan 15 2024 (no comma)
-        "%b %d, %Y",      # Jan 15, 2024
-        "%m/%d/%Y",       # 01/15/2024
-        "%m-%d-%Y",       # 01-15-2024
-        "%m/%d/%y",       # 01/15/24
-        "%m-%d-%y",       # 01-15-24
-        "%Y-%m-%d",       # 2024-01-15
-        "%d %B %Y",       # 15 January 2024
-        "%d %b %Y",       # 15 Jan 2024
-    ]
-
-    # Normalize: title-case the month abbreviation so strptime can parse it
-    # e.g., "NOV 09 2021" → "Nov 09 2021"
-    v_norm = v
-    m_abbrev = re.match(r'^([A-Z]{3})\s+(\d{1,2}),?\s+(\d{4})$', v)
-    if m_abbrev:
-        v_norm = f"{m_abbrev.group(1).capitalize()} {m_abbrev.group(2)} {m_abbrev.group(3)}"
-
-    for fmt in date_formats:
+    if _is_section_header_value(v): return False, v, 0.0
+    m = re.match(r'^([A-Z]{3})\s+(\d{1,2}),?\s+(\d{4})$', v)
+    if m: v = f"{m.group(1).capitalize()} {m.group(2)} {m.group(3)}"
+    formats = ["%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%b %d, %Y", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y"]
+    for fmt in formats:
         try:
-            dt = datetime.strptime(v_norm, fmt)
-            if 1990 <= dt.year <= 2050:
-                return True, v, 0.95
-        except ValueError:
-            continue
-
-    # Try partial match
-    m = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', v)
-    if m:
-        return True, m.group(1), 0.90
-
-    m = re.search(r'([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})', v)
-    if m:
-        return True, m.group(1), 0.90
-
+            if 1990 <= datetime.strptime(v, fmt).year <= 2050: return True, v, 0.95
+        except: continue
+    m = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', v) or re.search(r'([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})', v)
+    if m: return True, m.group(1), 0.90
     return False, v, 0.0
 
-
 def validate_money(value: str) -> Tuple[bool, str, float]:
-    """Validate monetary value"""
-    if _is_section_header_value(value):
-        return False, value, 0.0
-
+    if _is_section_header_value(value): return False, value, 0.0
     try:
-        clean = value.replace('$', '').replace(',', '').strip()
-        amt = float(clean)
-
-        if 1 <= amt <= 10_000_000:
-            formatted = f"${amt:,.2f}".replace('.00', '')
-            return True, formatted, 0.92
-    except Exception:
-        pass
-
+        amt = float(value.replace('$', '').replace(',', '').strip())
+        if 1 <= amt <= 10_000_000: return True, f"${amt:,.2f}".replace('.00', ''), 0.92
+    except: pass
     return False, value, 0.0
-
 
 def validate_phone(value: str) -> Tuple[bool, str, float]:
-    """Validate phone number"""
-    if _is_section_header_value(value):
-        return False, value, 0.0
-
-    digits = ''.join(c for c in value if c.isdigit())
-
-    if len(digits) == 10:
-        normalized = _normalize_phone(value)
-        return True, normalized, 0.95
-    elif len(digits) == 11 and digits[0] == '1':
-        normalized = _normalize_phone(value)
-        return True, normalized, 0.95
-
+    if _is_section_header_value(value): return False, value, 0.0
+    d = ''.join(c for c in value if c.isdigit())
+    if len(d) == 10 or (len(d) == 11 and d[0] == '1'): return True, _normalize_phone(value), 0.95
     return False, value, 0.0
 
-
-# ============================================================
-# CROSS-VALIDATION
-# ============================================================
-
-def _cross_validate(validated: Dict) -> Dict:
-    """Cross-validate related fields for consistency"""
-
-    # Boost confidence if mailing == property
-    if "mailing_address" in validated and "property_address" in validated:
-        mailing = validated["mailing_address"]["value"]
-        property_addr = validated["property_address"]["value"]
-
-        mailing_norm = mailing.lower().replace(',', '').replace('.', '')
-        property_norm = property_addr.lower().replace(',', '').replace('.', '')
-
-        if mailing_norm == property_norm:
-            validated["mailing_address"]["confidence"] = min(1.0, validated["mailing_address"]["confidence"] * 1.1)
-            validated["property_address"]["confidence"] = min(1.0, validated["property_address"]["confidence"] * 1.1)
-            validated["mailing_address"]["note"] = "Same as property address"
-
-    # Boost confidence if effective < expiration
-    if "effective_date" in validated and "expiration_date" in validated:
+def _cross_validate(val: Dict) -> Dict:
+    if "mailing_address" in val and "property_address" in val:
+        if val["mailing_address"]["value"].lower().replace(',', '').replace('.', '') == val["property_address"]["value"].lower().replace(',', '').replace('.', ''):
+            val["mailing_address"]["confidence"] = min(1.0, val["mailing_address"]["confidence"] * 1.1)
+            val["property_address"]["confidence"] = min(1.0, val["property_address"]["confidence"] * 1.1)
+            val["mailing_address"]["note"] = "Same as property address"
+    if "effective_date" in val and "expiration_date" in val:
         try:
-            eff = validated["effective_date"]["value"]
-            exp = validated["expiration_date"]["value"]
-
+            eff = val["effective_date"]["value"]; exp = val["expiration_date"]["value"]
             for fmt in ["%B %d, %Y", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"]:
                 try:
-                    eff_dt = datetime.strptime(eff, fmt)
-                    exp_dt = datetime.strptime(exp, fmt)
-
-                    if eff_dt < exp_dt:
-                        validated["effective_date"]["confidence"] = min(1.0, validated["effective_date"]["confidence"] * 1.05)
-                        validated["expiration_date"]["confidence"] = min(1.0, validated["expiration_date"]["confidence"] * 1.05)
+                    if datetime.strptime(eff, fmt) < datetime.strptime(exp, fmt):
+                        val["effective_date"]["confidence"] = min(1.0, val["effective_date"]["confidence"] * 1.05)
+                        val["expiration_date"]["confidence"] = min(1.0, val["expiration_date"]["confidence"] * 1.05)
                     break
-                except:
-                    continue
-        except:
-            pass
-
-    return validated
-
+                except: continue
+        except: pass
+    return val
 
 # ============================================================
-# MAIN VALIDATION
+# MAIN ENTRY POINT
 # ============================================================
-
-def validate_and_arbitrate(
-    merged_fields: Dict,
-    ocr_confidence: float,
-    stage_breakdown: Dict,
-    doc_type: str = "UNK",
-    policy_type: str = "UNK",
-) -> Tuple[Dict, float]:
-    """
-    Main validation entry point
-    Validates and filters extracted fields based on document + policy type
-    
-    Args:
-        merged_fields: Merged fields from all extraction stages
-        ocr_confidence: OCR confidence score
-        stage_breakdown: Breakdown of fields by stage
-        doc_type: Document type (INV, RNW, CAN, DOI, COI, BIN, RNS, OTH, UNK)
-        policy_type: Policy type (HAZ, HO, FIR, FLD, BREQ, NPAY, etc.)
-    
-    Returns:
-        Tuple of (validated_fields, final_confidence)
-    """
-    validated = {}
-    scores = []
-
+def validate_and_arbitrate(merged_fields: Dict, ocr_confidence: float, stage_breakdown: Dict, doc_type: str = "UNK", policy_type: str = "UNK", lines: List[str] = []) -> Tuple[Dict, float]:
+    validated = {}; scores = []
     validators = {
-        "carrier_name": validate_carrier,
-        "policy_number": validate_policy_number,
-        "loan_number": validate_loan_number,
-        "insured_name": validate_name,
-        "agent_name": validate_name,
-        "mortgage_company": validate_name,
-        "property_address": validate_address,
-        "mailing_address": validate_address,
-        "effective_date": validate_date,
-        "expiration_date": validate_date,
-        "cancellation_date": validate_date,
-        "total_premium": validate_money,
-        "balance_due": validate_money,
-        "issue_date": validate_date,
-        "deductible": validate_money,
-        "agent_phone": validate_phone,
+        "carrier_name": validate_carrier, "policy_number": validate_policy_number, "loan_number": validate_loan_number,
+        "insured_name": validate_name, "agent_name": validate_name, "mortgage_company": validate_mortgage_company,
+        "property_address": validate_address, "mailing_address": validate_address, "effective_date": validate_date,
+        "expiration_date": validate_date, "cancellation_date": validate_date, "total_premium": validate_money,
+        "balance_due": validate_money, "issue_date": validate_date, "deductible": validate_money, "agent_phone": validate_phone
     }
-
+    
     for field, data in merged_fields.items():
-        if not isinstance(data, dict):
-            continue
-
-        value = data.get("value")
-        confidence = data.get("confidence", 0.0)
-        source = data.get("source", "")
-
-        # GLiNER is a last-resort AI fallback; its native scores (0.40-0.80)
-        # are not directly comparable to rule-based confidence scores.
-        # Use a lower floor so valid GLiNER extractions are not discarded.
-        if source == "stage2_5_gliner":
-            floor = 0.40
-        else:
-            floor = CONFIDENCE_FLOORS.get(field, DEFAULT_FLOOR)
-
-        if confidence < floor or not value:
-            continue
-
-        # Apply field-specific validation
+        if not isinstance(data, dict): continue
+        value = data.get("value"); confidence = data.get("confidence", 0.0); source = data.get("source", "")
+        floor = 0.40 if source == "stage2_5_gliner" else CONFIDENCE_FLOORS.get(field, DEFAULT_FLOOR)
+        if confidence < floor or not value: continue
         if field in validators:
             ok, norm_value, score = validators[field](value)
-            if not ok:
-                continue
-
-            data["value"] = norm_value
-            data["validation_score"] = score
-            scores.append(score)
-        else:
-            # Pass through unknown fields
-            scores.append(0.80)
-
+            if not ok: continue
+            data["value"] = norm_value; data["validation_score"] = score; scores.append(score)
+        else: scores.append(0.80)
         validated[field] = data
 
-    # Cross-validate related fields
     validated = _cross_validate(validated)
     
-    # Apply field filtering based on document + policy type business rules
-    # This restricts which fields are allowed for certain doc+policy combinations
-    validated = filter_allowed_fields(validated, doc_type, policy_type)
+    # Defaults and Filtering
+    default_fields = list(validators.keys()) + ["remit_info", "third_party_removed", "third_party_cancellation_date", "cancellation_reason", "cancellation_effective_date"]
+    allowed = ALLOWED_FIELDS_BY_DOC_POLICY.get((doc_type, policy_type), default_fields)
+    validated = {f: d for f, d in validated.items() if f in allowed}
+    
+    # Missing Reasons
+    raw_text = " ".join(lines).lower() if lines else ""
+    validated = attach_missing_reasons(validated, allowed, raw_text)
 
-    # Calculate final confidence
-    if scores:
-        avg_validation_score = sum(scores) / len(scores)
-        final_confidence = round(
-            avg_validation_score * 0.6 + ocr_confidence * 0.4,
-            3,
-        )
-    else:
-        final_confidence = round(ocr_confidence * 0.4, 3)
-
-    return validated, final_confidence
-
+    final_conf = round(sum(scores)/len(scores)*0.6 + ocr_confidence*0.4, 3) if scores else round(ocr_confidence*0.4, 3)
+    return validated, final_conf
 
 def validate_output(structured: Dict, confidence: float):
-    """Backward compatible wrapper"""
     return validate_and_arbitrate(structured, confidence, {"stage1": structured})

@@ -691,6 +691,7 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             },
             doc_type=routing.doc_type,
             policy_type=routing.policy_type,
+            lines=lines,
         )
 
         if debug:
