@@ -686,7 +686,7 @@ def _extract_mortgage_isaoa(lines: List[str]) -> Optional[Dict]:
 
 
 def _extract_cancel_reason_kw(lines: List[str]) -> Optional[Dict]:
-    """Infer cancellation reason from keywords."""
+    """Infer cancellation reason from keywords in text."""
     for line in lines:
         ll = line.lower()
         if "non-payment" in ll or "nonpayment" in ll or "non pay" in ll:
@@ -701,7 +701,8 @@ def _extract_cancel_reason_kw(lines: List[str]) -> Optional[Dict]:
             return _r("Building sold/removed/destroyed", "sc_cancel_kw", 0.78)
         if "removed, destroyed" in ll or "removed or destroyed" in ll:
             return _r("Building sold/removed/destroyed", "sc_cancel_kw", 0.78)
-        if "customer initiated" in ll:
+        # OCR typo: "tiitated" = "initiated"
+        if "customer initiated" in ll or "customer tiitated" in ll:
             return _r("Cancellation Customer Initiated", "sc_cancel_kw", 0.78)
         if "premium payment has not been received" in ll:
             return _r("Non-payment of premium", "sc_cancel_kw", 0.78)
@@ -709,6 +710,12 @@ def _extract_cancel_reason_kw(lines: List[str]) -> Optional[Dict]:
             return _r("Insured - Non Pay", "sc_cancel_kw", 0.78)
         if "no longer required by lender" in ll:
             return _r("No longer required by lender", "sc_cancel_kw", 0.78)
+        # Flood CAN: "no longer meets the definition of an eligible building"
+        if "no longer meets the definition" in ll:
+            return _r("Building sold/removed/destroyed", "sc_cancel_kw", 0.78)
+        # "cancelled at the time and date shown above" — generic, AmFam
+        if "cancelled at the time and date shown above" in ll:
+            return _r("Cancellation per notice", "sc_cancel_kw", 0.72)
     return None
 
 

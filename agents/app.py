@@ -392,9 +392,15 @@ def format_all_fields_as_json(fields, allowed=None):
     for k, v in fields.items():
         if allowed and k not in allowed:
             continue
-        val = v.get("value") if isinstance(v, dict) else v
-        if val:
-            clean[prettify(k)] = str(val)
+        if isinstance(v, dict):
+            val = v.get("value")
+            reason = v.get("reason")
+            if val:
+                clean[prettify(k)] = str(val)
+            elif reason:
+                clean[prettify(k)] = f"[Not extracted] {reason}"
+        elif v:
+            clean[prettify(k)] = str(v)
     return json.dumps(clean, indent=2, ensure_ascii=False)
 
 def copy_button_js(text_to_copy, button_label="📋 Copy to Clipboard", key="copy_btn"):
@@ -583,6 +589,8 @@ def render_clickable_summary(seg, fields_with_bbox, file_name, num_pages):
                     args=(fn,),
                 )
         for fn in failed:
+            reason = fields.get(fn, {}).get("reason", "")
+            reason_short = reason if reason else "Not extracted"
             if field_has_bbox(fn, fields_with_bbox):
                 st.button(
                     f"🔴 {prettify(fn)} ",
@@ -591,8 +599,13 @@ def render_clickable_summary(seg, fields_with_bbox, file_name, num_pages):
                     on_click=on_field_click,
                     args=(fn,),
                 )
+                if reason:
+                    st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;ℹ️ _{reason}_")
             else:
-                st.markdown(f"🔴 {prettify(fn)} — not extracted")
+                st.markdown(
+                    f"🔴 {prettify(fn)}"
+                )
+                st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;ℹ️ _{reason_short}_")
     with r:
         if (len(perfect) + len(partial) + len(failed)) > 0:
             fig, ax = plt.subplots(figsize=(4, 4))
