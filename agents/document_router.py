@@ -1,3 +1,46 @@
+"""
+Document Router - CLEAN ARCHITECTURE VERSION
+Classification, Routing, DTE & LORH Extraction
+
+CLEAN SEPARATION:
+- document_type: Structural (CAN, DOI, RNW, INV, COI, BIN, RNS, OTH ) from document_classifier
+- policy_type: Coverage OR cancellation subtype (HO, FIR, BREQ, NRNW, NPAY, UNWR, CEL...) from policy_classifier
+- Routing: Based on document_type only (policy_type used for field selection)
+
+IMPORTANT: 
+- TPN (Third Party Notice) is NOT a document type - it maps to CAN (if termination) or COI (if notification)
+- BREQ/BRQ (Borrower Request) is NOT a document type - it's a policy subtype (cancellation reason)
+- NRNW (Non-Renewal) is NOT a document type - it's a policy subtype (cancellation reason)
+
+This file contains THREE concerns that belong together because they
+are all driven by document type:
+
+  1. ROUTING   — classify doc → select ONE primary approach
+  2. DTE       — Direct Template Extraction (for CAN, DOI, EDI)
+  3. LORH      — Lightweight OCR Result Heuristic (for trivial docs)
+
+Routing Table:
+┌─────────────────────┬──────────────────────────────────────────────────────┐
+│ Approach            │ Best Suited Document Types                          │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ SARDE               │ Renewals, policy changes, amended declarations      │
+│ SARDE + LATE        │ Renewals w/ coverage/premium tables (HO,FIR,FLD…)   │
+│ SC → SARDE → LATE   │ Fax (PQ) packets, mixed multi-document files        │
+│ DTE                 │ Cancellations, interest removals, EDI               │
+│ SC+TE → DTE         │ Certificates, third-party notices, binders          │
+│ SC+TE + LATE        │ Invoices with transaction tables                    │
+│ SC+TE               │ Simple invoices, flood cancellations                │
+│ LORH                │ Very simple, single-page invoices/notices           │
+└─────────────────────┴──────────────────────────────────────────────────────┘
+
+Agent mapping:
+  SARDE → stage1_deterministic_agent.extract_fields
+  SC+TE → stage2_semantic_agent.extract_with_ner (calls GLiNER internally)
+  LATE  → stage3_layout_agent.extract_with_layoutxlm
+  DTE   → THIS FILE: extract_dte()
+  LORH  → THIS FILE: extract_lorh()
+"""
+
 from enum import Enum
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -27,7 +70,7 @@ class Approach(Enum):
 
 ALLOWED_DOC_TYPES = {
     "BIN", "CAN", "OTH", "RNW",
-    "RNS", "INV", "DOI", "COI", 
+    "RNS", "INV", "DOI", "COI" 
 }
 
 # ============================================================
@@ -79,7 +122,7 @@ REQUIRED_FIELDS: Dict[str, List[str]] = {
              "effective_date", "expiration_date"],
     "BIN":  ["carrier_name", "policy_number", "insured_name",
              "effective_date"],
-    "OTH":  ["policy_number"],
+    "OTH":  ["policy_number"], 
 }
 
 OPTIONAL_FIELDS: Dict[str, List[str]] = {
@@ -95,13 +138,13 @@ OPTIONAL_FIELDS: Dict[str, List[str]] = {
     "RNS":  [],
     "BIN":  ["expiration_date", "property_address"],
     "OTH":  ["insured_name", "carrier_name", "property_address",
-             "loan_number"],
+             "loan_number"], 
 }
 
 # Policy types with coverage/premium tables → triggers + LATE
 TABLE_POLICY_TYPES = {
     "HO", "HO3", "HO6", "FIR", "FLD", "HAZ", "DP3", "WND", "AUTO", "ERQ", "LL", "UO",
-    "NRNW", "BREQ", "NPAY", "UNWR", "CEL", 
+    "NRNW", "BREQ", "NPAY", "UNWR", "CEL" 
 }
 
 # ============================================================
@@ -626,22 +669,10 @@ def classify_doc_type(lines: List[str]) -> str:
             return "DOI"
 
     # OCR-robust: garbled TPN detection
-    # "third party" + "terminat"/"termin" + "interest" = likely DOI
-    # NOTE: "notice" removed from trigger keywords — it is too generic and
-    # falsely matches cancellation notices that mention "third party interest"
-    # as a column header (e.g. "Cancellation date for third party interest").
-    # Also guarded: skip if strong CAN signals are present, since a real TPN
-    # doc would not contain "cancellation notice" or "cancellation date".
-    if ("third party" in full
+    # "third party" + "terminat" + "interest" = likely DOI
+    if ("third party" in full 
         and "interest" in full
-        and any(k in full for k in ("terminat", "termin"))
-        and not any(k in full for k in (
-            "cancellation notice",
-            "notice of cancellation",
-            "cancellation date",
-            "will be cancelled",
-            "policy will be cancelled",
-        ))):
+        and any(k in full for k in ("terminat", "termin", "notice"))):
         has_policy_terminate = bool(re.search(
             r"terminate this policy effective[:\s]*\d", full))
         if not has_policy_terminate:
@@ -1257,10 +1288,10 @@ def classify_policy_type(lines: List[str]) -> str:
         return "LL"
     if "dp3" in text or "dp-3" in text:
         return "DP3"
-    # HO — Manufactured home maps to HAZ, not HO
+    # HO — Manufactured home
     if any(k in full for k in ("manufactured home", "mobile home", "mobilehome",
                                 "policy type: manufactured home")):
-        return "HAZ"
+        return "HO"
     if any(k in full for k in ("homeowner", "ho-3", "ho3", "home protection",
                                 "homeowners pol", "homeowner pol", "homesaver")):
         return "HO"
@@ -2554,3 +2585,5 @@ def extract_lorh(lines: List[str]) -> Dict[str, Dict]:
         if "expiration_date" not in out and len(all_dates) >= 2:
             out["expiration_date"] = _candidate(
                 all_dates[1], "lorh_exp_scan", 0.80)
+
+    return out
