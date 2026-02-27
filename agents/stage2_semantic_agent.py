@@ -47,11 +47,13 @@ def extract_with_ner(
 # Modes: inline, next, inline_or_next, date_inline, dollar_inline, address_block
 
 _POLICY_NUMBER_LABELS = [
-    (r"(?i)(?:dwelling\s+(?:fire\s+)?)?policy\s*(?:number|no|#|num)\s*:?", "inline_or_next"),
+    (r"(?i)(?:dwelling\s+(?:fire\s+)?)?policy\s*(?:number|no\.?|#|num)\.?\s*:?", "inline_or_next"),
     (r"(?i)^policy\s*:", "inline"),
-    (r"(?i)nfip\s+policy\s*(?:number|no|#)\s*:", "inline"),
+    (r"(?i)nfip\s+policy\s*(?:number|no\.?|#)\.?\s*:", "inline"),
     # Nationwide: "DWELLING FIRE POLICY NUMBER" followed by "DPC 0076173896-1"
     (r"(?i)dwelling\s+fire\s+policy\s+number\s*:?", "inline_or_next"),
+    # Nationwide/AMCO: "POLICY NO.:" (period after NO before colon)
+    (r"(?i)policy\s+no\.\s*:", "inline_or_next"),
 ]
 _POLICY_NUMBER_SKIP = re.compile(
     r"(?i)(?:write|please|include|allow|change\s+request|refer\s+to|"
@@ -101,6 +103,8 @@ _EXP_DATE_LABELS = [
     (r"(?i)expir(?:ation|es|ing)?\s*(?:date)?\s*:", "date"),
     (r"(?i)pol\.?\s*to\s*:", "date"),
     (r"(?i)^to\s*:", "date"),
+    # Nationwide/Allied: "From: MM/DD/YYYY To: MM/DD/YYYY" — extract after "To:"
+    (r"(?i)\bTo\s*:\s*", "date"),
     (r"(?i)through\s+", "date"),
     # Date range line: pick the second date after "to"
     (r"(?i)\bto\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\b", "date_range_end"),
@@ -144,7 +148,7 @@ _MORTGAGE_LABELS = [
     (r"(?i)mortgagee\s+(?:full\s+)?name\s*:", "inline_or_next"),
     (r"(?i)first\s+mortgage\s*:", "inline_or_next"),
     (r"(?i)mortgage(?:e)?(?:\s*/\s*add\.?\s*party)?\s*:", "inline"),
-    (r"(?i)loss\s+payee\s*:?", "next"),
+    (r"(?i)(?:^|\b)loss\s+payee\s*:", "next"),
     (r"(?i)mortgagee\s+(?:wailing|mailing)\s+name\s+and\s+address\s*:", "next"),
     (r"(?i)^holder\s*:", "inline_or_next"),  # State Farm: "holder: CAPITAL CITY BANK"
     # --- INS observation batch additions (Section 4) ---
@@ -185,6 +189,8 @@ _PREMIUM_LABELS = [
     (r"(?i)mortgagee\s+premium\s*:?", "dollar"),
     # AAA: "Total Premium:"
     (r"(?i)total\s+premium\s*:", "dollar"),
+    # Invoice/Declaration: "TOTAL DUE $ 5,421.05"
+    (r"(?i)total\s+due\s*:?", "dollar"),
 ]
 
 _BALANCE_LABELS = [
@@ -260,7 +266,7 @@ def _extract_with_rules(
         # --- POLICY NUMBER ---
         if "policy_number" in missing_fields and "policy_number" not in out:
             if not _POLICY_NUMBER_SKIP.search(line):
-                val = _try_labels(line, nxt, _POLICY_NUMBER_LABELS)
+                val = _try_labels(line, nxt, _POLICY_NUMBER_LABELS, nxt2)
                 if val:
                     # Take policy number portion (stop at REASON, text labels, etc.)
                     first = re.match(r'^([A-Z0-9\-]+(?:\s+\d+)*)', val.strip(), re.I)
@@ -274,7 +280,7 @@ def _extract_with_rules(
         # --- INSURED NAME ---
         if "insured_name" in missing_fields and "insured_name" not in out:
             if not _INSURED_NAME_SKIP.search(line):
-                val = _try_labels(line, nxt, _INSURED_NAME_LABELS)
+                val = _try_labels(line, nxt, _INSURED_NAME_LABELS, nxt2)
                 if val:
                     # Truncate at address patterns (digit + street name)
                     addr_m = re.search(r'\s+\d+\s+\w+\s+(?:st|street|ave|'
@@ -286,6 +292,11 @@ def _extract_with_rules(
                     addr_m2 = re.search(r'\s+\d{2,}\s+[A-Z]', val)
                     if addr_m2 and len(val[:addr_m2.start()].split()) >= 2:
                         val = val[:addr_m2.start()].strip()
+                    # Normalize OCR mixed-case corruption: "GIlLIS, DaVId" → "GILLIS, DAVID"
+                    # If the string has suspicious mixed-case (uppercase letters mid-word),
+                    # normalize to uppercase for consistent validation and display.
+                    if re.search(r'[A-Z][a-z][A-Z]', val) or re.search(r'[a-z][A-Z]', val):
+                        val = val.upper()
                     if _valid_name(val):
                         out["insured_name"] = _r(
                             _clean_isaoa(val), "sc_insured", 0.82)
@@ -342,14 +353,14 @@ def _extract_with_rules(
 
         # --- MORTGAGE COMPANY ---
         if "mortgage_company" in missing_fields and "mortgage_company" not in out:
-            val = _try_labels(line, nxt, _MORTGAGE_LABELS)
+            val = _try_labels(line, nxt, _MORTGAGE_LABELS, nxt2)
             if val and len(val) > 3:
                 out["mortgage_company"] = _r(
                     _clean_isaoa(val), "sc_mortgage", 0.80)
 
         # --- LOAN NUMBER ---
         if "loan_number" in missing_fields and "loan_number" not in out:
-            val = _try_labels(line, nxt, _LOAN_LABELS)
+            val = _try_labels(line, nxt, _LOAN_LABELS, nxt2)
             if val:
                 clean = re.sub(r'[^0-9A-Za-z]', '', val)
                 if _valid_loan_number(clean):
@@ -457,9 +468,30 @@ def _extract_with_rules(
     if "property_address" in missing_fields and "property_address" not in out:
         _extract_doi_name_address(lines, ["property_address"], out)
 
+    # ---- DOI/Policy Change: property address from insured header block ----
+    # For Policy Change docs the insured address appears in a header block:
+    #   Bradley R Hanson          (name)
+    #   42 Equestrian Way         (street)
+    #   Hawthorn Woods IL 60047   (city/state/zip)
+    # We detect it by finding a name-looking line followed by address lines,
+    # appearing BEFORE "Policy Information" / "Policy number" section headers.
+    if "property_address" in missing_fields and "property_address" not in out:
+        _extract_property_from_insured_header(lines, out)
+
     # ---- Column-header format: "Policy number" header + values 2 lines below ----
     if "policy_number" in missing_fields and "policy_number" not in out:
         _extract_column_policy_number(lines, out)
+
+    # ---- Orphaned value scanner: two-column OCR splits label from value ----
+    # When OCR outputs left-column lines then right-column lines, a label like
+    # "POLICY NO.:" may appear alone (no value) and the value "ADP 0038122530 7"
+    # appears later as a standalone line.  Scan for the classic Nationwide/AMCO
+    # format: "ADP    XXXXXXXXXX    N" on its own line after a policy label.
+    if "policy_number" in missing_fields and "policy_number" not in out:
+        _extract_orphaned_policy_value(lines, out)
+
+    if "loan_number" in missing_fields and "loan_number" not in out:
+        _extract_orphaned_loan_value(lines, out)
 
     # ---- "Named insured" column header ----
     if "insured_name" in missing_fields and "insured_name" not in out:
@@ -480,7 +512,7 @@ def _r(value: str, source: str, conf: float) -> Dict:
     return {"value": value, "confidence": conf, "source": source}
 
 
-def _try_labels(line: str, nxt: str, labels: list) -> Optional[str]:
+def _try_labels(line: str, nxt: str, labels: list, nxt2: str = "") -> Optional[str]:
     """Try label patterns, return value or None."""
     for pat, mode in labels:
         m = re.search(pat, line)
@@ -499,6 +531,10 @@ def _try_labels(line: str, nxt: str, labels: list) -> Optional[str]:
             # Also try next line if inline value is empty or too short
             if nxt and len(nxt.strip()) >= 2:
                 return nxt
+            # Also try nxt2 — handles two-column OCR where values are
+            # separated from labels by one blank or interleaved line
+            if nxt2 and len(nxt2.strip()) >= 2:
+                return nxt2
     return None
 
 
@@ -621,13 +657,24 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
         ll = line.lower().strip()
         if not ll or len(ll) > 120:
             continue
-        has_carrier = any(w in ll for w in _CARRIER_WORDS)
-        has_entity = any(w in ll for w in _CARRIER_ENTITY)
+        # Use word boundary matching to avoid false positives
+        # e.g., "ins" in "collins" or "co" in "colorado"
+        has_carrier = bool(re.search(
+            r'\b(?:insurance|indemnity|casualty|underwriters|surety|assurance)\b', ll))
+        has_entity = bool(re.search(
+            r'\b(?:company|exchange|group|mutual|corp|corporation)\b', ll))
         has_skip = any(w in ll for w in _CARRIER_SKIP)
         # Also match abbreviated: "ALLIED PROP AND CAS INS CO"
-        has_abbrev = bool(re.search(r'\b(?:ins|prop|cas)\b', ll))
-        if has_carrier and (has_entity or has_abbrev) and not has_skip:
+        # Use word boundary for abbreviations too
+        has_abbrev_ins = bool(re.search(r'\bins\b', ll))
+        has_abbrev_entity = bool(re.search(r'\b(?:co|prop|cas)\b', ll))
+        # For abbreviated match, require BOTH ins + co/prop/cas (not just one)
+        has_abbrev = has_abbrev_ins and has_abbrev_entity
+        if (has_carrier or has_abbrev_ins) and (has_entity or has_abbrev) and not has_skip:
             val = line.strip()
+            # Skip if it looks like an address (has zip code)
+            if re.search(r'\b\d{5}(-\d{4})?\b', val) and re.search(r'\b[A-Z]{2}\s+\d{5}', val):
+                continue
             # Strip common label prefixes: "Company:", "Carrier:", "Insurer:", etc.
             val = re.sub(r'^(?:Company|Carrier|Insurer|Underwriter|Provider)\s*:\s*',
                          '', val, flags=re.I).strip()
@@ -662,17 +709,89 @@ def _extract_exp_from_period(lines: List[str]) -> Optional[Dict]:
 
 def _extract_mortgage_isaoa(lines: List[str]) -> Optional[Dict]:
     """Extract mortgage company from ISAOA/ATIMA context."""
+
+    # --- FIRST PASS: Pattern A (highest priority) ---
+    # "Third party interest added: Mortgagee, COMPANY NAME ... ATIMA, loannum"
+    for line in lines:
+        m = re.search(
+            r'(?i)third\s+party\s+interest\s+added\s*:\s*mortgagee\s*,\s*(.+)',
+            line)
+        if m:
+            raw = m.group(1).strip()
+            name = re.sub(r'\s+(?:ITS\s+SUCCESSORS\s+AND/OR\s+ASSIGNS\s+)?(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA).*$',
+                          '', raw, flags=re.I).strip()
+            name = re.sub(r',?\s*\d{6,}$', '', name).strip()
+            if name and len(name) > 3 and not _is_header(name):
+                return _r(name, "sc_mortgage_third_party", 0.85)
+
+    # --- SECOND PASS: Pattern C (ISAOA/ATIMA on next line → name is current line) ---
+    # Also handles: "STATEBRIDGE COMPANY LLC" followed by "ITS SUCCESSORS AND/OR ASSIGNS ATIMA"
+    for idx, line in enumerate(lines):
+        if idx + 1 < len(lines):
+            nxt = lines[idx + 1].strip()
+            nxt_is_isaoa_line = (
+                re.search(r'(?i)^ISAOA', nxt) or nxt.upper().startswith('ISAOA')
+                or re.match(r'(?i)^ITS\s+SUCCESSORS?\s+AND[/\s]+OR\s+ASSIGNS', nxt)
+            )
+            if nxt_is_isaoa_line:
+                candidate = line.strip()
+                if (candidate and len(candidate) > 3
+                        and not re.search(r'(?i)^(?:to|from|dear|date|insured|named|policy|loan|attention)', candidate)
+                        and not re.search(r'\b\d{5}\b', candidate)
+                        and not _is_header(candidate)):
+                    name = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$',
+                                  '', candidate, flags=re.I).strip()
+                    if name and len(name) > 3:
+                        return _r(name, "sc_mortgage_isaoa_prevline", 0.82)
+
+    # --- THIRD PASS: Pattern B (ISAOA on same line as company name) ---
     for idx, line in enumerate(lines):
         if re.search(r'\b(?:ISAOA|ATIMA)\b', line, re.I):
-            name = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA).*$', '',
-                          line, flags=re.I).strip()
+            name = re.sub(r'\s+(?:ITS\s+SUCCESSORS[\s\w/]*)?(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA).*$',
+                          '', line, flags=re.I).strip()
+            # Also strip standalone "ITS SUCCESSORS AND/OR ASSIGNS" if that's all that remains
+            name = re.sub(r'^(?:ITS\s+)?SUCCESSORS?\s+AND[/\s]+OR\s+ASSIGNS\s*$', '',
+                          name, flags=re.I).strip()
             name = re.sub(r'^\d+\w*\s+', '', name).strip()
             name = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$', '',
                           name, flags=re.I).strip()
+            name = re.sub(r'(?i)^(?:third\s+party\s+interest\s+\w+\s*:\s*)?(?:mortgagee|loss\s+payee)\s*,?\s*', '', name).strip()
             if name and len(name) > 3 and not _is_header(name):
                 if idx > 0 and re.search(r'(?i)insured', lines[idx - 1]):
                     continue
+                # CRITICAL: If name is short (single word, <15 chars) and previous line
+                # looks like it could be the start of a multi-line company name, combine them
+                # e.g., "BROKER SOLUTIONS INC DBA NEW AMERICAN" + "FUNDG" → full company name
+                if (len(name.split()) <= 2 and len(name) < 15 and idx > 0):
+                    prev = lines[idx - 1].strip()
+                    # Previous line should look like a company name beginning
+                    if (prev and len(prev) > 5
+                            and not re.search(r'(?i)^(?:to|from|dear|date|insured|named|policy|loan|attention)', prev)
+                            and not re.search(r'\b\d{5}\b', prev)
+                            and not _is_header(prev)
+                            and not re.match(r'^\d+$', prev)):
+                        combined_name = prev.strip() + " " + name
+                        # Clean ISAOA/ATIMA from combined just in case
+                        combined_name = re.sub(r'\s+(?:ITS\s+SUCCESSORS[\s\w/]*)?(?:ISAOA|ATIMA).*$',
+                                               '', combined_name, flags=re.I).strip()
+                        if combined_name and len(combined_name) > 5:
+                            return _r(combined_name, "sc_mortgage_isaoa_combined", 0.80)
                 return _r(name, "sc_mortgage_isaoa", 0.78)
+            # If name is empty/short after stripping, the company name is on the PREVIOUS line
+            if (not name or len(name) <= 3) and idx > 0:
+                prev = lines[idx - 1].strip()
+                # Previous line should look like a company name (not a label, not a barcode)
+                if (prev and len(prev) > 3
+                        and not re.search(r'(?i)^(?:to|from|dear|date|insured|named|policy|loan|attention|\d{5,})', prev)
+                        and not re.search(r'\b\d{5}\b', prev)
+                        and not _is_header(prev)):
+                    prev_clean = re.sub(r'\s+(?:PO\s+BOX|P\.?O\.?\s*BOX).*$',
+                                        '', prev, flags=re.I).strip()
+                    # Strip leading barcodes/reference numbers like "000061EI310CCL1002480300 050030 001"
+                    prev_clean = re.sub(r'^\d+\w*\d+\w*\s+', '', prev_clean).strip()
+                    if prev_clean and len(prev_clean) > 3:
+                        return _r(prev_clean, "sc_mortgage_isaoa_prevline_fallback", 0.80)
+
         # "First:" line under Mortgagee section
         if re.match(r'(?i)first\s*:', line.strip()):
             val = line.split(":", 1)[1].strip() if ":" in line else ""
@@ -857,6 +976,124 @@ def _extract_property_from_located_at(lines: List[str]) -> Optional[Dict]:
     return None
 
 
+def _extract_orphaned_policy_value(lines: List[str], out: Dict) -> None:
+    """
+    Two-column OCR layout: policy label appears alone on one line,
+    value appears much later (up to 25 lines) as a standalone orphaned line.
+    Handles Nationwide/AMCO format: "ADP    0038122530    7"
+    where ADP is a plan code prefix, the number is the policy, and trailing digit is a suffix.
+
+    In two-column OCR the right-column values appear after ALL left-column content,
+    so the label (line 5) and value (line 17) may be 12+ lines apart — with all
+    left-column prose (letters, addresses) appearing in between.
+    KEY FIX: never STOP on prose — always SKIP it and keep scanning.
+    """
+    label_idx = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if re.search(r'(?i)policy\s+no\.?[\s\.]*:\.?\s*$', stripped):
+            label_idx = idx
+            break
+
+    if label_idx is None:
+        return
+
+    # Scan up to 25 lines forward — value appears after all left-column prose
+    for offset in range(1, 26):
+        i = label_idx + offset
+        if i >= len(lines):
+            break
+        candidate = lines[i].strip()
+        if not candidate:
+            continue
+
+        # SKIP: other label-only lines (end with ':' or '.:')
+        if re.search(r'(?i)^\w[\w\s\.]+\s*\.?\s*:\s*\.?\s*$', candidate):
+            continue
+
+        # SKIP: obvious footer/noise lines — keep scanning
+        if re.search(r'(?i)^(mortgagee copy|i9z9|nw cf|yours very)', candidate):
+            continue
+        if candidate in (')+1.', 'NW CF-1305 i', 'NW CF-1305'):
+            continue
+
+        # SKIP: barcode strings with embedded lowercase
+        if re.match(r'^[0-9][0-9a-z][0-9A-Za-z]{8,}$', candidate) and re.search(r'[a-z]', candidate):
+            continue
+
+        # SKIP: OCR reference codes like "I9Z9  2020248"
+        if re.match(r'^[A-Z]\d[A-Z]\d\b', candidate):
+            continue
+
+        # SKIP: long prose sentences — but do NOT stop scanning.
+        # In two-column OCR, the entire left-column letter body appears before
+        # the right-column values, so prose between label and value is expected.
+        words = candidate.split()
+        if len(words) > 7 and not any(c.isdigit() for c in candidate[:15]):
+            continue  # skip prose, keep scanning for the real value
+
+        # MATCH: Nationwide/AMCO plan-code format: "ADP    0038122530    7"
+        # PREFIX (2-4 caps) + DIGITS (8-12) + SINGLE DIGIT suffix
+        m = re.match(r'^([A-Z]{2,4})\s+([\d][\d\s]{6,}[\d])\s+(\d)\s*$', candidate)
+        if m:
+            raw = re.sub(r'\s+', '', m.group(2))  # "0038122530"
+            clean = _clean_policy(raw)
+            if _valid_policy_number(clean):
+                out["policy_number"] = _r(clean, "sc_orphaned_policy", 0.86)
+                return
+
+        # MATCH: generic standalone policy-number-looking token (single token only)
+        first_token = re.match(r'^([\w\-]{6,30})\s*$', candidate)
+        if first_token:
+            token = first_token.group(1)
+            if re.search(r'[a-z]', token):
+                continue  # lowercase → barcode/noise
+            clean = _clean_policy(token)
+            if _valid_policy_number(clean):
+                out["policy_number"] = _r(clean, "sc_orphaned_policy", 0.78)
+                return
+
+
+def _extract_orphaned_loan_value(lines: List[str], out: Dict) -> None:
+    """
+    Two-column OCR layout: loan label appears alone on one line,
+    value appears later as a standalone orphaned digit-only line.
+    Handles Nationwide/AMCO format: "0579158471" on its own line.
+    """
+    label_idx = None
+    for idx, line in enumerate(lines):
+        if re.search(r'(?i)loan\s+no\.?[\s\.]*:\.?\s*$', line.strip()):
+            label_idx = idx
+            break
+
+    if label_idx is None:
+        return
+
+    for offset in range(1, 21):
+        i = label_idx + offset
+        if i >= len(lines):
+            break
+        candidate = lines[i].strip()
+        if not candidate:
+            continue
+
+        # Skip label-only lines
+        if re.search(r'(?i)^\w[\w\s\.]+\s*\.?\s*:\s*\.?\s*$', candidate):
+            continue
+
+        # Skip barcodes and footers
+        if re.search(r'(?i)^(mortgagee copy|i9z9|nw cf|yours very|amco ins)', candidate):
+            continue
+        if re.match(r'^[0-9a-z]{10,}[A-Z0-9]{3,}$', candidate):
+            continue
+
+        # Pure digit string — potential loan number
+        if re.match(r'^\d{7,15}$', candidate):
+            if _valid_loan_number(candidate):
+                out["loan_number"] = _r(candidate, "sc_orphaned_loan", 0.84)
+                return
+
+
 def _extract_column_policy_number(lines: List[str], out: Dict) -> None:
     """
     Column-header layout: 'Policy number' as header, value 2 lines below.
@@ -933,13 +1170,40 @@ def _extract_column_named_insured(lines: List[str], out: Dict) -> None:
 def _extract_doi_loan_number(lines: List[str], out: Dict) -> None:
     """
     DOI-specific loan number patterns:
+    - 'Third party interest added: Mortgagee, COMPANY, <loan_number>' (same line)
+    - 'Third party interest added: Mortgagee, COMPANY ATIMA,\n<loan_number>' (next line)
     - 'Loan number (if available)' + value below
     - 'LOAN NO.:' inline
     - 'Loan No:' inline
     """
     for idx, line in enumerate(lines):
         ll = line.lower().strip()
-        # "Loan number" standalone or with "(if available)"
+
+        # Pattern A: "Third party interest added/removed: Mortgagee, COMPANY, LOANNUM" (same line)
+        m = re.search(
+            r'(?i)third\s+party\s+interest\s+(?:added|removed)\s*:\s*'
+            r'(?:mortgagee|loss\s+payee)\s*,\s*.+?,\s*(\d{7,15})\s*$',
+            line)
+        if m and _valid_loan_number(m.group(1)):
+            out["loan_number"] = _r(m.group(1).strip(), "sc_doi_loan_tp", 0.88)
+            return
+
+        # Pattern A2: loan number on NEXT line after "Third party interest added: ... ATIMA,"
+        if re.search(r'(?i)third\s+party\s+interest\s+(?:added|removed)\s*:', line):
+            # Check if line ends with ATIMA/ISAOA/ASSIGNS + optional comma (loan on next line)
+            if re.search(r'(?i)(?:ATIMA|ISAOA|ASSIGNS)\s*,?\s*$', line):
+                if idx + 1 < len(lines):
+                    nxt = lines[idx + 1].strip()
+                    if re.match(r'^\d{7,15}$', nxt) and _valid_loan_number(nxt):
+                        out["loan_number"] = _r(nxt, "sc_doi_loan_tp_nextline", 0.86)
+                        return
+            # Also check: loan number embedded after ATIMA/ISAOA on the same line
+            m2 = re.search(r'(?i)(?:ATIMA|ISAOA|ASSIGNS)\s*,\s*(\d{7,15})', line)
+            if m2 and _valid_loan_number(m2.group(1)):
+                out["loan_number"] = _r(m2.group(1).strip(), "sc_doi_loan_tp_embedded", 0.87)
+                return
+
+        # Pattern B: "Loan number" standalone or with "(if available)"
         if re.match(r'(?i)^loan\s+number', ll):
             # Check for inline value first
             m = re.search(r'(?i)loan\s+number[^:]*:\s*(\S+)', line)
@@ -959,6 +1223,99 @@ def _extract_doi_loan_number(lines: List[str], out: Dict) -> None:
                         out["loan_number"] = _r(candidate, "sc_doi_loan", 0.80)
                         return
                 # Continue scanning (address lines, etc. may appear between header and value)
+
+
+def _extract_property_from_insured_header(lines: List[str], out: Dict) -> None:
+    """
+    Policy Change / DOI: insured address appears in a free-form header block
+    BEFORE the policy details table. Pattern:
+        <Name line (2+ words, no digits, title-case or ALL CAPS)>
+        <Street address line (starts with digit)>
+        <City State ZIP line>
+    This address is treated as property_address for DOI docs since the insured's
+    address is the property address for mortgage tracking purposes.
+    
+    IMPORTANT: Must skip insurance company HQ addresses and mortgagee PO Box addresses
+    that also appear in the header area.
+    """
+    # Known company HQ / mortgagee addresses to skip
+    _SKIP_ADDRESS_PATTERNS = [
+        # Insurance company headquarters
+        r'(?i)american\s+parkway',
+        r'(?i)madison\s+wi\s+53783',
+        r'(?i)libertyville\s+il\s+60048',
+        r'(?i)273\s+peterson\s+rd',
+        r'(?i)scottsdale.*az\s+85258',
+        r'(?i)gainey\s+center',
+        # Common mortgagee PO Boxes (Troy MI, etc.)
+        r'(?i)po\s+box\s+7\d{3}\s*.*troy\s+mi',
+        r'(?i)48007',
+        r'(?i)po\s+box\s+\d+.*miami.*fl.*33197',
+        r'(?i)po\s+box\s+\d+.*dallas.*tx.*75266',
+    ]
+
+    # Names that indicate a company header block, not an insured header
+    _COMPANY_NAME_INDICATORS = [
+        r'(?i)\b(?:insurance|indemnity|casualty)\b.*\b(?:company|co|group|exchange|mutual|corp)\b',
+        r'(?i)^american\s+family',
+        r'(?i)^nationwide',
+        r'(?i)^allstate',
+        r'(?i)^state\s+farm',
+        r'(?i)^amco\s+insurance',
+    ]
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Stop scanning once we hit policy information section headers
+        if re.search(r'(?i)^(policy\s+information|policy\s+number|policy\s+period'
+                     r'|description\s+of\s+change|change\(s\)\s+made|named\s+insured'
+                     r'|third\s+party\s+interest)', stripped):
+            break
+        # Candidate name line: 2-5 words, no digits, not all-caps noise headers
+        words = stripped.split()
+        if (2 <= len(words) <= 6
+                and not any(c.isdigit() for c in stripped)
+                and not re.search(r'(?i)^(dear|date|insured|mortgage|to|from|re:|subject'
+                                  r'|attention|cc|the|your|this|we|you|if|for|and|or|in|of)', stripped)
+                and not _is_header(stripped)):
+
+            # SKIP: if name line looks like an insurance company name
+            if any(re.search(pat, stripped) for pat in _COMPANY_NAME_INDICATORS):
+                continue
+
+            # Check if next non-empty line is a street address
+            nxt_idx = idx + 1
+            while nxt_idx < len(lines) and not lines[nxt_idx].strip():
+                nxt_idx += 1
+            if nxt_idx >= len(lines):
+                continue
+            nxt = lines[nxt_idx].strip()
+
+            # SKIP: PO Box addresses (these are mortgagee/company mailing, not property)
+            if re.search(r'(?i)^p\.?o\.?\s*box', nxt):
+                continue
+
+            # Street address: starts with digit
+            if re.match(r'^\d+\s+\w', nxt) and not re.search(r'(?i)policy|loan|insured', nxt):
+                # Collect city/state/zip if present
+                city_idx = nxt_idx + 1
+                while city_idx < len(lines) and not lines[city_idx].strip():
+                    city_idx += 1
+                city_line = lines[city_idx].strip() if city_idx < len(lines) else ""
+                addr_parts = [nxt]
+                if city_line and re.search(r'\b[A-Z]{2}\s*\d{5}', city_line):
+                    addr_parts.append(city_line)
+                addr = ", ".join(addr_parts)
+
+                # SKIP: known company HQ / mortgagee addresses
+                if any(re.search(pat, addr) for pat in _SKIP_ADDRESS_PATTERNS):
+                    continue
+
+                if _valid_address(addr):
+                    out["property_address"] = _r(addr, "sc_doi_insured_header_addr", 0.76)
+                    return
 
 
 def _extract_doi_name_address(lines: List[str], missing_fields: List[str],
@@ -1087,8 +1444,12 @@ def _clean_policy(val: str) -> str:
     if not val:
         return val
     val = val.strip().lstrip(":").strip().rstrip(".,;:")
-    # Stop at common separators: REASON, Policy, AR, INS, Loan, etc.
-    val = re.split(r'\s+(?:REASON|Policy|AR\b|INS\b|Loan|Mortgag|Name|Address|Type)', val, flags=re.I)[0].strip()
+    # Stop at common separators: REASON, Policy, AR, INS, Loan, Agency, etc.
+    # These are often appended by OCR when columns merge
+    val = re.split(
+        r'\s+(?:REASON|Policy|AR\b|INS\b|Loan|Mortgag|Name|Address|Type|'
+        r'Agency|Agent|Markham|Page|Covered|Your|Information|Account)',
+        val, flags=re.I)[0].strip()
     # Remove leading type codes like "ADP", "HO" before actual policy number
     m = re.match(r'^[A-Z]{2,4}\s+(\d[\d\s\-]+\w*)$', val)
     if m:
@@ -1146,7 +1507,17 @@ def _valid_loan_number(text: str) -> bool:
         return False
     clean = re.sub(r'[^0-9A-Za-z]', '', text)
     digits = sum(c.isdigit() for c in clean)
-    return digits >= 5 and 5 <= len(clean) <= 25
+    if not (digits >= 5 and 5 <= len(clean) <= 25):
+        return False
+    # Block footer/form reference codes (print job IDs)
+    # e.g. "1965565232" from "19655_65232kR" at bottom of pages
+    digit_str = re.sub(r'[^0-9]', '', clean)
+    if digit_str and re.match(r'^(?:19\d{3}|044)\d{5,9}$', digit_str):
+        return False
+    # Block 10-digit numbers starting with 19xxx (form ref pattern)
+    if len(digit_str) == 10 and digit_str[:2] == '19' and int(digit_str[:5]) >= 19000:
+        return False
+    return True
 
 
 def _valid_name(text: str) -> bool:
