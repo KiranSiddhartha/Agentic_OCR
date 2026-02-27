@@ -36,7 +36,7 @@ def classify_policy(lines: List[str]) -> str:
     - policy_type = BREQ (reason) or FLD (coverage)
     """
 
-    text = " ".join(lines).lower()
+    text = re.sub(r"\s+", " ", " ".join(lines).lower())
 
     # ==========================================================
     # DOI GUARD: If DOI signals are present, skip cancellation 
@@ -394,7 +394,7 @@ def classify_policy(lines: List[str]) -> str:
         "farm and ranch",
         "farmowners",
         "farm owners",
-    )):
+    )) or bool(re.search(r"\bfarm\s+ranch\b", text)):
         return "HAZ"  # Map FARM → HAZ per extraction taxonomy
 
     fir_strong = any(k in text for k in (
@@ -852,7 +852,7 @@ CANCELLATION_REASONS = {
 
 
 def classify_cancellation_reason(lines):
-    text = " ".join(lines).lower()
+    text = re.sub(r"\s+", " ", " ".join(lines).lower())
     for reason_type, keywords in CANCELLATION_REASONS.items():
         for keyword in keywords:
             if keyword in text:
