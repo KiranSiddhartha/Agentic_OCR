@@ -44,6 +44,13 @@ DATE_ABBREV_RE = re.compile(
     r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+\d{1,2}[\s,\-]+\d{4}\b",
     re.I
 )
+# Also match "OCT-05-2021 to OCT-05-2022" style date ranges
+DATE_ABBREV_RANGE_RE = re.compile(
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+\d{1,2}[\s,\-]+\d{4})"
+    r"\s+to\s+"
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+\d{1,2}[\s,\-]+\d{4})",
+    re.I
+)
 PO_BOX_RE = re.compile(r"p\.?o\.?\s*box", re.I)
 STREET_RE = re.compile(
     r"\b\d{1,6}\s+.+?\b("
@@ -99,6 +106,7 @@ POLICY_LABELS = {
     "your policy number", "policynumber",
     "dwelling policy number",
     "account number", "your account number",
+    "cert. #", "cert #", "cert. no",  # QBE: "CERT. #: QSN4481303"
 }
 
 INSURED_LABELS = {
@@ -113,6 +121,7 @@ INSURED_LABELS = {
     "first named insured",
     "named insured and address",
     "name and address of insured",  # ADDED
+    "customer name",  # QBE invoice: "Customer Name: Dashiell Lopez"
 }
 
 # CRITICAL: Terms that should NOT be captured as insured names
@@ -123,6 +132,14 @@ BAD_INSURED_TERMS = {
     "loss payee", "lienholder", "lender",
     "isaoa", "atima", "isaoa atima", "isaoa/atima",
     "lien holder", "1st mortgagee copy",
+    
+    # Financial institutions / Banks (CRITICAL - not insured names)
+    "first horizon bank", "first horizon",
+    "wells fargo", "chase bank", "bank of america",
+    "us bank", "pnc bank", "citizens bank",
+    "huntington bank", "regions bank",
+    "orchid underwriters", "attn:",  # Invoice headers
+    "attn", "attention",
     
     # Product names
     "homesaver policy", "homesaver polcy", "homeowners policy",
@@ -223,6 +240,8 @@ PROPERTY_TRIGGERS = {
     "coverage detail for",  # Encompass: "Coverage Detail for 136 Old Altamont..."
     "insured location covered by this policy",
     "location",  # State Farm: "Location: 2971 GA HIGHWAY 93 S"
+    "description of property",  # Adirondack: "DESCRIPTION OF PROPERTY:"
+    "location of residence premises",  # Travelers Homesaver
 }
 
 # Property labels for inline extraction (Label: Value format)
@@ -232,6 +251,9 @@ PROPERTY_INLINE_LABELS = {
     "premises address", "property location",
     "property insured",  # ADDED for "Property Insured: 4616 HERITAGE RD"
     "location",  # State Farm: "Location: <address>"
+    "located at",  # Adirondack: "LOCATED AT: 908 Meadow Ln"
+    "description of property",  # Adirondack: "DESCRIPTION OF PROPERTY: LOCATED AT: addr"
+    "location of residence premises",  # Travelers Homesaver
 }
 
 # Standalone "Address:" can be a property address in declarations contexts
@@ -263,11 +285,13 @@ MORTGAGE_TRIGGERS = {
     # Note: Removed "lender" as it can trigger on "Lender Relations Center"
 }
 
-# Patterns that look like mortgage triggers but are actually service centers
+# Patterns that look like mortgage triggers but are actually service centers or footer text
 MORTGAGE_FALSE_POSITIVES = {
     "lender relations center",
     "mortgagee relations center",
     "mortgage relations center",
+    "mortgagee copy",       # Footer: "Mortgagee Copy Page 1 of 3"
+    "continued on next",    # Footer: "Continued on next page Mortgagee Copy"
 }
 
 # NEW: Producer/Agent triggers - names after these should NOT be captured as insured
@@ -291,12 +315,16 @@ LOAN_LABELS = {
     "loan/contract number", "loan/contract #",
     "loan:", "mortgage loan no",
     "mortgage loan no.", "loan no.",
+    "loan#",  # Common in flood policies: "LOAN# 1041640358" or "Loan#: 0580239576"
 }
 
 DATE_LABELS_EFFECTIVE = {
     "effective date", "policy effective date",
     "coverage begins", "term start date",
-    "change effective date",
+    "effective from",  # QBE: "EFFECTIVE FROM 10/05/2021 TO 10/05/2022"
+    # NOTE: "change effective date" intentionally excluded — it captures endorsement
+    # change dates (e.g., "Change Effective Date: 07-09-20") which are NOT the
+    # policy effective date.  The real effective date comes from Policy Period.
 }
 
 DATE_LABELS_EXPIRATION = {
@@ -333,6 +361,27 @@ def _normalize_name(v: str) -> str:
     # Remove common prefixes/suffixes
     v = re.sub(r"^(named insured|insured|policyholder)[:\s]*", "", v, flags=re.I)
     v = re.sub(r"\s*(beginning|effective|since|policy period).*$", "", v, flags=re.I)
+    
+    # CRITICAL: Strip OCR-garbled label prefixes from names
+    # E.g., "NANEAND ADDRESO OCTHEINSURED Dashiell Lopez" → "Dashiell Lopez"
+    # Look for the transition from garbled uppercase noise to actual name
+    # Strategy: if the text contains a recognizable name pattern at the end,
+    # strip the garbled prefix
+    garbled_label_patterns = [
+        # Garbled "NAME AND ADDRESS OF THE INSURED" variations
+        r"(?i)^.*?(?:NAMEAND|NANEAND|NAMEANDADDRESS|NANDADDRES|ADDRESO|OCTHE|OFTHE)"
+        r"(?:INSURED|INSUREO|LNSURED)?\s*",
+        # Garbled "INSURED NAME AND ADDRESS" variations
+        r"(?i)^.*?(?:INSUREDNAME|INSUREONAME|INSUREDMAILING)\s*",
+        # Garbled "INSURED LOCATION" / "COVERED BY THIS POLICY"
+        r"(?i)^.*?(?:INSUREDLOCATION|COVEREDBYTHIS)\s*(?:POLICY)?\s*",
+    ]
+    for pat in garbled_label_patterns:
+        m = re.match(pat, v)
+        if m and m.end() < len(v):
+            remainder = v[m.end():].strip()
+            if remainder and len(remainder) > 3:
+                v = remainder
     
     # Handle "LASTNAME, FIRSTNAME" format BUT NOT company names with comma
     # Don't swap if it contains entity suffixes
@@ -423,6 +472,65 @@ def _is_document_reference(v: str) -> bool:
     return False
 
 
+def _is_garbled_label(text: str) -> bool:
+    """
+    Detect OCR-garbled label text that should NOT be treated as a name or value.
+    Fax/scanned documents produce garbled text like:
+      "NANEAND ADDRESO OCTHEINSURED" = "NAME AND ADDRESS OF THE INSURED"
+      "BOWARE QSE SPECATY" = garbled carrier header noise
+    
+    Strategy: Use fuzzy matching against known label fragments.
+    If the text is mostly composed of garbled versions of known labels, reject it.
+    """
+    from difflib import SequenceMatcher
+    
+    ll = text.lower().strip()
+    
+    # Quick check: if it contains recognizable label fragments, it's probably garbled
+    _GARBLED_LABEL_FRAGMENTS = [
+        # Garbled versions of common labels (OCR errors on fax documents)
+        "nameand", "naneand", "addreso", "octhe", "ofthe",
+        "theinsured", "insuredname", "namedinsured",
+        "policyno", "policynumber", "policynum",
+        "addressof", "addressofthe", "nameandaddress",
+        "coverageforms", "coverageform",
+        "declarationpage", "declarationspage",
+        # No-space merges of common label words
+        "insuredlocation", "propertylocation", "propertyaddress",
+        "policyperiod", "effectivedate", "expirationdate",
+        "mortgagecompany", "loanumber", "loannumber",
+    ]
+    ll_nospace = re.sub(r'\s+', '', ll)
+    for frag in _GARBLED_LABEL_FRAGMENTS:
+        if frag in ll_nospace:
+            return True
+    
+    # Fuzzy match against known full labels (catches OCR character substitutions)
+    _KNOWN_LABELS = [
+        "name and address of the insured",
+        "name and address of insured",
+        "named insured and address",
+        "insured name and address",
+        "insured mailing name and address",
+        "name of the insured",
+        "policy number",
+        "insured location",
+        "property address",
+        "coverage forms",
+        "declaration page",
+        "declarations page",
+        "coverage and limits",
+        "this declaration page is attached to and forms part of certificate provisions",
+    ]
+    for known in _KNOWN_LABELS:
+        # Compare character similarity ratio
+        ratio = SequenceMatcher(None, ll_nospace, known.replace(" ", "")).ratio()
+        if ratio > 0.55:  # 55% character similarity = likely garbled label
+            return True
+    
+    return False
+
+
 def _looks_like_name(text: str) -> bool:
     """
     Check if text looks like a person/company name
@@ -433,6 +541,10 @@ def _looks_like_name(text: str) -> bool:
     
     text = text.strip()
     ll = text.lower()
+    
+    # CRITICAL: Reject OCR-garbled labels masquerading as names
+    if _is_garbled_label(text):
+        return False
     
     # CRITICAL: Block mortgagee-related terms
     for bad_term in BAD_INSURED_TERMS:
@@ -586,10 +698,14 @@ def _looks_like_policy(v: str) -> bool:
     return False
 
 
-def _looks_like_loan_number(v: str) -> bool:
+def _looks_like_loan_number(v: str, labeled: bool = False) -> bool:
     """
     Check if value looks like a loan number
     IMPROVED: Better filtering, stricter for short numbers
+    Args:
+        v: The value to check
+        labeled: If True, the number came from an explicit loan label
+                 (e.g., "Loan Number: 600003415") — use relaxed filtering
     """
     if not v:
         return False
@@ -610,6 +726,16 @@ def _looks_like_loan_number(v: str) -> bool:
     if len(digits) < 6 or len(digits) > 18:
         return False
     
+    # When the number comes from an explicit label, use relaxed validation
+    # These are high-confidence: the label already confirms it's a loan number
+    if labeled:
+        # Only block obvious non-loan patterns
+        if DATE_RE.search(v):
+            return False
+        if re.match(r'^(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(\d{4}|\d{2})$', digits):
+            return False
+        return True
+    
     # Block 13+ pure digits — likely a barcode artifact
     if len(digits) >= 13 and v.replace(' ', '').replace('-', '').isdigit():
         return False
@@ -618,10 +744,21 @@ def _looks_like_loan_number(v: str) -> bool:
     if '000000' in digits:
         return False
     
+    # Block numbers starting with '00' that are longer than 10 digits
+    if digits.startswith('00') and len(digits) > 10:
+        return False
+    
     # Block if more than 50% zeros in longer numbers
     if len(digits) > 10:
         zero_count = digits.count('0')
         if zero_count > len(digits) * 0.5:
+            return False
+    
+    # Block if more than 40% zeros in numbers with 9+ digits
+    # (catches footer codes like 00172500217 with 45% zeros)
+    if len(digits) >= 9:
+        zero_count = digits.count('0')
+        if zero_count > len(digits) * 0.4:
             return False
     
     # Block dates (with separators)
@@ -697,10 +834,13 @@ def _looks_like_carrier(line: str) -> bool:
     """Check if line looks like an insurance carrier name"""
     ll = line.lower()
     
-    # Must have "insurance" or "indemnity" or "casualty" somewhere
-    if not any(w in ll for w in ('insurance', 'indemnity', 'casualty', 'assurance', ' ins ')):
-        if not ll.endswith(' ins'):
-            return False
+    # Must have "insurance" or "indemnity" or "casualty" or abbreviations INS/CAS
+    # "ALLIED PROP AND CAS INS CO" uses abbreviations
+    has_ins = any(w in ll for w in ('insurance', 'indemnity', 'casualty', 'assurance', ' ins '))
+    if not has_ins:
+        has_ins = ll.endswith(' ins') or bool(re.search(r'\bins\b', ll)) or bool(re.search(r'\bcas\b', ll))
+    if not has_ins:
+        return False
     
     # Should have company type
     if not any(w in ll for w in ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')):
@@ -760,6 +900,8 @@ def _extract_carrier_name(line: str) -> str:
     # Use the LAST occurrence (for "State Farm Fire and Casualty Company")
     company_type_words = ['company', 'exchange', 'group', 'mutual', 
                           'corp', 'corporation', 'indemnity', 'casualty']
+    # Short words that need word-boundary matching
+    company_type_short = ['co']
     
     ll = line.lower()
     best_end = -1
@@ -771,13 +913,24 @@ def _extract_carrier_name(line: str) -> str:
             if end > best_end:
                 best_end = end
     
+    # Word-boundary match for short words like "co" to avoid matching inside "company"/"coverage"
+    for ct in company_type_short:
+        for m in re.finditer(r'\b' + re.escape(ct) + r'\b', ll):
+            end = m.end()
+            if end > best_end:
+                best_end = end
+    
     if best_end > 0:
         result = line[:best_end].strip()
     else:
         result = line
     
-    # Must still contain 'insurance', 'indemnity', or 'casualty'
-    if not any(w in result.lower() for w in ('insurance', 'indemnity', 'casualty', 'assurance', 'fire')):
+    # Must still contain 'insurance', 'indemnity', 'casualty', or abbreviations INS/CAS
+    result_lower = result.lower()
+    has_ins_word = any(w in result_lower for w in ('insurance', 'indemnity', 'casualty', 'assurance', 'fire'))
+    if not has_ins_word:
+        has_ins_word = bool(re.search(r'\bins\b', result_lower)) or bool(re.search(r'\bcas\b', result_lower))
+    if not has_ins_word:
         return ""
     
     # Reasonable length check
@@ -864,6 +1017,27 @@ class StatefulExtractor:
         """Update current parsing role based on section headers"""
         ll = line.lower().strip()
         
+        # Detect fax cover sheet pages — suppress extraction until real policy content starts
+        if any(k in ll for k in ("fax cover sheet", "cover message", "fax number",
+                                  "fax coversheet", "fax cover page")):
+            self._in_fax_cover = True
+        # Also detect fax cover by fuzzy/garbled patterns
+        if not getattr(self, '_in_fax_cover', False):
+            ll_nospace = re.sub(r'\s+', '', ll)
+            if any(f in ll_nospace for f in ("faxcoversheet", "covermessage", "faxnumber",
+                                              "faxcoverpage")):
+                self._in_fax_cover = True
+        # Exit fax cover when we see real policy content
+        if getattr(self, '_in_fax_cover', False):
+            if any(k in ll for k in ("policy declarations", "declaration page", "invoice",
+                                       "policy information", "certificate", "renewal",
+                                       "policy number", "policy no", "policy #",
+                                       "declarations page", "cert.", "cert #",
+                                       "prev. cert", "name and address of",
+                                       "coverages", "effective from",
+                                       "policy period")):
+                self._in_fax_cover = False
+        
         # Check for role triggers (order matters - more specific first)
         if any(k in ll for k in POLICY_LABELS):
             self._flush_accumulators()
@@ -897,7 +1071,10 @@ class StatefulExtractor:
             # CRITICAL: Don't trigger for endorsement/premium section headers
             _prop_skip = ("endorsement", "total premium", "total policy",
                           "total location", "rated", "coverage info",
-                          "policy info", "pol indicator", "coverage and limits")
+                          "policy info", "pol indicator", "coverage and limits",
+                          "policy period",     # "Policy Period Location of Residence Premises" is NOT a property trigger
+                          "standard time",     # "STANDARD TIME AT THE RESIDENCE PREMISES" is boilerplate, not property
+                          "12:01")             # Time stamp lines near policy period
             if not any(s in ll for s in _prop_skip):
                 self._flush_accumulators()
                 self.role, self.window = Role.PROPERTY_BLOCK, 8
@@ -908,12 +1085,21 @@ class StatefulExtractor:
         elif any(k in ll for k in MORTGAGE_TRIGGERS):
             # Check if it's a false positive (service center header)
             if not any(fp in ll for fp in MORTGAGE_FALSE_POSITIVES):
-                self._flush_accumulators()
-                self.role, self.window = Role.MORTGAGE_BLOCK, 10
+                # CRITICAL: Skip "Reason for Change:" lines — these describe WHY a change
+                # was made, not the mortgagee section itself.
+                # e.g., "Reason for Change: Change to Mortgagee Information"
+                if "reason for" in ll:
+                    pass  # Do NOT enter MORTGAGE_BLOCK
+                else:
+                    self._flush_accumulators()
+                    self.role, self.window = Role.MORTGAGE_BLOCK, 10
         elif any(k in ll for k in PRODUCER_TRIGGERS):
             # Producer/agent section - skip names here
-            self._flush_accumulators()
-            self.role, self.window = Role.PRODUCER_BLOCK, 6
+            # CRITICAL: Don't override INSURED_BLOCK — two-column OCR merge can put
+            # agency names on the same line as insured names (e.g., "YOKO MATSUMOTO GEICO INS AGENCY INC")
+            if self.role != Role.INSURED_BLOCK:
+                self._flush_accumulators()
+                self.role, self.window = Role.PRODUCER_BLOCK, 6
         elif any(k in ll for k in CARRIER_TRIGGERS):
             # DON'T flush carrier accumulator - we might need to combine
             self._flush_accumulators(entering_carrier_block=True)
@@ -947,6 +1133,12 @@ class StatefulExtractor:
     
     def extract(self, line: str):
         """Main extraction logic for each line"""
+        # Skip extraction during fax cover sheet pages
+        # (fax cover sheets contain loan numbers, dates, and names that can
+        # be misidentified as policy fields)
+        if getattr(self, '_in_fax_cover', False):
+            return
+        
         # Always try inline extraction first
         self._inline(line)
         
@@ -986,8 +1178,12 @@ class StatefulExtractor:
         if stripped.endswith(":"):
             return
         
-        # Check if this line contains 'insurance'
-        if 'insurance' in ll:
+        # Check if this line contains 'insurance' or abbreviation 'ins'/'cas'
+        has_insurance_keyword = 'insurance' in ll
+        if not has_insurance_keyword:
+            has_insurance_keyword = bool(re.search(r'\bins\b', ll)) or bool(re.search(r'\bcas\b', ll))
+        
+        if has_insurance_keyword:
             # CRITICAL: Skip email addresses, URLs, and binding notices
             if '@' in clean or 'www.' in ll or 'http' in ll or '.com' in ll:
                 self.carrier_accumulator = []  # Clear any pending accumulation
@@ -997,8 +1193,9 @@ class StatefulExtractor:
             if self.carrier_accumulator:
                 combined = " ".join(self.carrier_accumulator) + " " + clean
                 combined_lower = combined.lower()
-                # If combined has insurance + company type, use it
-                if 'insurance' in combined_lower and any(w in combined_lower for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual')):
+                # If combined has insurance/ins/cas + company type, use it
+                combined_has_ins = 'insurance' in combined_lower or bool(re.search(r'\bins\b', combined_lower)) or bool(re.search(r'\bcas\b', combined_lower))
+                if combined_has_ins and any(w in combined_lower for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual')):
                     if not any(w in combined_lower for w in ('agency', 'agent', 'services')):
                         carrier_val = _extract_carrier_name(combined)
                         self.fields["carrier_name"] = {
@@ -1056,13 +1253,19 @@ class StatefulExtractor:
                     return
         
         # Check if this might be first part of multi-line carrier
-        elif clean.isupper() and len(clean.split()) <= 2 and not any(c.isdigit() for c in clean):
-            # Might be company name prefix like "ADIRONDACK"
-            noise_words = {"PAGE", "DATE", "POLICY", "NUMBER", "INSURED", "ADDRESS", "NOTICE", "PO", "BOX"}
+        # e.g., "ADIRONDACK" (uppercase) or "Anchor Specialty" (Title Case)
+        elif len(clean.split()) <= 3 and not any(c.isdigit() for c in clean):
+            # Might be company name prefix
+            noise_words = {"PAGE", "DATE", "POLICY", "NUMBER", "INSURED", "ADDRESS", 
+                          "NOTICE", "PO", "BOX", "RENEWAL", "DECLARATIONS", "PREMIUM",
+                          "COVERAGE", "SECTION", "DWELLING", "HOMEOWNERS", "HO3"}
             words = clean.split()
-            if words and not any(w in noise_words for w in words):
+            upper_words = [w.upper() for w in words]
+            if words and not any(w in noise_words for w in upper_words):
                 if all(len(w) >= 3 for w in words):  # Each word should be substantial
-                    self.carrier_accumulator = [clean]
+                    # Accept if all uppercase OR all title case (first letter upper)
+                    if clean.isupper() or all(w[0].isupper() for w in words if w):
+                        self.carrier_accumulator = [clean]
     
     def _inline(self, line: str):
         """Extract from inline patterns (Label: Value)"""
@@ -1159,14 +1362,36 @@ class StatefulExtractor:
         # Property Address (NEW - for "Risk Location: 3004 NORFOLK DR" patterns)
         if "property_address" not in self.fields and ":" in line:
             if any(k in ll for k in PROPERTY_INLINE_LABELS):
-                _, _, v = line.partition(":")
-                v = v.strip()
-                if v and _looks_like_address(v):
-                    self.fields["property_address"] = {
-                        "value": v,
-                        "confidence": 0.98,
-                        "source": "inline",
-                    }
+                # CRITICAL: Skip date/policy lines that contain "location" incidentally
+                # e.g., "Policy Expiration Date: 09/03/2021 12:01 A.M. at Insured Location"
+                skip_property_line = any(skip_k in ll for skip_k in (
+                    "expiration", "effective", "policy period", "process date",
+                    "transaction", "policy number"))
+                if skip_property_line:
+                    pass  # Don't extract property from date/policy lines
+                else:
+                    _, _, v = line.partition(":")
+                    v = v.strip()
+                    # Handle double-label patterns:
+                    # "DESCRIPTION OF PROPERTY:  LOCATED AT:  908 Meadow Ln"
+                    # After first ":", remainder may contain "LOCATED AT: <address>"
+                    if ":" in v:
+                        # Try extracting after the LAST colon
+                        last_colon_idx = v.rfind(":")
+                        after_last = v[last_colon_idx + 1:].strip()
+                        if after_last and _looks_like_address(after_last):
+                            v = after_last
+                        elif "located at" in v.lower():
+                            # Extract after "LOCATED AT:"
+                            m_loc = re.search(r'(?i)located\s+at\s*:\s*(.*)', v)
+                            if m_loc:
+                                v = m_loc.group(1).strip()
+                    if v and _looks_like_address(v):
+                        self.fields["property_address"] = {
+                            "value": v,
+                            "confidence": 0.98,
+                            "source": "inline",
+                        }
         
         # Property Address from "Coverage Detail for <address>" (Encompass format)
         if "property_address" not in self.fields and "coverage detail for" in ll:
@@ -1187,7 +1412,7 @@ class StatefulExtractor:
             label_lower = label.lower().strip()
             
             # Check if this is an insured label
-            if any(k in label_lower for k in ("insured", "policyholder")):
+            if any(k in label_lower for k in ("insured", "policyholder", "customer name")):
                 # CRITICAL: Skip if label contains mortgagee terms or interest-type labels
                 if any(bad in label_lower for bad in (
                     "mortgagee", "loss payee", "lender",
@@ -1197,15 +1422,19 @@ class StatefulExtractor:
                     pass  # Skip this
                 else:
                     v = _normalize_name(val)
+                    # CRITICAL: Reject OCR-garbled label text captured as name value
+                    if v and _is_garbled_label(v):
+                        v = ""  # Don't use garbled label text as a name
                     if v and _looks_like_name(v):
                         self.fields["insured_name"] = {
                             "value": v,
                             "confidence": 0.99,
                             "source": "inline",
                         }
-                    elif v and len(v.strip()) > 3:
+                    elif v and len(v.strip()) > 3 and "insured_name" not in self.fields:
                         # Value on same line might be partial - check next line context
                         # Store as potential first part of multi-line name
+                        # CRITICAL: Only set partial if we don't already have a good name
                         self._partial_insured = v.strip()
         
         # Loan Number (IMPROVED)
@@ -1227,7 +1456,7 @@ class StatefulExtractor:
                         digits = d
                         break
             
-            if _looks_like_loan_number(digits):
+            if _looks_like_loan_number(digits, labeled=True):
                 self.fields["loan_number"] = {
                     "value": digits,
                     "confidence": 0.96,
@@ -1236,13 +1465,18 @@ class StatefulExtractor:
         
         # Dates
         if "effective_date" not in self.fields:
-            date = _extract_date(line, DATE_LABELS_EFFECTIVE)
-            if date:
-                self.fields["effective_date"] = {
-                    "value": date,
-                    "confidence": 0.95,
-                    "source": "inline",
-                }
+            # CRITICAL: Skip "Original New Business Effective Date" — this is the
+            # original inception date (e.g., 10/21/2010), NOT the current renewal date.
+            if "original" in ll and "effective" in ll:
+                pass  # Skip original effective dates entirely
+            else:
+                date = _extract_date(line, DATE_LABELS_EFFECTIVE)
+                if date:
+                    self.fields["effective_date"] = {
+                        "value": date,
+                        "confidence": 0.95,
+                        "source": "inline",
+                    }
         
         if "expiration_date" not in self.fields:
             date = _extract_date(line, DATE_LABELS_EXPIRATION)
@@ -1316,15 +1550,22 @@ class StatefulExtractor:
         # Date range pattern: "MM/DD/YYYY to MM/DD/YYYY" or "From: MM/DD/YYYY To: MM/DD/YYYY"
         # Extracts both effective and expiration dates from a single line
         if "effective_date" not in self.fields or "expiration_date" not in self.fields:
-            # Pattern 1: "DATE to DATE" (no colons)
+            # Pattern 1: "DATE to DATE" (no colons) — case-insensitive for "To" vs "to"
             date_range = re.search(
                 r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+to\s+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-                line
+                line, re.I
             )
             # Pattern 2: "From: DATE To: DATE" (with colons) - Nationwide/Allied format
             if not date_range:
                 date_range = re.search(
                     r'(?i)from\s*:\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+to\s*:\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+                    line
+                )
+            # Pattern 3: "DATE - DATE" (dash-separated) — Adirondack/other formats
+            # e.g., "4/30/2020 - 4/30/2021" or "06-26-20 To: 06-26-21"
+            if not date_range:
+                date_range = re.search(
+                    r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*[-–]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
                     line
                 )
             if date_range:
@@ -1385,8 +1626,14 @@ class StatefulExtractor:
             # Look for date or date range on this line
             date_range = re.search(
                 r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+to\s+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-                line
+                line, re.I
             )
+            # Also try dash-separated: "4/30/2020 - 4/30/2021"
+            if not date_range:
+                date_range = re.search(
+                    r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*[-–]\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+                    line
+                )
             abbrev_range = re.search(
                 r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4})'
                 r'\s+to\s+'
@@ -1465,10 +1712,13 @@ class StatefulExtractor:
                 "total policy premium", "total premium",
                 "total residence premium", "annual premium",
                 "total annual policy cost", "full term premium",
+                "total premium paid",  # Flood: "Total Premium Paid: 5,007.19"
+                "invoice total",  # QBE: "Invoice Total: 5,421.05"
+                "total due",  # QBE declaration: "TOTAL DUE"
             )
             if any(k in ll for k in premium_labels):
-                # Try to find dollar amount on same line
-                money = re.findall(r'\$[\d,]+\.?\d*', line)
+                # Try to find dollar amount on same line (handles "$ 150.00" with space)
+                money = re.findall(r'\$\s*[\d,]+\.?\d*', line)
                 if money:
                     self.fields["total_premium"] = {
                         "value": money[-1],  # Take last (usually the total)
@@ -1476,8 +1726,25 @@ class StatefulExtractor:
                         "source": "inline_premium",
                     }
                 else:
-                    # Mark that we need to look at next lines for the amount
-                    self._pending_premium = True
+                    # Try bare number after colon (e.g., "Invoice Total: 5,421.05")
+                    if ":" in line:
+                        _, _, after_colon = line.partition(":")
+                        bare = re.search(r'([\d,]+\.\d{2})', after_colon.strip())
+                        if bare:
+                            val = bare.group(1).replace(",", "")
+                            if float(val) > 0:
+                                self.fields["total_premium"] = {
+                                    "value": "$" + bare.group(1),
+                                    "confidence": 0.94,
+                                    "source": "inline_premium_bare",
+                                }
+                            else:
+                                self._pending_premium = True
+                        else:
+                            self._pending_premium = True
+                    else:
+                        # Mark that we need to look at next lines for the amount
+                        self._pending_premium = True
             elif getattr(self, '_pending_premium', False):
                 # Look for dollar amount on the line following a premium label
                 money = re.findall(r'\$[\d,]+\.?\d*', line)
@@ -1573,6 +1840,18 @@ class StatefulExtractor:
         """Extract insured name from INSURED block - IMPROVED"""
         ll = line.lower().strip()
         
+        # CRITICAL: Reject OCR-garbled labels masquerading as name values
+        if _is_garbled_label(line):
+            return
+        
+        # CRITICAL: Skip lines that are insured labels with colons.
+        # _inline() already processes "Named Insured: YOKO" and sets _partial_insured = "YOKO".
+        # If _insured() also processes this line, it will try to combine _partial with the
+        # same line's content, producing "YOKO YOKO". Let _inline() handle label:value lines.
+        if ":" in line and any(k in ll for k in ("insured", "policyholder")):
+            # This is a label line like "Named Insured: YOKO" — already handled by _inline()
+            return
+        
         # Skip obvious non-name lines
         skip_patterns = [
             "po box", "policy period", "loan number", "policy type",
@@ -1588,6 +1867,9 @@ class StatefulExtractor:
             # Endorsement table values
             "included", "excluded", "not included",
             "limit    premium", "total premium",
+            # Footer/copyright lines
+            "copyright", "copyrighted", "permission",
+            "office, inc", "includes copyrighted",
         ]
         if any(p in ll for p in skip_patterns):
             return
@@ -1603,6 +1885,27 @@ class StatefulExtractor:
             return
         
         clean_line = _normalize_name(line)
+        
+        # CRITICAL: Handle two-column OCR merge where insured name + agency name
+        # are on the same line. E.g., "YOKO MATSUMOTO GEICO INS AGENCY INC"
+        # The insured name is the part BEFORE the agency/company keywords.
+        if not _looks_like_name(clean_line) and "insured_name" not in self.fields:
+            _agency_split_kw = ("geico", "agency", " ins ", "insurance", "allstate",
+                                "state farm", "nationwide", "farmers", "progressive",
+                                "liberty mutual", "usaa", "erie", "safeco")
+            cl_lower = clean_line.lower()
+            for kw in _agency_split_kw:
+                idx = cl_lower.find(kw)
+                if idx > 3:  # Must have at least a few chars before the keyword
+                    candidate = clean_line[:idx].strip()
+                    if candidate and _looks_like_name(candidate):
+                        self.fields["insured_name"] = {
+                            "value": candidate,
+                            "confidence": 0.93,
+                            "source": "block_column_split",
+                        }
+                        self._partial_insured = candidate
+                        return
         
         # Strip trailing date patterns (e.g., "Dummy Name July 2020" -> "Dummy Name")
         clean_line = re.sub(
@@ -1634,9 +1937,10 @@ class StatefulExtractor:
         # then skip it - it's likely from a two-column layout where mortgagee is on left
         _mortgage_company_indicators = (
             "lending", "bank", "mortgage", "credit union", "financial",
-            "servicing", "loan", "savings",
+            "servicing", "loan", "savings", "horizon bank", "underwriters",
+            "orchid", "attn",  # "Attn: Orchid Underwriters"
         )
-        _entity_suffixes = ("llc", "inc", "corp", "na", "n.a.", "fsb", "f.s.b.")
+        _entity_suffixes = ("llc", "inc", "corp", "na", "n.a.", "fsb", "f.s.b.", "bank")
         name_lower = clean_line_stripped.lower() if clean_line_stripped else clean_line.lower()
         has_mortgage_indicator = any(w in name_lower for w in _mortgage_company_indicators)
         has_entity_suffix = any(w in name_lower for w in _entity_suffixes)
@@ -1742,20 +2046,45 @@ class StatefulExtractor:
         
         # Check if it's an address (capture for mailing)
         if _looks_like_address(line):
+            # Check if line has "Label: Value" format
+            address_value = line.strip()
+            if ":" in line:
+                _, _, val = line.partition(":")
+                val = val.strip()
+                if val and _looks_like_address(val):
+                    address_value = val
+            
+            # CRITICAL: Skip addresses that belong to the agency/insurer (two-column layout)
+            # Agency addresses often contain "GEICO", "AGENCY", "BLVD" with company names
+            _agency_indicators = ("geico", "agency", "insurance agency", "ins agency",
+                                  "allstate", "state farm", "farmers", "nationwide")
+            addr_lower = address_value.lower()
+            is_agency_address = any(w in addr_lower for w in _agency_indicators)
+            
             if "mailing_address" not in self.fields:
-                # Check if line has "Label: Value" format
-                address_value = line.strip()
-                if ":" in line:
-                    _, _, val = line.partition(":")
-                    val = val.strip()
-                    if val and _looks_like_address(val):
-                        address_value = val
-                
-                self.fields["mailing_address"] = {
-                    "value": address_value,
-                    "confidence": 0.92,
-                    "source": "insured_block",
-                }
+                if not is_agency_address:
+                    self.fields["mailing_address"] = {
+                        "value": address_value,
+                        "confidence": 0.92,
+                        "source": "insured_block",
+                    }
+                # If this IS an agency address, skip it — don't capture
+            else:
+                # Append city/state/zip continuation to existing street address
+                existing = self.fields["mailing_address"]["value"]
+                has_street_number = bool(re.match(r'^\d+\s+', existing.strip()))
+                new_has_street = bool(re.match(r'^\d+\s+', address_value.strip()))
+                is_city_continuation = (
+                    has_street_number and not new_has_street
+                    and re.search(r'[A-Z]{2}\s+\d{5}', address_value)
+                    and "," not in existing
+                )
+                if is_city_continuation:
+                    self.fields["mailing_address"]["value"] = existing + ", " + address_value
+                elif new_has_street and not has_street_number:
+                    # Replace partial address with one that has a street number
+                    if not is_agency_address:
+                        self.fields["mailing_address"]["value"] = address_value
     
     def _property(self, line: str):
         """Extract property address from PROPERTY block"""
@@ -1774,7 +2103,8 @@ class StatefulExtractor:
         # Skip lines with endorsement/coverage keywords
         _prop_skip_kw = ("endorsement", "exclusion", "amendment", "provision",
                          "protection", "replacement", "liability", "fungi",
-                         "ordinance", "coverage", "included", "total")
+                         "ordinance", "coverage", "included", "total",
+                         "from:", "standard time", "12:01")  # Date/time lines near policy period
         if any(k in ll for k in _prop_skip_kw):
             return
         
@@ -1888,7 +2218,7 @@ class StatefulExtractor:
         if m_loan_type:
             if "loan_number" not in self.fields:
                 digits = m_loan_type.group(1)
-                if _looks_like_loan_number(digits):
+                if _looks_like_loan_number(digits, labeled=True):
                     self.fields["loan_number"] = {
                         "value": digits,
                         "confidence": 0.94,
@@ -1919,7 +2249,7 @@ class StatefulExtractor:
         
         # Loan number — also capture "N/A" style loan indicators
         if "loan_number" not in self.fields:
-            has_loan_label = any(k in ll for k in ("loan no", "loan number", "loan #", "loan id", "ln #", "mortgage loan"))
+            has_loan_label = any(k in ll for k in ("loan no", "loan number", "loan #", "loan id", "ln #", "mortgage loan", "loan/contract"))
             if has_loan_label:
                 if ":" in line:
                     _, _, v = line.partition(":")
@@ -1932,7 +2262,7 @@ class StatefulExtractor:
                         }
                     else:
                         digits = ''.join(c for c in v if c.isdigit())
-                        if _looks_like_loan_number(digits):
+                        if _looks_like_loan_number(digits, labeled=True):
                             self.fields["loan_number"] = {
                                 "value": digits,
                                 "confidence": 0.94,
@@ -1940,9 +2270,12 @@ class StatefulExtractor:
                             }
             elif not _looks_like_address(line):
                 # Only scan tokens for loan number if line is NOT an address
+                # If the entire line is just a number (common after MORTGAGEE block),
+                # use labeled=True since the mortgage context is strong evidence
+                line_is_pure_number = line.strip().replace('-', '').replace(' ', '').isdigit()
                 for token in line.split():
                     digits = ''.join(c for c in token if c.isdigit())
-                    if _looks_like_loan_number(digits):
+                    if _looks_like_loan_number(digits, labeled=line_is_pure_number):
                         self.fields["loan_number"] = {
                             "value": digits,
                             "confidence": 0.90,
@@ -1952,8 +2285,14 @@ class StatefulExtractor:
         
         # Mortgage company
         if "mortgage_company" not in self.fields:
+            # CRITICAL: Skip loan-label lines — these contain loan numbers, not company names
+            # e.g., "Loan/Contract Number: 600003415" should NOT be captured as mortgage_company
+            has_loan_label = any(k in ll for k in ("loan no", "loan number", "loan #", "loan id",
+                                                     "loan/contract", "contract number"))
+            if has_loan_label:
+                pass  # Skip — this is a loan line, not a company name
             # Look for company-like patterns
-            if any(w in ll for w in ("bank", "mortgage", "lending", "credit", "loan", "federal", "financial")):
+            elif any(w in ll for w in ("bank", "mortgage", "lending", "credit", "loan", "federal", "financial", " mtg ")):
                 # CRITICAL: Skip if it's just a label like "First Mortgagee"
                 if re.match(r'^(first|second|third|1st|2nd|3rd)\s+(mortgagee|lender)', ll):
                     return
@@ -2026,14 +2365,38 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
             if any(k in ll for k in POLICY_LABELS):
                 if ":" in line:
                     _, _, v = line.partition(":")
-                    v = _clean(v).replace(" ", "")
-                    if _looks_like_policy(v):
-                        fields["policy_number"] = {
-                            "value": v,
-                            "confidence": 0.88,
-                            "source": "sweep",
-                        }
-                        break
+                    v = _clean(v)
+                    # Check for known spaced policy number formats BEFORE removing spaces
+                    # e.g., "602732135 664 1" (9+3+1 digit format)
+                    if re.match(r'^\d{9}\s+\d{3}\s+\d$', v):
+                        # This is a spaced policy number - keep as-is
+                        v_check = v.replace(" ", "")
+                        if _looks_like_policy(v_check):
+                            fields["policy_number"] = {
+                                "value": v,
+                                "confidence": 0.88,
+                                "source": "sweep",
+                            }
+                            break
+                    elif re.match(r'^\d{3}\s+\d{3}\s+\d{3}$', v):
+                        # "821 736 168" format — combine
+                        v_combined = v.replace(" ", "")
+                        if _looks_like_policy(v_combined):
+                            fields["policy_number"] = {
+                                "value": v_combined,
+                                "confidence": 0.88,
+                                "source": "sweep",
+                            }
+                            break
+                    else:
+                        v = v.replace(" ", "")
+                        if _looks_like_policy(v):
+                            fields["policy_number"] = {
+                                "value": v,
+                                "confidence": 0.88,
+                                "source": "sweep",
+                            }
+                            break
                 
                 # Check next few lines
                 for j in range(i + 1, min(i + 3, len(lines))):
@@ -2099,6 +2462,10 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
             if any(k in ll for k in PROPERTY_TRIGGERS):
                 for j in range(i + 1, min(i + 5, len(lines))):
                     candidate = lines[j].strip()
+                    cand_lower = candidate.lower()
+                    # Skip date/time lines that appear near policy period
+                    if any(skip in cand_lower for skip in ("from:", "standard time", "12:01", "policy period")):
+                        continue
                     if _looks_like_address(candidate):
                         # CRITICAL: Strip leading person name from address
                         # e.g., "Dashiell Lopez 19116 N Gardenia Ave" → "19116 N Gardenia Ave"
@@ -2181,6 +2548,10 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
         for line in lines:
             ll = line.lower()
             if any(k in ll for k in LOAN_LABELS):
+                # CRITICAL: Skip footer/reference lines that contain mixed alphanumeric codes
+                # e.g., "001725/00217 F3115MMA 9695 07/21/20" or "19660_859561_6 PL-8653 1-97"
+                if re.search(r'[A-Z]\d{3,}[A-Z]{2,}', line):
+                    continue  # Skip lines with mixed alphanumeric reference codes
                 # Try to extract number from line
                 if ":" in line:
                     _, _, v = line.partition(":")
@@ -2197,7 +2568,7 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                 else:
                     digits = ''.join(c for c in line if c.isdigit())
                 
-                if _looks_like_loan_number(digits):
+                if _looks_like_loan_number(digits, labeled=True):
                     fields["loan_number"] = {
                         "value": digits,
                         "confidence": 0.85,
@@ -2212,12 +2583,16 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
             "total policy premium", "total premium",
             "total residence premium", "annual premium",
             "total annual policy cost", "full term premium",
+            "mortgagee premium",  # Adirondack mortgagee certificate format
+            "total premium paid",  # Flood policies: "Total Premium Paid: 5,007.19"
+            "invoice total",  # QBE invoice: "Invoice Total: 5,421.05"
+            "total due",  # QBE declaration: "TOTAL DUE"
         )
         for i, line in enumerate(lines):
             ll = line.lower()
             if any(k in ll for k in premium_labels):
-                # Check same line for dollar amount
-                money = re.findall(r'\$[\d,]+\.?\d*', line)
+                # Check same line for dollar amount (handles "$ 150.00" with space)
+                money = re.findall(r'\$\s*[\d,]+\.?\d*', line)
                 if money:
                     fields["total_premium"] = {
                         "value": money[-1],
@@ -2225,11 +2600,24 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                         "source": "sweep_premium",
                     }
                     break
+                # Fallback: bare number after colon (e.g., "Total Premium Paid: 5,007.19")
+                if ":" in line:
+                    _, _, after = line.partition(":")
+                    bare = re.search(r'([\d,]+\.\d{2})', after.strip())
+                    if bare:
+                        val = bare.group(1).replace(",", "")
+                        if float(val) > 0:
+                            fields["total_premium"] = {
+                                "value": "$" + bare.group(1),
+                                "confidence": 0.83,
+                                "source": "sweep_premium",
+                            }
+                            break
                 # Check next lines — take the LAST dollar amount found
                 # (in two-column layouts, the total is the last amount)
                 last_money = None
                 for j in range(i + 1, min(i + 20, len(lines))):
-                    money_j = re.findall(r'\$[\d,]+\.?\d*', lines[j])
+                    money_j = re.findall(r'\$\s*[\d,]+\.?\d*', lines[j])
                     if money_j:
                         last_money = money_j[-1]
                 if last_money:
@@ -2237,6 +2625,22 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                         "value": last_money,
                         "confidence": 0.82,
                         "source": "sweep_premium_lookahead",
+                    }
+                    break
+    
+    # --- Total Premium: standalone "Total:" with bare number (QBE invoice format) ---
+    # "Total:    5,421.05" — no $ sign, just "Total:" label
+    if "total_premium" not in fields:
+        for i, line in enumerate(lines):
+            # Match "Total:" followed by a bare number (with or without $)
+            m = re.match(r'(?i)^\s*(?:invoice\s+)?total\s*:\s*\$?\s*([\d,]+\.\d{2})\s*$', line.strip())
+            if m:
+                val = m.group(1).replace(",", "")
+                if float(val) > 50:  # Reasonable premium threshold
+                    fields["total_premium"] = {
+                        "value": "$" + m.group(1),
+                        "confidence": 0.88,
+                        "source": "sweep_total_bare",
                     }
                     break
 
@@ -2718,7 +3122,7 @@ def _extract_recipient_mortgagee(lines: List[str], fields: Dict) -> None:
     """
     bank_keywords = ("bank", "credit union", "mortgage", "lending",
                      "servicing", "financial", "funding")
-    for i in range(min(20, len(lines))):
+    for i in range(min(30, len(lines))):
         line = lines[i].strip()
         ll = line.lower()
         if not any(w in ll for w in bank_keywords):
@@ -2734,8 +3138,9 @@ def _extract_recipient_mortgagee(lines: List[str], fields: Dict) -> None:
             for l in lookahead
         )
         # ISAOA/ATIMA on the very next line is a definitive mortgagee signal
+        # Also handle OCR variant "ISOA" (missing letter)
         has_isaoa_next = bool(
-            lookahead and re.search(r"(?i)^(ISAOA|ATIMA)", lookahead[0].strip())
+            lookahead and re.search(r"(?i)^(ISAOA|ISOA|ATIMA)", lookahead[0].strip())
         )
 
         if (has_po_box and has_city_state) or has_isaoa_next:
@@ -2750,7 +3155,7 @@ def _extract_recipient_mortgagee(lines: List[str], fields: Dict) -> None:
                              "first", "wells", "chase", "us "))):
                     bank_name = prev + " " + bank_name
             bank_name = re.sub(
-                r"\s+(?:ITS|ISAOA|ATIMA|SUCCESSORS|AND/OR|ASSIGNS).*$",
+                r"\s+(?:ITS|ISAOA|ISOA|ATIMA|SUCCESSORS|AND/OR|ASSIGNS).*$",
                 "", bank_name, flags=re.I).strip()
             bank_name = re.sub(r"^[\d\s\"\'°³ae;:]+", "", bank_name).strip()
             bank_name = re.sub(r"\s+", " ", bank_name).strip()
@@ -2762,10 +3167,10 @@ def _extract_recipient_mortgagee(lines: List[str], fields: Dict) -> None:
                 }
             return
 
-        # ISAOA/ATIMA on same line
-        if "isaoa" in ll or "atima" in ll:
+        # ISAOA/ATIMA on same line (also handle OCR variant ISOA)
+        if "isaoa" in ll or "isoa" in ll or "atima" in ll:
             bank_name = re.sub(
-                r"\s+(?:ISAOA|ATIMA|ISAOA\s*/?\ s*ATIMA|ITS\s+SCRS).*$",
+                r"\s+(?:ISAOA|ISOA|ATIMA|ISAOA\s*/?\ s*ATIMA|ISOA\s*/?\s*ATIMA|ITS\s+SCRS).*$",
                 "", line, flags=re.I).strip()
             bank_name = re.sub(r"^[\d\s\"\'°³ae;:]+", "", bank_name).strip()
             if len(bank_name) > 3:
@@ -3065,18 +3470,23 @@ def _override_policy_from_label(lines: List[str], fields: Dict) -> None:
 
 def _clean_mortgage_suffixes(fields: Dict) -> None:
     """
-    Clean mortgage_company: strip ITS SCRS/ISAOA/ATIMA/ASSIGNS suffixes.
+    Clean mortgage_company: strip ITS SCRS/ISAOA/ISOA/ATIMA/ASSIGNS suffixes.
     These are legal designations, not part of the company name.
     """
     if "mortgage_company" not in fields:
         return
     val = fields["mortgage_company"].get("value", "")
     # Strip "ITS SCRS &/OR ASSIGNS ATIMA" and similar
+    # Also handle OCR variant "ISOA" (missing letter from ISAOA)
     cleaned = re.sub(
-        r'\s+(?:ITS\s+SCRS|ISAOA|ATIMA|ITS\s+SUCCESSORS|'
+        r'\s+(?:ITS\s+SCRS|ISAOA|ISOA|ATIMA|ITS\s+SUCCESSORS|'
         r'&/OR\s+ASSIGNS|AND/OR\s+ASSIGNS|SUCCESSORS\s+AND/OR\s+ASSIGNS)'
-        r'[\s&/OR]*(?:ATIMA|ISAOA|ASSIGNS)*\s*$',
+        r'[\s&/OR]*(?:ATIMA|ISAOA|ISOA|ASSIGNS)*\s*$',
         '', val, flags=re.I).strip()
+    # Also strip ",  ISOA/ATIMA" or ", ISAOA/ATIMA" at end (with comma)
+    cleaned = re.sub(
+        r',?\s*(?:ISAOA|ISOA)\s*/?\s*(?:ATIMA)?\s*$',
+        '', cleaned, flags=re.I).strip()
     if cleaned and cleaned != val:
         fields["mortgage_company"]["value"] = cleaned
 
@@ -3113,6 +3523,34 @@ def _extract_loan_next_line(lines: List[str], fields: Dict) -> None:
                     "source": "stage1_loan_labeled",
                 }
                 return
+
+    # Strategy: Table-header loan number extraction (Adirondack format)
+    # Table header: "Policy Type    Loan Number    Mortgagee Premium"
+    # Data row:     "PACKAGE        7000654501     $1,151"
+    # No colon — "Loan Number" is a column header, value is on the next line
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        # Check for table header containing "loan number" without colon
+        if "loan number" in ll and ":" not in line:
+            # Look at next 1-3 lines for the data row
+            for j in range(i + 1, min(i + 4, len(lines))):
+                row = lines[j].strip()
+                if not row:
+                    continue
+                # Split row by multiple spaces (table columns) or extract tokens
+                tokens = re.split(r'\s{2,}', row)
+                for token in tokens:
+                    token = token.strip()
+                    d = ''.join(c for c in token if c.isdigit())
+                    if d and _looks_like_loan_number(d) and len(d) >= 7:
+                        # Verify this isn't a dollar amount
+                        if not re.search(r'^\$', token.strip()):
+                            fields["loan_number"] = {
+                                "value": d, "confidence": 0.93,
+                                "source": "stage1_loan_table_header",
+                            }
+                            return
+                break  # Only process the first matching header
 
 
 def _extract_carrier_page2(lines: List[str], fields: Dict) -> None:
@@ -3154,6 +3592,8 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
     """
     Clean carrier_name: strip trailing single OCR-bleed character.
     E.g. "ALLSTATE INDEMNITY COMPANYD" → "ALLSTATE INDEMNITY COMPANY"
+    Also: fuzzy-match garbled OCR carrier names to known carriers.
+    E.g. "BOWARE QSE SPECATY INSURANCE COMPANY" → "QBE SPECIALTY INSURANCE COMPANY"
     """
     if "carrier_name" not in fields:
         return
@@ -3167,6 +3607,76 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
     cleaned = re.sub(r'\s+[A-Z]$', '', cleaned).strip()
     if cleaned and cleaned != val:
         fields["carrier_name"]["value"] = cleaned
+        val = cleaned
+    
+    # Fuzzy-match against known carriers to fix OCR garbling
+    # E.g., "BOWARE QSE SPECATY INSURANCE COMPANY" → "QBE SPECIALTY INSURANCE COMPANY"
+    _KNOWN_CARRIERS_FUZZY = [
+        "QBE SPECIALTY INSURANCE COMPANY",
+        "ALLSTATE INDEMNITY COMPANY",
+        "ALLSTATE VEHICLE AND PROPERTY INSURANCE COMPANY",
+        "ALLSTATE FIRE AND CASUALTY INSURANCE COMPANY",
+        "STATE FARM FIRE AND CASUALTY COMPANY",
+        "NATIONWIDE MUTUAL INSURANCE COMPANY",
+        "NATIONWIDE MUTUAL FIRE INSURANCE COMPANY",
+        "ALLIED PROPERTY AND CASUALTY INSURANCE COMPANY",
+        "TRAVELERS HOME AND MARINE INSURANCE COMPANY",
+        "TRAVELERS INDEMNITY COMPANY",
+        "LIBERTY MUTUAL FIRE INSURANCE COMPANY",
+        "LIBERTY MUTUAL INSURANCE COMPANY",
+        "FARMERS INSURANCE EXCHANGE",
+        "SAFECO INSURANCE COMPANY OF AMERICA",
+        "SAFECO INSURANCE COMPANY OF ILLINOIS",
+        "ERIE INSURANCE EXCHANGE",
+        "ERIE INSURANCE COMPANY",
+        "AMERICAN FAMILY INSURANCE COMPANY",
+        "AMCO INSURANCE COMPANY",
+        "CITIZENS PROPERTY INSURANCE CORPORATION",
+        "UNIVERSAL PROPERTY AND CASUALTY INSURANCE COMPANY",
+        "FEDERATED NATIONAL INSURANCE COMPANY",
+        "SOUTHERN OAK INSURANCE COMPANY",
+        "TOWER HILL PRIME INSURANCE COMPANY",
+        "TOWER HILL SIGNATURE INSURANCE COMPANY",
+        "PEOPLES TRUST INSURANCE COMPANY",
+        "HERITAGE PROPERTY AND CASUALTY INSURANCE COMPANY",
+        "FLORIDA PENINSULA INSURANCE COMPANY",
+        "SECURITY FIRST INSURANCE COMPANY",
+        "HOMEOWNERS CHOICE INSURANCE COMPANY",
+        "AEGIS SECURITY INSURANCE COMPANY",
+        "ADIRONDACK INSURANCE EXCHANGE",
+        "HARTFORD FIRE INSURANCE COMPANY",
+        "THE HANOVER INSURANCE COMPANY",
+        "CHUBB INDEMNITY INSURANCE COMPANY",
+        "AMICA MUTUAL INSURANCE COMPANY",
+        "KEMPER INDEPENDENCE INSURANCE COMPANY",
+        "MERCURY INSURANCE COMPANY",
+        "SHELTER MUTUAL INSURANCE COMPANY",
+        "USAA CASUALTY INSURANCE COMPANY",
+        "AUTO-OWNERS INSURANCE COMPANY",
+        "CSAA INSURANCE EXCHANGE",
+        "ENCOMPASS INSURANCE COMPANY",
+        "AMERICAN STRATEGIC INSURANCE COMPANY",
+        "ORCHID UNDERWRITERS AGENCY",
+        "ANCHOR SPECIALTY INSURANCE COMPANY",
+    ]
+    try:
+        from difflib import SequenceMatcher
+        val_upper = val.upper()
+        best_match, best_score = None, 0
+        for known in _KNOWN_CARRIERS_FUZZY:
+            score = SequenceMatcher(None, val_upper, known).ratio()
+            if score > best_score:
+                best_match, best_score = known, score
+        # Threshold: 60% similarity is strong enough for OCR correction
+        # but only if the current value contains "insurance" or similar keywords
+        val_lower = val.lower()
+        has_ins_word = any(w in val_lower for w in ('insurance', 'indemnity', 'casualty', 'assurance', 'exchange', 'mutual'))
+        if best_score > 0.60 and has_ins_word and best_match:
+            fields["carrier_name"]["value"] = best_match
+            fields["carrier_name"]["confidence"] = min(fields["carrier_name"].get("confidence", 0.90), 0.92)
+            fields["carrier_name"]["source"] = fields["carrier_name"].get("source", "") + "_fuzzy_corrected"
+    except ImportError:
+        pass  # difflib should always be available, but just in case
 
 
 def _extract_mortgage_from_third_party(lines: List[str], fields: Dict) -> None:
@@ -3348,8 +3858,8 @@ def _extract_mortgage_from_doi_address_block(lines: List[str], fields: Dict) -> 
                         }
                         return
         
-        # Also handle: "ISAOA/ATIMA" alone on a line (without SUCCESSORS)
-        if re.match(r'(?i)^ISAOA\s*/?\s*ATIMA\s*$', stripped):
+        # Also handle: "ISAOA/ATIMA" or "ISOA/ATIMA" alone on a line (without SUCCESSORS)
+        if re.match(r'(?i)^(?:ISAOA|ISOA)\s*/?\s*ATIMA\s*$', stripped):
             if i > 0:
                 prev = lines[i - 1].strip()
                 if re.match(r'^[A-Z0-9]{15,}', prev) and i > 1:
@@ -3413,6 +3923,56 @@ def _extract_policy_period_dates(lines: List[str], fields: Dict) -> None:
                 has_exp = True
             if has_eff and has_exp:
                 return
+
+        # Try abbreviated month date range: "OCT-05-2021 to OCT-05-2022"
+        if not (has_eff and has_exp):
+            m_abbrev = re.search(
+                r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+\d{1,2}[\s,\-]+\d{4})'
+                r'\s+to\s+'
+                r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[\s\-]+\d{1,2}[\s,\-]+\d{4})',
+                window, re.I
+            )
+            if m_abbrev:
+                if not has_eff:
+                    fields["effective_date"] = {
+                        "value": m_abbrev.group(1),
+                        "confidence": 0.95,
+                        "source": "stage1_policy_period_block",
+                    }
+                    has_eff = True
+                if not has_exp:
+                    fields["expiration_date"] = {
+                        "value": m_abbrev.group(2),
+                        "confidence": 0.95,
+                        "source": "stage1_policy_period_block",
+                    }
+                    has_exp = True
+                if has_eff and has_exp:
+                    return
+
+        # Try dash-separated date range: "4/30/2020 - 4/30/2021"
+        if not (has_eff and has_exp):
+            m_dash = re.search(
+                r'([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})\s*[-–]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})',
+                window,
+            )
+            if m_dash:
+                if not has_eff:
+                    fields["effective_date"] = {
+                        "value": m_dash.group(1),
+                        "confidence": 0.95,
+                        "source": "stage1_policy_period_block",
+                    }
+                    has_eff = True
+                if not has_exp:
+                    fields["expiration_date"] = {
+                        "value": m_dash.group(2),
+                        "confidence": 0.95,
+                        "source": "stage1_policy_period_block",
+                    }
+                    has_exp = True
+                if has_eff and has_exp:
+                    return
 
         # Fallback: first two dates in the nearby block.
         dates = date_pat.findall(window)
@@ -3484,3 +4044,75 @@ def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
 def extract_with_regex(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     """Alias for backward compatibility"""
     return extract_fields(lines, layout_elements)
+
+# ============================================================
+# DEBUG HELPER - Call this to see exact OCR lines + extraction trace
+# ============================================================
+def debug_extract(lines, print_lines=True):
+    """
+    Debug wrapper: prints OCR lines and extraction trace.
+    Usage: from stage1_deterministic_agent import debug_extract; debug_extract(lines)
+    """
+    if print_lines:
+        print("=" * 70)
+        print(f"OCR LINES ({len(lines)} total)")
+        print("=" * 70)
+        for i, line in enumerate(lines):
+            print(f"  {i:3d}: {repr(line)}")
+    
+    print("\n" + "=" * 70)
+    print("EXTRACTION TRACE")
+    print("=" * 70)
+    
+    ext = StatefulExtractor()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        old_fields = set(ext.fields.keys())
+        old_role = ext.role
+        ext.update_role(line)
+        ext.extract(line)
+        new_fields = set(ext.fields.keys()) - old_fields
+        if new_fields or ext.role != old_role:
+            print(f"\n  Line {i:3d}: {repr(line[:80])}")
+            if ext.role != old_role:
+                print(f"           Role: {old_role} -> {ext.role}")
+            for f in new_fields:
+                v = ext.fields[f]
+                print(f"           +++ {f} = {repr(v.get('value', '?'))} (src={v.get('source', '?')})")
+    
+    ext.finalize()
+    _safe_sweep(lines, ext.fields)
+    _extract_mortgage_from_third_party(lines, ext.fields)
+    _extract_loan_from_third_party(lines, ext.fields)
+    _extract_mortgage_from_doi_address_block(lines, ext.fields)
+    _extract_policy_period_dates(lines, ext.fields)
+    _extract_can_inv_fields(lines, ext.fields)
+    _clean_carrier_ocr_bleed(ext.fields)
+    
+    print("\n" + "=" * 70)
+    print("FINAL RESULTS")
+    print("=" * 70)
+    # Show ALL extracted fields (not a hardcoded list)
+    if ext.fields:
+        for f in sorted(ext.fields.keys()):
+            v = ext.fields[f]
+            print(f"  ✅ {f}: {v.get('value', '?')} (src={v.get('source', '?')})")
+    else:
+        print("  No fields extracted")
+    
+    # Also show which common fields are missing
+    common_fields = [
+        "carrier_name", "policy_number", "insured_name",
+        "effective_date", "expiration_date",
+        "property_address", "mailing_address",
+        "mortgage_company", "loan_number", "total_premium",
+        "cancellation_date", "cancellation_reason",
+        "balance_due", "issue_date", "remit_info",
+    ]
+    missing = [f for f in common_fields if f not in ext.fields]
+    if missing:
+        print(f"\n  Missing: {', '.join(missing)}")
+    
+    return ext.fields
