@@ -17,8 +17,8 @@ def classify_policy(lines: List[str]) -> str:
     Classify insurance policy type (coverage OR cancellation subtype).
     
     Returns COVERAGE TYPES:
-        AUTO, ERQ, FIR, FLD, HAZ, HO, HO6, LL, UO, WND, UNK
-    
+        AUTO, ERQ, FIR, FLD, HAZ, HO, HO6, LL, UO, WND
+            
     Returns CANCELLATION SUBTYPES (reasons for CAN/DOI docs):
         BREQ - Borrower Request / Customer Initiated
         NPAY - Non-Payment of Premium
@@ -36,7 +36,7 @@ def classify_policy(lines: List[str]) -> str:
     - policy_type = BREQ (reason) or FLD (coverage)
     """
 
-    text = " ".join(lines).lower()
+    text = re.sub(r"\s+", " ", " ".join(lines).lower())
 
     # ==========================================================
     # DOI GUARD: If DOI signals are present, skip cancellation 
@@ -208,11 +208,16 @@ def classify_policy(lines: List[str]) -> str:
             "premium payment has not been received",
             "non-payment of premium",
             "nonpayment of premium",
+            "nonpayment of the required premium",
             "failure to pay premium",
             "premium not paid",
             "premium has not been paid",
             "payment is not received on or before",
+            "for nonpayment of",
         )):
+            return "NPAY"
+        # Regex fallback: "nonpayment" within 25 chars of "premium"
+        if re.search(r"nonpayment.{0,25}premium", text):
             return "NPAY"
 
         # NRNW — Non-Renewal
@@ -342,14 +347,35 @@ def classify_policy(lines: List[str]) -> str:
         return "HAZ"  # Map DS → HAZ per extraction taxonomy
 
     # MH (Manufactured Home) - check before HO
+    # If manufactured home has full HO coverage structure (Coverage A-F),
+    # it's a homeowners-style policy → HO. Otherwise → HAZ.
     if any(k in text for k in (
         "manufactured home",
         "mobile home",
-        "mobilehome",
         "policy type: manufactured home",
         "manufactured housing",
     )):
-        return "HO"  # Map MH → HO per extraction taxonomy
+        # Check for strong HO coverage structure
+        mh_ho_markers = sum(1 for cov in (
+            "coverage a", "coverage b", "coverage c", "coverage d",
+            "coverage e", "coverage f", "personal liability",
+            "medical payments", "loss of use",
+        ) if cov in text)
+        if mh_ho_markers >= 3 or "manufactured home policy" in text:
+            return "HO"  # Full HO structure → HO
+        return "HAZ"  # Standalone manufactured/mobile home → HAZ
+
+    # mobilehome (standalone, not "mobilehomeowners" which is HO)
+    if "mobilehome" in text and "mobilehomeowners" not in text:
+        # Check for strong HO coverage structure
+        mh_ho_markers2 = sum(1 for cov in (
+            "coverage a", "coverage b", "coverage c", "coverage d",
+            "coverage e", "coverage f", "personal liability",
+            "medical payments", "loss of use",
+        ) if cov in text)
+        if mh_ho_markers2 >= 3:
+            return "HO"
+        return "HAZ"  # Map mobilehome → HAZ per extraction taxonomy
 
     # COMMERCIAL_BOP (Businessowners Policy)
     if any(k in text for k in (
@@ -368,7 +394,7 @@ def classify_policy(lines: List[str]) -> str:
         "farm and ranch",
         "farmowners",
         "farm owners",
-    )):
+    )) or bool(re.search(r"\bfarm\s+ranch\b", text)):
         return "HAZ"  # Map FARM → HAZ per extraction taxonomy
 
     fir_strong = any(k in text for k in (
@@ -486,6 +512,7 @@ def classify_policy(lines: List[str]) -> str:
         "earthquake insurance",
     )):
         # Guard: "does not provide earthquake" / "earthquake is excluded" = disclaimer
+        # Guard: "earthquake deductible" = just a deductible field in a declaration page
         erq_excluded = any(k in text for k in (
             "does not provide earthquake",
             "not provide earthquake coverage",
@@ -498,6 +525,8 @@ def classify_policy(lines: List[str]) -> str:
             "peril of earthquake",
             "coverage for earthquake",
             "not have coverage for",
+            # Deductible field labels in declarations — not an earthquake policy
+            "earthquake deductible",
         ))
         if not erq_excluded:
             return "ERQ"
@@ -562,8 +591,9 @@ def classify_policy(lines: List[str]) -> str:
         "condominium new business",
         "condominium renewal",
         "condominium policy change",
-        # QBE / multi-peril with condo
-        "e&s multi-peril",
+        # QBE / multi-peril with condo context
+        # NOTE: "e&s multi-peril" alone is NOT HO6 — it's a generic specialty
+        # label. Only triggers HO6 if actual condo indicators are present.
     ))
     
     if not ho6_strong:
@@ -669,6 +699,30 @@ def classify_policy(lines: List[str]) -> str:
             return "HAZ"
 
     # ==========================================================
+    # 9b. "House & Home" → HAZ (Allstate policy type label)
+    # MUST be checked BEFORE HO scoring, because Allstate
+    # "House & Home" docs contain generic HO markers like
+    # "dwelling" and "deductible" that would falsely trigger HO.
+    # Guard: Third Party Notice of Termination should be BREQ,
+    # not HAZ, even when "House & Home" policy type label is present.
+    # ==========================================================
+    if any(k in text for k in (
+        "house & home",
+        "house and home",
+        "policy type: house",
+    )):
+        return "HAZ"
+
+    # ==========================================================
+    # 9c. "E&S Multi-Peril" → HAZ (QBE/Specialty surplus lines)
+    # E&S Multi-Peril is a specialty/surplus lines product that
+    # may have Coverage A-F structure but is NOT a standard HO policy.
+    # Must be checked BEFORE HO scoring to avoid false HO match.
+    # ==========================================================
+    if "e&s multi-peril" in text:
+        return "HAZ"
+
+    # ==========================================================
     # 10. HOMEOWNERS (HO) — needs STRONG residential signals
     # Requires 3+ of: coverage a-f, dwelling, personal liability,
     # home protection, policy declarations, residence premises, etc.
@@ -714,25 +768,7 @@ def classify_policy(lines: List[str]) -> str:
 
     # (Cancellation sub-types moved to step 0 at top)
 
-    # ==========================================================
-    # 12. "House & Home" → HAZ (Allstate policy type label)
-    # Guard: Third Party Notice of Termination should be BREQ,
-    # not HAZ, even when "House & Home" policy type label is present.
-    # ==========================================================
-    if any(k in text for k in (
-        "house & home",
-        "house and home",
-        "policy type: house",
-    )):
-        # Guard: if this is a Third Party Notice of Termination with 
-        # policy termination, it should have been caught as BREQ above.
-        # If we reach here, it's a genuine HAZ coverage type.
-        if "third party notice of termination" not in text:
-            return "HAZ"
-        # For TPN docs, we want the cancellation subtype (BREQ/CEL) 
-        # to take priority, but if we reached here, fall through to 
-        # check other coverage types or return HAZ as last resort
-        return "HAZ"
+    # (Step 12 "House & Home" moved to step 9b above HO scoring)
 
     # ==========================================================
     # 13. "Homeowners Policy" standalone → HO
@@ -747,15 +783,31 @@ def classify_policy(lines: List[str]) -> str:
         return "HO"
 
     # ==========================================================
-    # 14. MOBILEHOME → HO (per table: HO includes Mobile Home)
+    # 14. MOBILEHOME → HAZ or HO depending on coverage structure
+    # Note: "mobilehomeowners" maps to HO (handled in HO scoring)
     # ==========================================================
     if any(k in text for k in (
         "mobile home",
-        "mobilehome",
         "manufactured home",
         "policy type: manufactured home",
     )):
-        return "HO"
+        mh_ho_late = sum(1 for cov in (
+            "coverage a", "coverage b", "coverage c", "coverage d",
+            "coverage e", "coverage f", "personal liability",
+            "medical payments", "loss of use",
+        ) if cov in text)
+        if mh_ho_late >= 3 or "manufactured home policy" in text:
+            return "HO"
+        return "HAZ"
+    if "mobilehome" in text and "mobilehomeowners" not in text:
+        mh_ho_late2 = sum(1 for cov in (
+            "coverage a", "coverage b", "coverage c", "coverage d",
+            "coverage e", "coverage f", "personal liability",
+            "medical payments", "loss of use",
+        ) if cov in text)
+        if mh_ho_late2 >= 3:
+            return "HO"
+        return "HAZ"
 
     # ==========================================================
     # DEFAULT
@@ -800,7 +852,7 @@ CANCELLATION_REASONS = {
 
 
 def classify_cancellation_reason(lines):
-    text = " ".join(lines).lower()
+    text = re.sub(r"\s+", " ", " ".join(lines).lower())
     for reason_type, keywords in CANCELLATION_REASONS.items():
         for keyword in keywords:
             if keyword in text:

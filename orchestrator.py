@@ -395,6 +395,14 @@ CRITICAL_FIELDS = [
     "expiration_date",
 ]
 
+IMPORTANT_FIELDS = [
+    "property_address",
+    "mailing_address",
+    "mortgage_company",
+    "loan_number",
+    "total_premium",
+]
+
 ALL_KNOWN_FIELDS = [
     "carrier_name", "policy_number", "insured_name",
     "effective_date", "expiration_date",
@@ -456,6 +464,20 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         vision = _vision_agent
 
         ocr = vision.ocr_engine.run_with_boxes(processed)
+
+        # ── OCR RECOVERY ──────────────────────────────────────────
+        # If PaddleOCR returns empty (possible singleton corruption
+        # from use_mp / mkldnn), recreate the engine and retry once.
+        if not ocr or not ocr.get("text"):
+            print("[PIPELINE] OCR returned empty — recreating OCR engine and retrying")
+            try:
+                from api.ocr_engine import OCREngine
+                vision.ocr_engine = OCREngine()
+                ocr = vision.ocr_engine.run_with_boxes(processed)
+            except Exception as retry_err:
+                print(f"[PIPELINE] OCR retry failed: {retry_err}")
+        # ──────────────────────────────────────────────────────────
+
         if not ocr or not ocr.get("text"):
             return _empty_result("No OCR text")
 
@@ -566,15 +588,22 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         # ============================
         # STAGE 3 — EXECUTE PRIMARY APPROACH
         # ============================
-        # MULTI-PAGE OPTIMIZATION: If prior pages already found fields,
-        # reduce the target field set so we don't run expensive agents
-        # for fields we already have.
+        # MULTI-PAGE OPTIMIZATION: If prior pages already found reliable fields,
+        # reduce target set; keep low-confidence/placeholder values eligible.
         target_fields = routing.all_target_fields
         if prior_fields:
-            target_fields = [
-                f for f in target_fields
-                if f not in prior_fields
-            ]
+            target_fields = []
+            for f in routing.all_target_fields:
+                prev = prior_fields.get(f)
+                if not isinstance(prev, dict):
+                    target_fields.append(f)
+                    continue
+                prev_value = prev.get("value")
+                prev_conf = float(prev.get("confidence", 0) or 0)
+                prev_reason = prev.get("reason")
+                # Re-extract if prior value is missing/weak/placeholder.
+                if prev_reason or prev_value in (None, "", [], "N/A") or prev_conf < 0.80:
+                    target_fields.append(f)
             if debug:
                 print(f"[MULTI-PAGE] {len(prior_fields)} fields from prior pages, "
                       f"{len(target_fields)} still needed")
@@ -605,23 +634,21 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         # ============================
         # STAGE 4 — CONDITIONAL FALLBACK
         # ============================
-        # OPTIMIZATION: Only trigger fallback for CRITICAL required fields
-        # that are truly missing (not just optional gaps)
-        missing_critical = missing_required_fields(
+        # Trigger fallback for missing expected fields (critical + important).
+        missing_expected = missing_required_fields(
             primary_result,
             routing.required_fields
         )
-        # Filter to only truly critical fields worth a fallback run
         worth_fallback = [
-            f for f in missing_critical
-            if f in CRITICAL_FIELDS
+            f for f in missing_expected
+            if f in CRITICAL_FIELDS or f in IMPORTANT_FIELDS
         ]
 
         fallback_result: Dict[str, Dict] = {}
 
         if worth_fallback and routing.fallback:
             if debug:
-                print(f"\n[FALLBACK] Missing critical: {worth_fallback}")
+                print(f"\n[FALLBACK] Missing expected: {worth_fallback}")
                 print(f"[FALLBACK] Running {routing.fallback.value}")
 
             fallback_result = _execute_approach(
@@ -641,10 +668,10 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
                       f"{len(fallback_result)} fields: "
                       f"{list(fallback_result.keys())}")
         elif debug:
-            if not missing_critical:
+            if not missing_expected:
                 print("[FALLBACK] Skipped — no required fields missing")
             elif not worth_fallback:
-                print(f"[FALLBACK] Skipped — only non-critical missing: {missing_critical}")
+                print(f"[FALLBACK] Skipped — only non-target missing: {missing_expected}")
             else:
                 print("[FALLBACK] Skipped — no fallback defined "
                       f"for {routing.approach.value}")
@@ -677,6 +704,7 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             },
             doc_type=routing.doc_type,
             policy_type=routing.policy_type,
+            lines=lines,
         )
 
         if debug:
@@ -695,13 +723,14 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
             "routing_reason": routing.reason,
             "fallback_used": routing.fallback.value if (
                 worth_fallback and routing.fallback) else None,
+                "expected_fields": routing.required_fields,
         }
 
     except Exception as e:
-        if debug:
-            import traceback
-            print(f"[ERROR] Pipeline failed: {e}")
-            traceback.print_exc()
+        # FIXED: Always log pipeline errors (not just in debug mode)
+        import traceback
+        print(f"[PIPELINE ERROR] {e}")
+        traceback.print_exc()
         return _empty_result(str(e))
 
 
@@ -893,6 +922,13 @@ def run_pipeline_batch(images, max_retries=1, debug=False, use_cache=True):
         # Accumulate fields for next page
         for k, v in result.get("fields", {}).items():
             if k not in accumulated_fields:
+                accumulated_fields[k] = v
+                continue
+            prev = accumulated_fields.get(k, {})
+            prev_conf = float(prev.get("confidence", 0) or 0) if isinstance(prev, dict) else 0.0
+            new_conf = float(v.get("confidence", 0) or 0) if isinstance(v, dict) else 0.0
+            # Prefer stronger later-page value over weaker early-page value.
+            if new_conf > prev_conf:
                 accumulated_fields[k] = v
 
     return results

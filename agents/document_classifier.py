@@ -3,7 +3,7 @@ Document Type Classifier - CLEAN ARCHITECTURE VERSION
 Returns ONLY valid document types (structural classification).
 Policy types and cancellation subtypes are handled by policy_classifier.
 
-Valid document types: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
+Valid document types: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH
 NOT returned: FPN, NRNW, BREQ/BRQ (these are policy subtypes)
 """
 from typing import List
@@ -18,7 +18,6 @@ VALID_DOC_TYPES = {
     "RNW",  # Renewal/Declarations
     "CAN",  # Cancellation (includes non-renewal structurally)
     "OTH",  # Other
-    "UNK",  # Unknown
 }
 
 # REMOVED FROM VALID DOCUMENT TYPES:
@@ -178,10 +177,10 @@ DOC_TYPES = {
 def classify_document(lines: List[str]) -> str:
     """
     Classify insurance document type based on STRUCTURE only.
-    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH, UNK
+    Returns: BIN, COI, DOI, INV, RNS, RNW, CAN, OTH
 
     Valid doc types per business rules:
-      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN, UNK
+      BIN, COI, DOI, INV, RNS, RNW, OTH, CAN
     
     Does NOT return (these are policy subtypes handled by policy_classifier):
       FPN   - Force Placed Notice (removed from valid types)

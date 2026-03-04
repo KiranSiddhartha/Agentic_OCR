@@ -52,30 +52,31 @@ ALL_POLICY_TYPES = COVERAGE_TYPES | CANCELLATION_SUBTYPES | {"OTH"}
 # FIELD RULES BY DOCUMENT TYPE
 # ============================================================
 
+# ============================================================
+# BASE DOCUMENT FIELDS (strict per-document-type base)
+# These are the MINIMUM fields for each document type.
+# Policy-type expansion adds fields ON TOP of these.
+# ============================================================
+
 FIELD_RULES = {
-    "RNW": {
+    "CAN": {
+        # Base = 5 fields
         "carrier_name",
         "policy_number",
         "insured_name",
-        "property_address",
-        "mailing_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
+        "cancellation_date",
+        "cancellation_reason",
     },
-    "FLD": {
+    "RNW": {
+        # Base = 5 fields
         "carrier_name",
         "policy_number",
         "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
         "effective_date",
         "expiration_date",
     },
     "INV": {
+        # Base = 6 fields
         "carrier_name",
         "policy_number",
         "insured_name",
@@ -83,26 +84,14 @@ FIELD_RULES = {
         "issue_date",
         "remit_info",
     },
-    "CAN": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-        "property_address",  # ADDED - often needed
-        "mortgage_company",  # ADDED - often needed
-    },
     "DOI": {
-        "carrier_name",
+        # Base = 3 fields
         "policy_number",
         "mortgage_company",
         "loan_number",
-        "insured_name",  # ADDED - usually present
-        "property_address",  # ADDED - usually present
     },
     "RNS": {
+        # Base = 5 fields (NO expansion for any policy type)
         "carrier_name",
         "policy_number",
         "insured_name",
@@ -110,6 +99,7 @@ FIELD_RULES = {
         "expiration_date",
     },
     "COI": {
+        # Base = 6 fields (NO expansion for any policy type)
         "carrier_name",
         "policy_number",
         "insured_name",
@@ -118,6 +108,7 @@ FIELD_RULES = {
         "expiration_date",
     },
     "BIN": {
+        # Base = 6 fields (NO expansion for any policy type)
         "carrier_name",
         "policy_number",
         "insured_name",
@@ -126,192 +117,175 @@ FIELD_RULES = {
         "expiration_date",
     },
     "OTH": {
+        # Base = 5 fields (NO expansion for any policy type)
         "carrier_name",
         "policy_number",
         "insured_name",
         "property_address",
-        "loan_number", 
-    } 
+        "loan_number",
+    },
 }
 
 # ============================================================
 # FIELD RULES BY POLICY TYPE
 # ============================================================
 
+# ============================================================
+# POLICY-TYPE EXPANSION FIELDS
+# These are the ADDITIONAL fields added on top of the document
+# base when a specific policy type is detected.
+# Only CAN, RNW, INV, DOI expand — RNS, COI, BIN, OTH do NOT.
+# ============================================================
+
+# --- CAN EXPANSION (base=5) ---
+# +2 fields: HO, FLD, FIR, BREQ, NPAY, NRNW, UNWR
+# +1 field:  HAZ, HO6, LL, WND, ERQ
+# +0 fields: AUTO, UO, CEL, OTH
+CAN_EXPANSION = {
+    "HO":   {"property_address", "mortgage_company"},         # 5+2=7
+    "FLD":  {"property_address", "mortgage_company"},         # 5+2=7
+    "FIR":  {"property_address", "mortgage_company"},         # 5+2=7
+    "HAZ":  {"property_address"},                             # 5+1=6
+    "HO6":  {"property_address"},                             # 5+1=6
+    "LL":   {"property_address"},                             # 5+1=6
+    "WND":  {"property_address"},                             # 5+1=6
+    "ERQ":  {"property_address"},                             # 5+1=6
+    "AUTO": set(),                                            # 5+0=5
+    "UO":   set(),                                            # 5+0=5
+    "BREQ": {"property_address", "mortgage_company"},         # 5+2=7
+    "NPAY": {"property_address", "mortgage_company"},         # 5+2=7
+    "NRNW": {"property_address", "mortgage_company"},         # 5+2=7
+    "UNWR": {"property_address", "mortgage_company"},         # 5+2=7
+    "CEL":  set(),                                            # 5+0=5
+    "OTH":  set(),                                            # 5+0=5
+}
+
+# --- RNW EXPANSION (base=5) ---
+# +5 fields: HO  (property_address, mailing_address, mortgage_company, loan_number, total_premium)
+# +4 fields: FIR (property_address, mortgage_company, loan_number, total_premium)
+# +3 fields: FLD (property_address, mortgage_company, loan_number)
+# +3 fields: HO6 (property_address, mailing_address, total_premium)
+# +2 fields: HAZ, LL, WND, ERQ (property_address, total_premium)
+# +1 field:  AUTO (total_premium)
+# +0 fields: UO, BREQ, NPAY, NRNW, UNWR, CEL, OTH
+RNW_EXPANSION = {
+    "HO":   {"property_address", "mailing_address", "mortgage_company", "loan_number", "total_premium"},  # 5+5=10
+    "FLD":  {"property_address", "mortgage_company", "loan_number"},                                       # 5+3=8
+    "FIR":  {"property_address", "mortgage_company", "loan_number", "total_premium"},                      # 5+4=9
+    "HAZ":  {"property_address", "total_premium"},                                                         # 5+2=7
+    "HO6":  {"property_address", "mailing_address", "total_premium"},                                      # 5+3=8
+    "LL":   {"property_address", "total_premium"},                                                         # 5+2=7
+    "WND":  {"property_address", "total_premium"},                                                         # 5+2=7
+    "ERQ":  {"property_address", "total_premium"},                                                         # 5+2=7
+    "AUTO": {"total_premium"},                                                                             # 5+1=6
+    "UO":   set(),                                                                                         # 5+0=5
+    "BREQ": set(),                                                                                         # 5+0=5
+    "NPAY": set(),                                                                                         # 5+0=5
+    "NRNW": set(),                                                                                         # 5+0=5
+    "UNWR": set(),                                                                                         # 5+0=5
+    "CEL":  set(),                                                                                         # 5+0=5
+    "OTH":  set(),                                                                                         # 5+0=5
+}
+
+# --- INV EXPANSION (base=6) ---
+# +1 field: HO, FLD, FIR, HAZ, HO6, LL, WND, ERQ (property_address)
+# +0 fields: AUTO, UO, BREQ, NPAY, NRNW, UNWR, CEL, OTH
+INV_EXPANSION = {
+    "HO":   {"property_address"},   # 6+1=7
+    "FLD":  {"property_address"},   # 6+1=7
+    "FIR":  {"property_address"},   # 6+1=7
+    "HAZ":  {"property_address"},   # 6+1=7
+    "HO6":  {"property_address"},   # 6+1=7
+    "LL":   {"property_address"},   # 6+1=7
+    "WND":  {"property_address"},   # 6+1=7
+    "ERQ":  {"property_address"},   # 6+1=7
+    "AUTO": set(),                  # 6+0=6
+    "UO":   set(),                  # 6+0=6
+    "BREQ": set(),                  # 6+0=6
+    "NPAY": set(),                  # 6+0=6
+    "NRNW": set(),                  # 6+0=6
+    "UNWR": set(),                  # 6+0=6
+    "CEL":  set(),                  # 6+0=6
+    "OTH":  set(),                  # 6+0=6
+}
+
+# --- DOI EXPANSION (base=3) ---
+# +1 field: HO, FLD (property_address)
+# +0 fields: all others
+DOI_EXPANSION = {
+    "HO":   {"property_address"},   # 3+1=4
+    "FLD":  {"property_address"},   # 3+1=4
+    "FIR":  set(),                  # 3+0=3
+    "HAZ":  set(),                  # 3+0=3
+    "HO6":  set(),                  # 3+0=3
+    "LL":   set(),                  # 3+0=3
+    "WND":  set(),                  # 3+0=3
+    "ERQ":  set(),                  # 3+0=3
+    "AUTO": set(),                  # 3+0=3
+    "UO":   set(),                  # 3+0=3
+    "BREQ": set(),                  # 3+0=3
+    "NPAY": set(),                  # 3+0=3
+    "NRNW": set(),                  # 3+0=3
+    "UNWR": set(),                  # 3+0=3
+    "CEL":  set(),                  # 3+0=3
+    "OTH":  set(),                  # 3+0=3
+}
+
+# Master expansion lookup (only expandable doc types)
+EXPANSION_MATRIX = {
+    "CAN": CAN_EXPANSION,
+    "RNW": RNW_EXPANSION,
+    "INV": INV_EXPANSION,
+    "DOI": DOI_EXPANSION,
+}
+
+# NO-EXPANSION doc types — always return base only
+NO_EXPANSION_DOCS = {"RNS", "COI", "BIN", "OTH"}
+
+# Legacy compatibility alias
 POLICY_FIELD_RULES = {
-    # COVERAGE TYPES
-    "HO": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mailing_address",
-        "loan_number",
-        "mortgage_company",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "FLD": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "loan_number",
-        "mortgage_company",
-        "effective_date",
-        "expiration_date",
-    },
-    "AUTO": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "FIR": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-        "mortgage_company",  # ADDED - fire policies often have mortgagee
-        "loan_number",  # ADDED
-    },
-    "WND": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "ERQ": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "HO6": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mailing_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "LL": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "HAZ": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "effective_date",
-        "expiration_date",
-        "total_premium",
-    },
-    "UO": {
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "effective_date",
-        "expiration_date",
-    },
-    
-    # CANCELLATION SUBTYPES (REASONS)
-    "BREQ": {
-        # Borrower Request cancellation
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-    },
-    "NPAY": {
-        # Non-Payment cancellation
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-    },
-    "NRNW": {
-        # Non-Renewal
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-    },
-    "UNWR": {
-        # Underwriting cancellation
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-    },
-    "CEL": {
-        # Generic cancellation
-        "carrier_name",
-        "policy_number",
-        "insured_name",
-        "property_address",
-        "mortgage_company",
-        "loan_number",
-        "effective_date",
-        "expiration_date",
-        "cancellation_date",
-        "cancellation_reason",
-    },
-    
-    # UNKNOWN
-    "OTH": {
-        "carrier_name",
-        "policy_number",
-        "loan_number",
-    },
+    "HO": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "mailing_address", "loan_number", "mortgage_company",
+            "effective_date", "expiration_date", "total_premium"},
+    "FLD": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "loan_number", "mortgage_company", "effective_date", "expiration_date"},
+    "AUTO": {"carrier_name", "policy_number", "insured_name",
+             "effective_date", "expiration_date", "total_premium"},
+    "FIR": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "effective_date", "expiration_date", "total_premium",
+            "mortgage_company", "loan_number"},
+    "WND": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "effective_date", "expiration_date", "total_premium"},
+    "ERQ": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "effective_date", "expiration_date", "total_premium"},
+    "HO6": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "mailing_address", "effective_date", "expiration_date", "total_premium"},
+    "LL": {"carrier_name", "policy_number", "insured_name", "property_address",
+           "effective_date", "expiration_date", "total_premium"},
+    "HAZ": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "effective_date", "expiration_date", "total_premium"},
+    "UO": {"carrier_name", "policy_number", "insured_name",
+           "effective_date", "expiration_date"},
+    "BREQ": {"carrier_name", "policy_number", "insured_name", "property_address",
+             "mortgage_company", "loan_number", "effective_date", "expiration_date",
+             "cancellation_date", "cancellation_reason"},
+    "NPAY": {"carrier_name", "policy_number", "insured_name", "property_address",
+             "mortgage_company", "loan_number", "effective_date", "expiration_date",
+             "cancellation_date", "cancellation_reason"},
+    "NRNW": {"carrier_name", "policy_number", "insured_name", "property_address",
+             "mortgage_company", "loan_number", "effective_date", "expiration_date",
+             "cancellation_date", "cancellation_reason"},
+    "UNWR": {"carrier_name", "policy_number", "insured_name", "property_address",
+             "mortgage_company", "loan_number", "effective_date", "expiration_date",
+             "cancellation_date", "cancellation_reason"},
+    "CEL": {"carrier_name", "policy_number", "insured_name", "property_address",
+            "mortgage_company", "loan_number", "effective_date", "expiration_date",
+            "cancellation_date", "cancellation_reason"},
+    "OTH": {"carrier_name", "policy_number", "loan_number"},
 }
 
 # ============================================================
-# FIELD SELECTION LOGIC - IMPROVED
+# FIELD SELECTION LOGIC - DETERMINISTIC MATRIX
 # ============================================================
 
 def get_allowed_fields(
@@ -321,41 +295,29 @@ def get_allowed_fields(
     """
     Determine allowed fields based on document and policy type.
 
-    Improved Rules:
-    - RNW / HO / HAZ → UNION of document + policy rules
-    - CAN / DOI → UNION instead of intersection (more permissive)
-    - Others → document rules only
-    
-    Rationale: Intersection was too restrictive and caused field loss.
-    For CAN and DOI documents, we want ALL relevant fields from both
-    document and policy perspectives.
+    DETERMINISTIC MATRIX RULES (128 combinations):
+    ─────────────────────────────────────────────────
+    • RNS, COI, BIN, OTH → base fields ONLY (no expansion)
+    • CAN, RNW, INV, DOI → base fields + policy-type expansion
+    • No dynamic merging, no intersection, no union heuristics
+    • All 128 combinations produce exact, auditable field counts
+
+    Returns: Set of allowed field names for the given combination.
     """
-    doc_fields: Set[str] = FIELD_RULES.get(document_type, set())
-    policy_fields: Set[str] = (
-        POLICY_FIELD_RULES.get(policy_type, set())
-        if policy_type
-        else set()
-    )
+    # Get base document fields (always present)
+    base_fields: Set[str] = set(FIELD_RULES.get(document_type, set()))
 
-    if document_type in {"RNW", "HO", "HAZ"}:
-        return doc_fields | policy_fields
+    # No-expansion document types — return base only regardless of policy
+    if document_type in NO_EXPANSION_DOCS:
+        return base_fields
 
-    # Strict intersection for CAN/DOI, but with fallback
-    if document_type in {"CAN", "DOI"}:
-        if not policy_fields:
-            # Policy type unknown or not in our list - use doc fields only
-            return doc_fields
-        
-        intersection = doc_fields & policy_fields
-        
-        if len(intersection) < 3:
-            # Intersection too small - likely a mismatch, use union instead
-            print(f"WARNING: Small intersection for {document_type}-{policy_type}, using union")
-            return doc_fields | policy_fields
-        
-        return intersection
+    # Expandable document types — look up expansion matrix
+    if document_type in EXPANSION_MATRIX and policy_type:
+        expansion = EXPANSION_MATRIX[document_type].get(policy_type, set())
+        return base_fields | expansion
 
-    return doc_fields
+    # Fallback: unknown policy type → base only
+    return base_fields
 
 # ============================================================
 # VALIDATION FUNCTIONS
