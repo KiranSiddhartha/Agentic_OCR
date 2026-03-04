@@ -282,6 +282,24 @@ def _extract_with_rules(
             if not _INSURED_NAME_SKIP.search(line):
                 val = _try_labels(line, nxt, _INSURED_NAME_LABELS, nxt2)
                 if val:
+                    # CRITICAL FIX: Handle split-line names like "Named Insured: YOKO\nMATSUMOTO"
+                    # When inline value is a single word (partial name), combine with next line
+                    val_stripped = val.strip()
+                    val_words = val_stripped.split()
+                    if len(val_words) == 1 and val_stripped.replace(",", "").isalpha():
+                        # Single word name — likely split across lines
+                        # Check if next line is a continuation (also a single uppercase name word)
+                        if nxt and nxt.strip():
+                            nxt_stripped = nxt.strip()
+                            nxt_words = nxt_stripped.split()
+                            # Combine if next line looks like a name part (1-3 words, alphabetic, not a label)
+                            if (1 <= len(nxt_words) <= 3
+                                and all(w.replace(",", "").replace(".", "").isalpha() for w in nxt_words)
+                                and not any(b in nxt_stripped.lower() for b in (
+                                    "policy", "number", "period", "effective", "date",
+                                    "address", "coverage", "premium", "mortgage",
+                                    "page", "continued", "section"))):
+                                val = val_stripped + " " + nxt_stripped
                     # Truncate at address patterns (digit + street name)
                     addr_m = re.search(r'\s+\d+\s+\w+\s+(?:st|street|ave|'
                                        r'avenue|rd|road|blvd|dr|drive|ln|'
@@ -293,10 +311,21 @@ def _extract_with_rules(
                     if addr_m2 and len(val[:addr_m2.start()].split()) >= 2:
                         val = val[:addr_m2.start()].strip()
                     # Normalize OCR mixed-case corruption: "GIlLIS, DaVId" → "GILLIS, DAVID"
-                    # If the string has suspicious mixed-case (uppercase letters mid-word),
-                    # normalize to uppercase for consistent validation and display.
                     if re.search(r'[A-Z][a-z][A-Z]', val) or re.search(r'[a-z][A-Z]', val):
                         val = val.upper()
+                    # CRITICAL: Strip garbled label prefixes from name values
+                    # E.g., "NANEAND ADDRESO OCTHEINSURED Dashiell Lopez" → strip prefix
+                    garbled_pats = [
+                        r"(?i)^.*?(?:NAMEAND|NANEAND|ADDRESO|OCTHE|OFTHE)(?:INSURED|INSUREO|LNSURED)?\s*",
+                        r"(?i)^.*?(?:INSUREDNAME|INSUREONAME|INSUREDMAILING)\s*",
+                    ]
+                    for gpat in garbled_pats:
+                        gm = re.match(gpat, val)
+                        if gm and gm.end() < len(val):
+                            remainder = val[gm.end():].strip()
+                            if remainder and len(remainder) > 3:
+                                val = remainder
+                                break
                     if _valid_name(val):
                         out["insured_name"] = _r(
                             _clean_isaoa(val), "sc_insured", 0.82)
@@ -653,6 +682,26 @@ def _after_match(line: str, m) -> Optional[str]:
 
 def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
     """Detect carrier name by keyword matching (no label)."""
+    # KNOWN CARRIERS for fuzzy matching against OCR-garbled text
+    _KNOWN_CARRIERS = [
+        "QBE SPECIALTY INSURANCE COMPANY",
+        "ALLSTATE INDEMNITY COMPANY",
+        "ALLSTATE VEHICLE AND PROPERTY INSURANCE COMPANY",
+        "STATE FARM FIRE AND CASUALTY COMPANY",
+        "NATIONWIDE MUTUAL INSURANCE COMPANY",
+        "TRAVELERS HOME AND MARINE INSURANCE COMPANY",
+        "LIBERTY MUTUAL FIRE INSURANCE COMPANY",
+        "SAFECO INSURANCE COMPANY OF AMERICA",
+        "ERIE INSURANCE EXCHANGE",
+        "AMERICAN FAMILY INSURANCE COMPANY",
+        "CITIZENS PROPERTY INSURANCE CORPORATION",
+        "UNIVERSAL PROPERTY AND CASUALTY INSURANCE COMPANY",
+        "FEDERATED NATIONAL INSURANCE COMPANY",
+        "AEGIS SECURITY INSURANCE COMPANY",
+        "HARTFORD FIRE INSURANCE COMPANY",
+        "ANCHOR SPECIALTY INSURANCE COMPANY",
+    ]
+    
     for line in lines[:40]:
         ll = line.lower().strip()
         if not ll or len(ll) > 120:
@@ -683,6 +732,32 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
                          r'Summary|Page\s*\d).*$', '', val, flags=re.I).strip()
             if val and len(val) > 5:
                 return _r(val, "sc_carrier_kw", 0.80)
+    
+    # Fuzzy matching fallback: try to match OCR-garbled carrier names
+    # E.g., "BOWARE QSE SPECATY INSURANCE COMPANY" → "QBE SPECIALTY INSURANCE COMPANY"
+    try:
+        from difflib import SequenceMatcher
+        for line in lines[:40]:
+            ll = line.lower().strip()
+            if not ll or len(ll) > 120 or len(ll) < 10:
+                continue
+            # Must contain something resembling "insurance" or similar
+            has_ins_hint = any(w in ll for w in ('insuran', 'indemn', 'casualt', 'assuran',
+                                                  'company', 'exchang', 'mutual', 'corp'))
+            if not has_ins_hint:
+                continue
+            val = line.strip()
+            val_upper = val.upper()
+            best_match, best_score = None, 0
+            for known in _KNOWN_CARRIERS:
+                score = SequenceMatcher(None, val_upper, known).ratio()
+                if score > best_score:
+                    best_match, best_score = known, score
+            if best_score > 0.55 and best_match:  # 55% similarity threshold
+                return _r(best_match, "sc_carrier_fuzzy", 0.78)
+    except ImportError:
+        pass
+    
     return None
 
 
@@ -1523,6 +1598,17 @@ def _valid_loan_number(text: str) -> bool:
 def _valid_name(text: str) -> bool:
     if not text or ":" in text:
         return False
+    
+    # CRITICAL: Reject OCR-garbled label text masquerading as names
+    # E.g., "NANEAND ADDRESO OCTHEINSURED Daael Lome?" = garbled label + garbled name
+    ll_nospace = re.sub(r'\s+', '', text.lower())
+    _garbled_frags = ("nameand", "naneand", "addreso", "octhe", "ofthe",
+                      "theinsured", "insuredname", "namedinsured",
+                      "addressof", "nameandaddress", "coveredbythis",
+                      "insuredlocation")
+    if any(f in ll_nospace for f in _garbled_frags):
+        return False
+    
     has_entity = any(w in text.lower()
                      for w in ("llc", "inc", "corp", "company", "trust"))
     if any(c.isdigit() for c in text) and not has_entity:
@@ -1533,13 +1619,17 @@ def _valid_name(text: str) -> bool:
            "mortgagee", "agency", "agent", "services",
            "property", "mailing", "address", "number",
            "effective", "expiration", "document", "produced",
-           "information", "renewal", "type")
+           "information", "renewal", "type",
+           "copyright", "copyrighted", "includes copyrighted",
+           "office, inc", "permission")
     if any(b in ll for b in bad):
         return False
     words = text.split()
     if has_entity:
         return 1 <= len(words) <= 10
-    return 1 <= len(words) <= 8
+    # Require at least 2 words for person names — single word is almost
+    # always a partial name from OCR splitting across lines
+    return 2 <= len(words) <= 8
 
 
 def _valid_address(text: str) -> bool:

@@ -415,12 +415,20 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
         "nationwide", "allstate", "state farm", "geico", "progressive",
         "travelers", "liberty mutual", "farmers", "usaa", "erie",
         "safeco", "hartford", "hanover", "encompass", "auto-owners",
-        "american family", "citizens", "universal", "federated",
+        "american family", "citizens", "universal", "federated", "aegis",
         "chubb", "amica", "kemper", "mercury", "shelter",
     }
     v_lower_check = v.lower().strip().rstrip("'\"")
-    if v_lower_check in KNOWN_CARRIER_BRANDS:
+    v_brand_norm = re.sub(r'[^a-z0-9\s]+', '', v_lower_check).strip()
+    if v_lower_check in KNOWN_CARRIER_BRANDS or v_brand_norm in KNOWN_CARRIER_BRANDS:
         return True, v.strip().rstrip("'\""), 0.95
+    # Handle OCR lines that include instructions/web URLs instead of clean carrier text.
+    # Example: "SIMPLY GO TO OURAEGISINSURANCE.COM WEBSITE..." -> "AEGIS"
+    if re.search(r'(?i)\b(?:website|www\.|\.com|go to|select)\b', v):
+        for brand in sorted(KNOWN_CARRIER_BRANDS, key=len, reverse=True):
+            token = brand.replace(" ", "")
+            if token and (token in v_brand_norm.replace(" ", "") or re.search(rf'\b{re.escape(brand)}\b', v_lower_check)):
+                return True, brand.upper(), 0.95
     # Strip common OCR tail-noise appended after carrier names.
     v = re.sub(
         r'(?i)\s+(?:policy\s+that\s+apply|policy\s+that\s+applies|policy\s+that\s+app|policy\s+that)\b.*$',
@@ -432,7 +440,35 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
     v_clean = v.replace('*', '').replace('/', '').strip(); vl_clean = v_clean.lower()
     if any(b in vl_clean for b in BAD_CARRIER_PATTERNS) or any(w in vl_clean for w in ('agency', 'agent', 'services', 'producer')): return False, v, 0.0
     has_ins = ('insurance' in vl_clean or ' ins ' in vl_clean or vl_clean.endswith(' ins') or ' ins.' in vl_clean or 'indemnity' in vl_clean or 'casualty' in vl_clean or 'assurance' in vl_clean or 'trust' in vl_clean or ('fire' in vl_clean and any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corp', 'mutual'))))
-    if not has_ins: return False, v, 0.0
+    if not has_ins:
+        # Try fuzzy matching against known carriers before rejecting
+        _KNOWN_CARRIERS_VAL = [
+            "QBE SPECIALTY INSURANCE COMPANY",
+            "ALLSTATE INDEMNITY COMPANY",
+            "STATE FARM FIRE AND CASUALTY COMPANY",
+            "NATIONWIDE MUTUAL INSURANCE COMPANY",
+            "TRAVELERS HOME AND MARINE INSURANCE COMPANY",
+            "LIBERTY MUTUAL FIRE INSURANCE COMPANY",
+            "SAFECO INSURANCE COMPANY OF AMERICA",
+            "ERIE INSURANCE EXCHANGE",
+            "AMERICAN FAMILY INSURANCE COMPANY",
+            "CITIZENS PROPERTY INSURANCE CORPORATION",
+            "AEGIS SECURITY INSURANCE COMPANY",
+            "ANCHOR SPECIALTY INSURANCE COMPANY",
+        ]
+        try:
+            from difflib import SequenceMatcher
+            v_up = v_clean.upper()
+            best_match, best_score = None, 0
+            for known in _KNOWN_CARRIERS_VAL:
+                score = SequenceMatcher(None, v_up, known).ratio()
+                if score > best_score:
+                    best_match, best_score = known, score
+            if best_score > 0.60 and best_match:
+                return True, best_match, 0.90
+        except ImportError:
+            pass
+        return False, v, 0.0
     if not any(w in vl_clean for w in ('company', 'co', 'exchange', 'group', 'corporation', 'corp', 'mutual')) and len(v_clean.split()) < 2: return False, v, 0.0
     # CRITICAL: Strip trailing single-char OCR noise (e.g., "ALLSTATE INDEMNITY COMPANYD" → "ALLSTATE INDEMNITY COMPANY")
     v_clean = re.sub(r'\b(COMPANY|CORPORATION|EXCHANGE|GROUP|MUTUAL|INDEMNITY)[A-Z]\b', r'\1', v_clean, flags=re.I)
@@ -470,18 +506,43 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
     if re.match(r'^n/?a$', v, re.I): return True, "N/A", 0.90
     if v.lower() in JUNK_VALUES or _is_document_reference(v) or DATE_RE.search(v): return False, v, 0.0
     digits = ''.join(c for c in v if c.isdigit())
-    if not (7 <= len(digits) <= 12) or len(digits) >= 13 or re.match(r'^\d{5}_\d+', v) or '000000' in digits: return False, v, 0.0
+    if not (7 <= len(digits) <= 16) or re.match(r'^\d{5}_\d+', v) or '000000' in digits: return False, v, 0.0
     if len(digits) > 0 and digits.count('0') > len(digits) * 0.6: return False, v, 0.0
     # Reject barcode-style numbers: long all-digit strings that are likely
     # page footers (e.g., "044091120000442", "1965565232" from print barcodes).
     # Heuristic: 13+ digit pure numbers starting with "0" are typically barcodes.
     # NOTE: 10-digit loan numbers starting with "0" are legitimate (e.g., "0400004466")
-    if len(digits) >= 13 and digits.startswith('0'): return False, v, 0.0
+    # NOTE: 13-digit loan numbers like "1502000775817" are legitimate (Anchor Specialty)
+    if len(digits) >= 15 and digits.startswith('0'): return False, v, 0.0
     return True, digits, 0.95
 
 def validate_name(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
     if not v or len(v) < 2: return False, v, 0.0
+    
+    # CRITICAL: Reject OCR-garbled label text masquerading as names
+    v_nospace = re.sub(r'\s+', '', v.lower())
+    _garbled_frags = ("nameand", "naneand", "addreso", "octhe", "ofthe",
+                      "theinsured", "insuredname", "namedinsured",
+                      "addressof", "nameandaddress", "coveredbythis",
+                      "insuredlocation")
+    if any(f in v_nospace for f in _garbled_frags):
+        # Try to strip the garbled prefix and keep the actual name
+        garbled_pats = [
+            r"(?i)^.*?(?:NAMEAND|NANEAND|ADDRESO|OCTHE|OFTHE)(?:INSURED|INSUREO|LNSURED)?\s*",
+            r"(?i)^.*?(?:INSUREDNAME|INSUREONAME|INSUREDMAILING)\s*",
+        ]
+        cleaned = v
+        for gpat in garbled_pats:
+            gm = re.match(gpat, v)
+            if gm and gm.end() < len(v):
+                cleaned = v[gm.end():].strip()
+                break
+        if cleaned != v and len(cleaned) > 3:
+            v = cleaned
+        else:
+            return False, v, 0.0
+    
     # CRITICAL: Normalize "LASTNAME,FIRSTNAME" → "LASTNAME, FIRSTNAME"
     # OCR often produces names without space after comma
     v = re.sub(r'([A-Za-z]),([A-Za-z])', r'\1, \2', v)
@@ -494,8 +555,14 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     vl = v.lower()
     if any(s in vl for s in MARKETING_SLOGANS) or any(p in vl for p in PRODUCT_NAMES) or any(c in vl for c in BAD_INSURED_COMPANY_NAMES): return False, v, 0.0
     CARRIER_INDICATORS = {"aegis", "allstate", "state farm", "geico", "progressive", "travelers", "liberty mutual", "farmers", "citizens", "universal", "federated", "nationwide", "american family", "usaa", "auto-owners", "erie", "encompass", "safeco", "hanover", "hartford", "insurance company", "insurance co", "insurance exchange", "assurance company", "property insurance", "casualty insurance"}
+    # if any(i in vl for i in CARRIER_INDICATORS):
+    #     if len(words) <= 2 or words[0] in CARRIER_INDICATORS or words[-1] in CARRIER_INDICATORS: return False, v, 0.0
+
+    # Reject only if the entire value looks like a carrier
     if any(i in vl for i in CARRIER_INDICATORS):
-        if len(words) <= 2 or words[0] in CARRIER_INDICATORS or words[-1] in CARRIER_INDICATORS: return False, v, 0.0
+        if any(w in vl for w in ("insurance", "company", "corporation", "exchange")):
+            return False, v, 0.0
+        
     if any(p in vl for p in BAD_NAME_PHRASES) or re.search(r'[$%*#@!]', v) or _is_document_reference(v) or _is_phone_number(v): return False, v, 0.0
     bad_starts = ("policy", "coverage", "premium", "billing", "copy", "page", "section", "office", "message", "declarations", "effective", "expiration", "total", "subtotal", "the ", "this ", "our ", "your ", "and ", "or ", "for ")
     if any(vl.startswith(w) for w in bad_starts): return False, v, 0.0
@@ -543,12 +610,12 @@ def validate_date(value: str) -> Tuple[bool, str, float]:
     v = re.sub(r'(\d),(\d{4})', r'\1, \2', v)
     m = re.match(r'^([A-Z]{3})\s+(\d{1,2}),?\s+(\d{4})$', v)
     if m: v = f"{m.group(1).capitalize()} {m.group(2)} {m.group(3)}"
-    formats = ["%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%b %d, %Y", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y"]
+    formats = ["%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%b %d, %Y", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%b-%d-%Y", "%b-%d-%y"]
     for fmt in formats:
         try:
             if 1990 <= datetime.strptime(v, fmt).year <= 2050: return True, v, 0.95
         except: continue
-    m = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', v) or re.search(r'([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})', v)
+    m = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', v) or re.search(r'([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})', v) or re.search(r'([A-Z]{3}-\d{1,2}-\d{2,4})', v)
     if m: return True, m.group(1), 0.90
     return False, v, 0.0
 
@@ -608,13 +675,20 @@ def _salvage_from_lines(
 
     # Carrier: allow abbreviated forms like "INS CO"
     if "carrier_name" in missing:
+        known_brand_pattern = re.compile(
+            r'\b(?:nationwide|allstate|state\s*farm|geico|progressive|travelers|'
+            r'liberty\s*mutual|farmers|usaa|erie|safeco|hartford|hanover|'
+            r'encompass|auto-owners|american\s*family|citizens|universal|'
+            r'federated|chubb|amica|kemper|mercury|shelter)\b',
+            re.I
+        )
         for line in lines[:80]:
             ll = line.lower().strip()
             if not ll or len(ll) < 5:
                 continue
             if any(x in ll for x in ("agency", "services", "producer", "agent", "mortgagee", "loss payee")):
                 continue
-            if re.search(r'\b(insurance|ins\.?\s+co|ins\s+co|mutual|casualty|indemnity|fire)\b', ll):
+            if re.search(r'\b(insurance|ins\.?\s+co|ins\s+co|mutual|casualty|indemnity|fire)\b', ll) or known_brand_pattern.search(ll):
                 candidates["carrier_name"] = line.strip()
                 break
 
@@ -712,8 +786,8 @@ def _salvage_from_lines(
 def _normalize_carrier_with_context(validated: Dict, lines: List[str]) -> Dict:
     """
     Resolve brand-vs-legal-entity carrier conflicts using document context.
-    Example: RNW docs with "Nationwide is on your side" but legal line says
-    "ALLIED PROP AND CAS INS CO".
+    NOTE: Do NOT override legal entity carrier names (like "ALLIED PROP AND CAS INS CO")
+    with brand names (like "Nationwide"). The legal entity is the correct carrier.
     """
     carrier = validated.get("carrier_name")
     if not carrier or not isinstance(carrier, dict):
@@ -723,12 +797,7 @@ def _normalize_carrier_with_context(validated: Dict, lines: List[str]) -> Dict:
     if not val:
         return validated
 
-    text = " ".join(lines).lower() if lines else ""
-    if "nationwide" in text and re.search(r'(?i)\ballied\s+prop(?:erty)?\s+and\s+cas', val):
-        carrier["value"] = "NATIONWIDE"
-        carrier["source"] = "validation_context_brand"
-        carrier["confidence"] = max(carrier.get("confidence", 0.0), 0.96)
-
+    # No brand overrides — the legal entity name is the correct carrier
     return validated
 
 # ============================================================
@@ -757,7 +826,8 @@ def validate_and_arbitrate(merged_fields: Dict, ocr_confidence: float, stage_bre
         validated[field] = data
 
     validated = _cross_validate(validated)
-
+    validated = _normalize_carrier_with_context(validated, lines)
+    
     # Defaults and Filtering
     default_fields = list(validators.keys()) + ["remit_info", "third_party_removed", "third_party_cancellation_date", "cancellation_reason", "cancellation_effective_date"]
     allowed = ALLOWED_FIELDS_BY_DOC_POLICY.get((doc_type, policy_type), default_fields)
