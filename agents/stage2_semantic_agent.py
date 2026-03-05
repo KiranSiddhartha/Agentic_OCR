@@ -429,6 +429,15 @@ def _extract_with_rules(
         # --- CANCELLATION DATE ---
         if "cancellation_date" in missing_fields and "cancellation_date" not in out:
             val = _try_date_labels(line, _CANCEL_DATE_LABELS)
+            if not val:
+                # Check if label is on this line but date is on the NEXT line
+                # (common when OCR splits "POLICY CANCELLATION DATE IS:" from "09/04/2020")
+                for pat, _ in _CANCEL_DATE_LABELS:
+                    if re.search(pat, line):
+                        # Label found but no date on this line — check next line
+                        if nxt:
+                            val = _extract_date(nxt)
+                        break
             if val:
                 out["cancellation_date"] = _r(val, "sc_cancel_date", 0.85)
 
@@ -459,6 +468,33 @@ def _extract_with_rules(
         val = _extract_cancel_reason_kw(lines)
         if val:
             out["cancellation_reason"] = val
+
+    # ---- Cancellation Date: joined-text regex fallback ----
+    # Handles "POLICY CANCELLATION DATE IS:\n09/04/2020" split across lines
+    if "cancellation_date" in missing_fields and "cancellation_date" not in out:
+        text = "\n".join(lines)
+        _can_date_rx = re.compile(
+            r"(?i)(?:"
+            r"(?:cancellation|cancel(?:led)?|termination|void|cease|non-?renewal)"
+            r"(?:\s+effective|\s+date(?:\s+and\s+time)?)?(?:\s+for[\w\s]*interest)?"
+            r"(?:\s+(?:is|will\s+be|date\s+is))?\s*[:\-]?\s*"
+            r"|cancel(?:led|ed)\s+(?:.*?(?:standard|local)\s+time\s+)?on\s+"
+            r"|policy\s+cancellation\s+date\s+is\s*:\s*"
+            r")"
+            r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\w+ \d{1,2},?\s*\d{4})"
+        )
+        m = _can_date_rx.search(text)
+        if m:
+            out["cancellation_date"] = _r(m.group(1).strip(), "sc_cancel_date_joined", 0.82)
+        else:
+            # Fallback: any line with "cancellation" near a date
+            for line in lines:
+                ll = line.lower()
+                if any(w in ll for w in ("cancellation", "cancelled", "canceled", "termination")):
+                    dates = re.findall(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b', line)
+                    if dates:
+                        out["cancellation_date"] = _r(dates[0], "sc_cancel_date_proximity", 0.78)
+                        break
 
     if "remit_info" in missing_fields and "remit_info" not in out:
         val = _extract_remit_fuzzy(lines)

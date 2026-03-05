@@ -1654,22 +1654,62 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
             out["policy_number"] = _candidate(
                 m.group(1).strip(), "dte_can_policy_inline", 0.92)
 
-    # Insured name
-    m = _NAME_LABEL_RE.search(text)
-    if m:
-        name = m.group(1).strip()
-        # Truncate at address patterns (digit + street suffix)
-        addr_m = re.search(r'\s+\d+\s+\w+\s+(?:st|street|ave|avenue|rd|road|blvd|'
-                           r'dr|drive|ln|lane|ct|cir|way)\b', name, re.I)
-        if addr_m:
-            name = name[:addr_m.start()].strip()
-        # Truncate at standalone digit blocks (address start)
-        addr_m2 = re.search(r'\s+\d{2,}\s+[A-Z]', name)
-        if addr_m2 and len(name[:addr_m2.start()].split()) >= 2:
-            name = name[:addr_m2.start()].strip()
-        if name:
-            out["insured_name"] = _candidate(
-                name, "dte_can_name", 0.93)
+    # Insured name — multi-strategy
+    # Strategy 1: "Policyholder(s)" or "Named Insured" label with value on next line(s)
+    for i, line in enumerate(lines):
+        if "insured_name" in out:
+            break
+        ll = line.lower()
+        if re.search(r'(?:policyholder|named\s+insured|name\s+and\s+address\s+of\s+insured)\s*[\(:\s]', ll):
+            # Skip boilerplate lines
+            if "has requested" in ll or "named below" in ll:
+                continue
+            # Look at next 1-3 lines for the actual name
+            for off in range(1, 4):
+                if i + off >= len(lines):
+                    break
+                nxt = lines[i + off].strip()
+                if not nxt or len(nxt) < 3:
+                    continue
+                # Stop at address lines (start with digits) or section headers
+                if re.match(r'^\d+\s+\w', nxt) and not re.match(r'^\d+\s+[A-Z]{2,}', nxt):
+                    break
+                if re.search(r'(?i)^(policy|coverage|mortgage|lien|premium|building)', nxt):
+                    break
+                # This looks like a name (all caps or title case, 2+ words, no digits)
+                name_cand = nxt
+                if re.match(r'^[A-Z][A-Za-z,.\s&\'-]+$', name_cand) and len(name_cand.split()) >= 2:
+                    # Truncate at address
+                    name_cand = re.sub(r'\s+\d+\s+\w+\s+(?:st|street|ave|rd|dr|ln|blvd|ct|way)\b.*', '', name_cand, flags=re.I).strip()
+                    if name_cand and len(name_cand) > 3:
+                        out["insured_name"] = _candidate(
+                            name_cand, "dte_can_name_nextline", 0.93)
+                        break
+
+    # Strategy 2: regex on joined text (original approach, but skip false positives)
+    if "insured_name" not in out:
+        m = _NAME_LABEL_RE.search(text)
+        if m:
+            name = m.group(1).strip()
+            # Reject false captures from boilerplate
+            name_lower = name.lower()
+            if any(fp in name_lower for fp in ("named below", "has requested",
+                                                 "following action", "the following",
+                                                 "indicated below", "identified above")):
+                name = ""
+            # Truncate at address patterns (digit + street suffix)
+            if name:
+                addr_m = re.search(r'\s+\d+\s+\w+\s+(?:st|street|ave|avenue|rd|road|blvd|'
+                                   r'dr|drive|ln|lane|ct|cir|way)\b', name, re.I)
+                if addr_m:
+                    name = name[:addr_m.start()].strip()
+                # Truncate at standalone digit blocks (address start)
+                addr_m2 = re.search(r'\s+\d{2,}\s+[A-Z]', name)
+                if addr_m2 and len(name[:addr_m2.start()].split()) >= 2:
+                    name = name[:addr_m2.start()].strip()
+            if name and len(name) > 3:
+                out["insured_name"] = _candidate(
+                    name, "dte_can_name", 0.93)
 
     # --- CANCELLATION DATE (expanded triggers) ---
     for idx, line in enumerate(lines):
@@ -1685,6 +1725,13 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
                 "cancel effective",
             )):
                 d = _first_date(line)
+                # If no date on this line, check next 1-2 lines
+                if not d:
+                    for off in range(1, 3):
+                        if idx + off < len(lines):
+                            d = _first_date(lines[idx + off])
+                            if d:
+                                break
                 if d:
                     out["cancellation_date"] = _candidate(
                         d, "dte_can_date", 0.96)
@@ -1694,6 +1741,13 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
                 "non-renewed as of", "will be non-renewed",
             )):
                 d = _first_date(line)
+                # If no date on this line, check next 1-2 lines
+                if not d:
+                    for off in range(1, 3):
+                        if idx + off < len(lines):
+                            d = _first_date(lines[idx + off])
+                            if d:
+                                break
                 if d:
                     out["cancellation_date"] = _candidate(
                         d, "dte_can_nrnw_date", 0.94)
@@ -1715,6 +1769,51 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
         out["expiration_date"] = _candidate(
             out["cancellation_date"]["value"],
             "dte_can_exp_from_cancel", 0.90)
+
+    # --- CANCELLATION DATE: post-loop fallback ---
+    # For two-column OCR where the label "POLICY CANCELLATION DATE IS:" is in the
+    # left column and the date "09/04/2020 AT 12:01 AM" is in the right column
+    # (appears many lines later), scan ALL lines for orphaned date+time patterns
+    # that look like cancellation dates.
+    if "cancellation_date" not in out:
+        # Check if we have a cancellation label somewhere (confirms this IS a CAN doc)
+        has_cancel_label = any(
+            any(k in line.lower() for k in (
+                "cancellation date", "policy cancellation", "cancel date",
+                "cancelled", "canceled", "notice of cancellation",
+            ))
+            for line in lines
+        )
+        if has_cancel_label:
+            # Scan for standalone "MM/DD/YYYY AT HH:MM AM/PM" lines (cancellation date+time)
+            for line in lines:
+                stripped = line.strip()
+                m = re.match(
+                    r'^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+'
+                    r'(?:AT\s+\d{1,2}:\d{2}\s*(?:AM|PM|A\.?M\.?|P\.?M\.?))',
+                    stripped, re.I
+                )
+                if m:
+                    out["cancellation_date"] = _candidate(
+                        m.group(1), "dte_can_date_orphaned", 0.85)
+                    break
+            # Also try: date on a line that has "cancelled" context nearby
+            if "cancellation_date" not in out:
+                text_joined = "\n".join(lines)
+                m = re.search(
+                    r'(?i)(?:cancellation|cancelled|canceled|cancel)\s+date'
+                    r'[\s\S]{0,500}?'
+                    r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})',
+                    text_joined
+                )
+                if m:
+                    out["cancellation_date"] = _candidate(
+                        m.group(1), "dte_can_date_proximity", 0.80)
+        # Update expiration from newly found cancellation date
+        if "cancellation_date" in out and "expiration_date" not in out:
+            out["expiration_date"] = _candidate(
+                out["cancellation_date"]["value"],
+                "dte_can_exp_from_cancel", 0.88)
 
     # --- EFFECTIVE DATE (policy inception / start date) ---
     for line in lines:
@@ -1780,13 +1879,37 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
                 out["cancellation_reason"] = _candidate(
                     "No longer required by lender", "dte_can_reason", 0.88)
 
-    # Carrier — try labeled first
-    m = _CARRIER_LABEL_RE.search(text)
-    if m:
-        out["carrier_name"] = _candidate(
-            m.group(1).strip().upper(), "dte_can_carrier", 0.90)
+    # Carrier — try "policy provided by" / "insurance provided by" first (most reliable)
+    for i, line in enumerate(lines):
+        if re.search(r'(?i)(?:your\s+)?(?:policy|insurance)\s+provided\s+by', line):
+            parts = []
+            for off in range(1, 4):
+                if i + off >= len(lines):
+                    break
+                nxt = lines[i + off].strip()
+                if not nxt or len(nxt) < 3:
+                    break
+                if re.match(r'(?i)(you may|contact|visit|phone|www\.|http|or visit)', nxt):
+                    break
+                parts.append(nxt)
+                if any(w in nxt.lower() for w in ("company", "exchange", "mutual", "group", "corp")):
+                    break
+            if parts:
+                carrier = " ".join(parts).strip()
+                carrier = re.sub(r'\s*(customer|phone|tel|fax|\(\d{3}\)|you may|or visit|www\.).*$', '', carrier, flags=re.I).strip()
+                if carrier and len(carrier) > 5:
+                    out["carrier_name"] = _candidate(
+                        carrier.upper(), "dte_can_carrier_provided", 0.95)
+            break
 
-    # Carrier — keyword fallback (scan first 20 lines for "insurance" + entity type)
+    # Carrier — try labeled regex
+    if "carrier_name" not in out:
+        m = _CARRIER_LABEL_RE.search(text)
+        if m:
+            out["carrier_name"] = _candidate(
+                m.group(1).strip().upper(), "dte_can_carrier", 0.90)
+
+    # Carrier — keyword fallback (scan first 25 lines for "insurance" + entity type)
     if "carrier_name" not in out:
         for line in lines[:25]:
             ll = line.lower().strip()
@@ -1799,11 +1922,14 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
                                                 "corporation"))
             has_abbrev = bool(re.search(r'\b(?:ins|prop|cas)\b', ll))
             has_skip = any(w in ll for w in ("agency", "agent", "services",
-                                              "broker", "producer", "processing",
-                                              "center", "relations"))
+                                              "broker", "producer", "processing"))
+            # CRITICAL: Don't skip lines that contain a known brand + "insurance"
+            # E.g., "Allstate Insurance Company Lender Relations Center" should still
+            # extract the carrier part before "Lender Relations Center"
             if has_ins and (has_entity or has_abbrev) and not has_skip:
                 val = line.strip()
-                val = re.sub(r'\s+(?:Mortgagee|Lender|Service).*$', '',
+                # Strip trailing noise: Lender/Relations/Center/Service
+                val = re.sub(r'\s+(?:Mortgagee|Lender|Service|Relations|Center).*$', '',
                              val, flags=re.I).strip()
                 val = re.sub(r'^\d+\s+', '', val).strip()  # strip leading numbers
                 if val and len(val) > 5:
@@ -1819,10 +1945,14 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
         if "mortgage_company" in out:
             break
         val = m.group(1).strip()
-        # Skip false positives: "MORTGAGEE COPY", "MORTGAGEE CERTIFICATE"
+        # Skip false positives: "MORTGAGEE COPY", "MORTGAGEE CERTIFICATE", "Lender Relations Center"
         val_lower = val.lower()
         if any(fp in val_lower for fp in ("copy", "certificate", "customer service",
-                                           "notice", "information")):
+                                           "notice", "information",
+                                           "relations center", "relations centre",
+                                           "service center", "service centre",
+                                           "or interested party", "interested party",
+                                           "other interested", "and/or its")):
             continue
         # Clean ISAOA/ATIMA suffixes (use DOTALL to consume across newlines)
         val = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA\s*/?\s*ATIMA|ITS\s+SCRS?\s*&?/?\s*OR\s+ASSIGNS?\s+ATIMA).*',

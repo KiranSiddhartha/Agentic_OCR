@@ -4014,6 +4014,7 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
     _KNOWN_CARRIERS_FUZZY = [
         "QBE SPECIALTY INSURANCE COMPANY",
         "ALLSTATE INDEMNITY COMPANY",
+        "ALLSTATE INSURANCE COMPANY",
         "ALLSTATE VEHICLE AND PROPERTY INSURANCE COMPANY",
         "ALLSTATE FIRE AND CASUALTY INSURANCE COMPANY",
         "STATE FARM FIRE AND CASUALTY COMPANY",
@@ -4031,6 +4032,7 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         "ERIE INSURANCE EXCHANGE",
         "ERIE INSURANCE COMPANY",
         "AMERICAN FAMILY INSURANCE COMPANY",
+        "AMERICAN BANKERS INSURANCE COMPANY OF FLORIDA",
         "AMCO INSURANCE COMPANY",
         "CITIZENS PROPERTY INSURANCE CORPORATION",
         "UNIVERSAL PROPERTY AND CASUALTY INSURANCE COMPANY",
@@ -4065,8 +4067,19 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         from difflib import SequenceMatcher
         val_upper = val.upper()
         best_match, best_score = None, 0
+        
+        # Extract the brand/first word from the input for brand-preference scoring
+        val_words = val_upper.split()
+        val_brand = val_words[0] if val_words else ""
+        
         for known in _KNOWN_CARRIERS_FUZZY:
             score = SequenceMatcher(None, val_upper, known).ratio()
+            # CRITICAL: Boost score when the known carrier starts with the same brand
+            # This prevents "ALLSTATE INSURANCE COMPANY" matching "ERIE INSURANCE COMPANY"
+            # (which has higher raw similarity due to shorter name)
+            known_brand = known.split()[0] if known.split() else ""
+            if val_brand and val_brand == known_brand:
+                score += 0.15  # Brand match bonus
             if score > best_score:
                 best_match, best_score = known, score
         # Threshold: 60% similarity is strong enough for OCR correction

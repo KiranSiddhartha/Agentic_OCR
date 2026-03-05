@@ -233,11 +233,30 @@ def _extract_carrier_name_from_lines(lines):
             return cand
 
     # Fallback: common carrier keywords.
+    # Try "policy provided by" or "insurance provided by" pattern first
+    for m_prov in re.finditer(
+        r"(?im)(?:your\s+)?(?:policy|insurance)\s+provided\s+by\s*:?\s*\n?\s*([^\n]+)",
+        text,
+    ):
+        cand = re.sub(r"\s+", " ", m_prov.group(1)).strip(" .,:;-")
+        # Strip trailing noise
+        cand = re.sub(r'\s*(customer|phone|tel|fax|www\.|http|\(\d{3}\)).*$', '', cand, flags=re.I).strip()
+        if cand and len(cand) >= 6:
+            return cand
+
     carrier_patterns = [
+        # Full names first (most specific)
+        (r"\ballstate\s+vehicle\s+and\s+property\s+insurance\s+company\b", "Allstate Vehicle and Property Insurance Company"),
+        (r"\ballstate\s+fire\s+and\s+casualty\s+insurance\s+company\b", "Allstate Fire and Casualty Insurance Company"),
+        (r"\ballstate\s+indemnity\s+company\b", "Allstate Indemnity Company"),
+        (r"\ballstate\s+insurance\s+company\b", "Allstate Insurance Company"),
         (r"\badirondack\s+insurance\s+exchange\b", "Adirondack Insurance Exchange"),
+        (r"\bencompass\s+indemnity\s+company\b", "Encompass Indemnity Company"),
+        (r"\berie\s+insurance\b", "Erie Insurance"),
+        # Brand names (less specific, last resort)
+        (r"\ballstate\b", "Allstate"),
         (r"\bencompass\b", "Encompass"),
         (r"\berie\b", "Erie"),
-        (r"\ballstate\b", "Allstate"),
         (r"\bstate\s+farm\b", "State Farm"),
         (r"\bfarmers\b", "Farmers"),
         (r"\btravelers\b", "Travelers"),
@@ -245,6 +264,7 @@ def _extract_carrier_name_from_lines(lines):
         (r"\bnationwide\b", "Nationwide"),
         (r"\bliberty\s+mutual\b", "Liberty Mutual"),
         (r"\bchubb\b", "Chubb"),
+        (r"\ballied\s+trust\b", "Allied Trust"),
     ]
     joined_lower = " ".join(lines).lower()
     for pattern, normalized in carrier_patterns:
@@ -483,6 +503,21 @@ def _extract_mailing_address_from_lines(lines):
 def _extract_insured_name_from_lines(lines):
     text = "\n".join(lines)
 
+    def _looks_like_person_name(v: str):
+        s = re.sub(r"\s+", " ", (v or "")).strip(" .,:;-")
+        if not s:
+            return False
+        if re.search(r"\d", s):
+            return False
+        bad_kw = (
+            "insurance", "company", "exchange", "bank", "mortgage",
+            "policy", "address", "mailing", "premium", "effective", "expiration",
+        )
+        if any(k in s.lower() for k in bad_kw):
+            return False
+        parts = [p for p in re.split(r"\s+", s) if p]
+        return 2 <= len(parts) <= 6
+
     def _clean_candidate(raw: str):
         cand = re.sub(r"\s+", " ", (raw or "")).strip(" .,:;-")
         cand = re.split(
@@ -518,7 +553,24 @@ def _extract_insured_name_from_lines(lines):
                     break
                 cand = _clean_candidate(str(lines[idx + off]).strip())
                 if cand:
-                    return cand
+                    names = [cand]
+                    for off2 in range(off + 1, min(off + 4, 6)):
+                        if idx + off2 >= len(lines):
+                            break
+                        nxt_raw = str(lines[idx + off2]).strip()
+                        if not nxt_raw:
+                            continue
+                        if re.search(r"\d{1,6}\s+\w+", nxt_raw) or re.search(r"\d{5}(?:-\d{4})?$", nxt_raw):
+                            break
+                        nxt = _clean_candidate(nxt_raw)
+                        if nxt and _looks_like_person_name(nxt):
+                            if nxt.lower() not in {n.lower() for n in names}:
+                                names.append(nxt)
+                            continue
+                        break
+                    if len(names) >= 2:
+                        return " & ".join(names[:2])
+                    return names[0]
 
     # Generic "Insured:" label fallback.
     for idx, line in enumerate(lines):
@@ -531,6 +583,117 @@ def _extract_insured_name_from_lines(lines):
                     return cand
 
     return None
+
+
+def _extract_cancellation_date_from_lines(lines):
+    """Extract cancellation date from OCR lines."""
+    text = "\n".join(lines)
+
+    # Pattern 1: "POLICY CANCELLATION DATE IS : 09/04/2020"
+    patterns = [
+        r"(?i)policy\s+cancellation\s+date\s+is\s*:\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        r"(?i)cancellation\s+(?:effective\s+)?date\s*(?:is)?\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        r"(?i)(?:cancel(?:led|lation)|termination)\s+(?:effective\s+)?(?:on|date)?\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        r"(?i)(?:cancel(?:led)?|terminated)\s+(?:.*?(?:standard|local)\s+time\s+)?on\s+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        r"(?i)non-?renewal\s+(?:effective\s+)?date\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+
+    # Fallback: line containing "cancellation" near a date
+    for line in lines:
+        ll = line.lower()
+        if any(w in ll for w in ("cancellation", "cancelled", "canceled", "cancel date", "termination")):
+            dates = re.findall(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b', line)
+            if dates:
+                return dates[0]
+
+    return None
+
+
+def _extract_cancellation_reason_from_lines(lines):
+    """Extract cancellation reason from OCR lines."""
+    text = "\n".join(lines)
+
+    # Pattern 1: "reason for cancellation: ..."
+    m = re.search(
+        r"(?i)reason\s+(?:for\s+)?(?:cancellation|termination|non-?renewal)\s*[:\-]?\s*(.{4,80})",
+        text,
+    )
+    if m:
+        return m.group(1).strip().rstrip(".,;:")
+
+    # Pattern 2: "cancellation reason: ..."
+    m = re.search(r"(?i)cancel(?:lation)?\s+reason\s*[:\-]?\s*(.{4,80})", text)
+    if m:
+        return m.group(1).strip().rstrip(".,;:")
+
+    # Pattern 3: Infer from "premium payment has not been received"
+    for line in lines:
+        ll = line.lower()
+        if "premium" in ll and ("not been received" in ll or "non-payment" in ll or "nonpayment" in ll):
+            return "Non-payment of premium"
+        if "underwriting" in ll and ("reason" in ll or "cancel" in ll):
+            return "Underwriting reasons"
+
+    return None
+
+
+def _augment_insured_with_secondary(existing_value, lines):
+    base = str(existing_value or "").strip()
+    if not base:
+        return None
+    text = "\n".join(lines)
+
+    def _is_name_line(raw: str):
+        s = re.sub(r"\s+", " ", (raw or "")).strip(" .,:;-")
+        if not s:
+            return False
+        if re.search(r"\d", s):
+            return False
+        if any(k in s.lower() for k in (
+            "policy", "effective", "expiration", "loan", "mailing",
+            "address", "premium", "carrier", "insurance", "mortgage",
+        )):
+            return False
+        return 2 <= len(s.split()) <= 6
+
+    # If already contains 2 names, leave as-is.
+    if re.search(r"\s(?:and|&|/)\s", base, re.I):
+        return base
+
+    for idx, line in enumerate(lines):
+        if not re.search(r"(?i)named\s+insured(?:\s+and\s+mailing\s+address)?|insured\s+name", str(line)):
+            continue
+        found_primary = False
+        for off in range(1, 6):
+            if idx + off >= len(lines):
+                break
+            cand = str(lines[idx + off]).strip()
+            if not cand:
+                continue
+            if re.search(r"\d{1,6}\s+\w+|\d{5}(?:-\d{4})?$", cand):
+                break
+            if not _is_name_line(cand):
+                continue
+            if base.lower() in cand.lower() or cand.lower() in base.lower():
+                found_primary = True
+                continue
+            if found_primary:
+                return f"{base} & {cand}"
+
+    # Inline format: "Named insured: A and B"
+    m = re.search(
+        r"(?im)\b(?:named\s+insured|insured\s+name)\b\s*[:\-]?\s*([^\n]+)",
+        text,
+    )
+    if m:
+        rhs = re.sub(r"\s+", " ", m.group(1)).strip(" .,:;-")
+        if re.search(r"\b(and|&|/)\b", rhs, re.I):
+            return rhs
+    return base
 
 
 def fill_missing_expected_fields(clean_fields: dict, expected_fields: list, all_lines: list):
@@ -559,6 +722,16 @@ def fill_missing_expected_fields(clean_fields: dict, expected_fields: list, all_
     put_if_missing("expiration_date", _extract_expiration_date_from_lines(all_lines))
     put_if_missing("property_address", _extract_property_address_from_lines(all_lines))
     put_if_missing("mailing_address", _extract_mailing_address_from_lines(all_lines))
+    put_if_missing("cancellation_date", _extract_cancellation_date_from_lines(all_lines))
+    put_if_missing("cancellation_reason", _extract_cancellation_reason_from_lines(all_lines))
+
+    # Insured name may already exist with only primary person; enrich with
+    # co-insured when present in nearby insured block lines.
+    if "insured_name" in expected_fields and isinstance(patched.get("insured_name"), dict):
+        existing = patched["insured_name"].get("value")
+        enriched = _augment_insured_with_secondary(existing, all_lines)
+        if enriched and enriched.strip():
+            patched["insured_name"]["value"] = enriched.strip()
     return patched
 
 
