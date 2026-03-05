@@ -169,7 +169,28 @@ export default function Home() {
   }
 
   const handleUpload = async (files: FileList) => {
-    const apiBase = "http://127.0.0.1:8000"
+    const apiBases = Array.from(
+      new Set(
+        [
+          process.env.NEXT_PUBLIC_API_BASE,
+          "http://127.0.0.1:8000",
+          "http://localhost:8000",
+        ].filter((v): v is string => Boolean(v))
+      )
+    )
+
+    const apiFetch = async (path: string, init: RequestInit) => {
+      let lastErr: unknown = null
+      for (const base of apiBases) {
+        try {
+          return await fetch(`${base}${path}`, init)
+        } catch (err) {
+          lastErr = err
+        }
+      }
+      throw lastErr || new Error(`Unable to reach backend for ${path}`)
+    }
+
     let filesArray = Array.from(files)
     if (filesArray.length === 0) return
 
@@ -191,7 +212,7 @@ export default function Home() {
       try {
         const zipData = new FormData()
         zipData.append("file", f)
-        const zipRes = await fetch(`${apiBase}/expand-zip`, {
+        const zipRes = await apiFetch("/expand-zip", {
           method: "POST",
           body: zipData,
         })
@@ -265,7 +286,7 @@ export default function Home() {
         const previewData = new FormData()
         previewData.append("file", file)
 
-        const previewRes = await fetch(`${apiBase}/preview`, {
+        const previewRes = await apiFetch("/preview", {
           method: "POST",
           body: previewData,
           signal,
@@ -294,12 +315,16 @@ export default function Home() {
       const formData = new FormData()
       formData.append("file", file)
       try {
-        const res = await fetch(`${apiBase}/analyze`, {
+        const res = await apiFetch("/analyze", {
           method: "POST",
           body: formData,
           signal,
         })
         if (runIdRef.current !== runId || signal.aborted) break
+        if (!res.ok) {
+          const errText = await res.text().catch(() => "")
+          throw new Error(errText || `Analyze failed with status ${res.status}`)
+        }
         const data: AnalyzeResponse = await res.json()
         setResults((prev) => {
           if (runIdRef.current !== runId || signal.aborted) return prev
@@ -405,7 +430,7 @@ export default function Home() {
 
             <button
               onClick={handleBack}
-              className="px-4 py-2 rounded-full bg-gray-200 text-gray-700 hover:bg-gray-300 transition"
+              className="px-4 py-2 rounded-full bg-green-100 text-green-800 border border-green-200 hover:bg-green-200 transition"
             >
               Back
             </button>
@@ -451,8 +476,8 @@ export default function Home() {
                   className="grid gap-6 mt-3"
                   style={{ gridTemplateColumns: `${PREVIEW_WIDTH_PERCENT}% ${OUTPUT_WIDTH_PERCENT}%` }}
                 >
-                  <div className="bg-white p-4 rounded-2xl shadow">
-                    <h3 className="font-semibold mb-4 text-lg">
+                  <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl shadow">
+                    <h3 className="font-semibold mb-4 text-lg text-amber-900">
                       Document Preview
                     </h3>
 
@@ -464,11 +489,11 @@ export default function Home() {
                         caption="Document Preview"
                       />
                     ) : loading ? (
-                      <div className="text-gray-500 text-sm">
-                        Generating preview...
-                      </div>
-                    ) : (
-                      <div className="text-gray-500 text-sm">
+                        <div className="text-amber-700 text-sm">
+                          Generating preview...
+                        </div>
+                      ) : (
+                      <div className="text-amber-700 text-sm">
                         No preview available
                       </div>
                     )}
@@ -772,7 +797,7 @@ export default function Home() {
       {(results.length > 0 || loading) && showBackToTop && (
         <button
           onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
-          className="fixed bottom-6 right-6 z-50 rounded-full border border-blue-300 bg-blue-500 px-4 py-2 text-sm font-semibold text-white shadow-lg hover:bg-blue-600"
+          className="fixed bottom-6 right-6 z-50 rounded-full border-2 border-yellow-500 bg-yellow-400 px-4 py-2 text-sm font-bold text-black shadow-lg hover:bg-yellow-300"
           title="Back to top"
         >
           Top

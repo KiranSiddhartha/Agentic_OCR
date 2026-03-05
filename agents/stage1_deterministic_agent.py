@@ -63,7 +63,7 @@ STREET_RE = re.compile(
 # Policy number patterns - multiple variants
 POLICY_REGEX_VARIANTS = [
     re.compile(r"^[A-Z]{2,4}[-\s]?\d{7,12}[-\s]?\d{0,2}$", re.I),  # DPC0076173896-1
-    re.compile(r"^\d{9,12}$"),  # 2004939477
+    re.compile(r"^\d{9,16}$"),  # 2004939477, 99047002652020 (NFIP flood 14-digit)
     re.compile(r"^\d{9}\s*\d{3}\s*\d{1}$"),  # 602732135 664 1
     re.compile(r"^[A-Z]{2,4}\d{1,2}[-]?\d{9,12}$", re.I),  # OKH3-109194373
     re.compile(r"^\d{8,12}[-\s]?\d{1,2}$"),  # 04038598 - 1
@@ -105,7 +105,6 @@ POLICY_LABELS = {
     "policy number", "policy no", "policy #",
     "your policy number", "policynumber",
     "dwelling policy number",
-    "account number", "your account number",
     "cert. #", "cert #", "cert. no",  # QBE: "CERT. #: QSN4481303"
 }
 
@@ -181,6 +180,13 @@ BAD_INSURED_TERMS = {
     "office use", "message", "messages",
     "risk management", "department",
     "third party notice", "notice of",
+    # Flood packet headings / OCR variants
+    "direct rating information",
+    "drect ratng informaton",
+    "nfip direct rating information",
+    "nfip drect ratng informaton",
+    "additional interest information",
+    "mortgagees additional interest information",
 }
 
 BAD_NAME_PHRASES = {
@@ -413,6 +419,58 @@ def _normalize_name(v: str) -> str:
     return v.strip()
 
 
+def _is_low_quality_name(v: str) -> bool:
+    """
+    Heuristic for OCR-damaged names that should be replaced if a better
+    labeled candidate exists (e.g., "Daael Lome?").
+    """
+    if not v:
+        return True
+    s = v.strip()
+    if not s:
+        return True
+    if "?" in s:
+        return True
+    if any(ch.isdigit() for ch in s):
+        return True
+    # Too little alphabetic signal for a real name.
+    alpha = sum(ch.isalpha() for ch in s)
+    if alpha < 4:
+        return True
+    return False
+
+
+def _override_insured_from_customer_label(lines: List[str], fields: Dict) -> None:
+    """
+    For invoice-like docs, prefer explicit "Customer Name" labels when
+    current insured_name is missing or clearly OCR-damaged.
+    """
+    current = fields.get("insured_name", {})
+    current_val = current.get("value", "") if isinstance(current, dict) else ""
+    if current_val and not _is_low_quality_name(current_val):
+        return
+
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if "customer name" not in ll:
+            continue
+
+        candidate = ""
+        if ":" in line:
+            _, _, right = line.partition(":")
+            candidate = _normalize_name(right)
+        elif i + 1 < len(lines):
+            candidate = _normalize_name(lines[i + 1])
+
+        if candidate and _looks_like_name(candidate):
+            fields["insured_name"] = {
+                "value": candidate,
+                "confidence": 0.93,
+                "source": "stage1_customer_name_label",
+            }
+            return
+
+
 def _is_phone_number(v: str) -> bool:
     """
     Check if value is a phone number
@@ -499,6 +557,8 @@ def _is_garbled_label(text: str) -> bool:
         "insuredlocation", "propertylocation", "propertyaddress",
         "policyperiod", "effectivedate", "expirationdate",
         "mortgagecompany", "loanumber", "loannumber",
+        "directratinginformation",
+        "mortgageesadditionalinterestinformation",
     ]
     ll_nospace = re.sub(r'\s+', '', ll)
     for frag in _GARBLED_LABEL_FRAGMENTS:
@@ -521,6 +581,8 @@ def _is_garbled_label(text: str) -> bool:
         "declarations page",
         "coverage and limits",
         "this declaration page is attached to and forms part of certificate provisions",
+        "nfip direct rating information",
+        "mortgagees additional interest information",
     ]
     for known in _KNOWN_LABELS:
         # Compare character similarity ratio
@@ -684,7 +746,7 @@ def _looks_like_policy(v: str) -> bool:
     
     # Pure numeric: 6-14 digits is OK
     if v_clean.isdigit():
-        return 6 <= len(v_clean) <= 14
+        return 6 <= len(v_clean) <= 16
     
     # Mixed: check against patterns
     for rx in POLICY_REGEX_VARIANTS:
@@ -1178,8 +1240,8 @@ class StatefulExtractor:
         if stripped.endswith(":"):
             return
         
-        # Check if this line contains 'insurance' or abbreviation 'ins'/'cas'
-        has_insurance_keyword = 'insurance' in ll
+        # Check if this line contains 'insurance', 'indemnity', 'casualty' or abbreviation 'ins'/'cas'
+        has_insurance_keyword = any(w in ll for w in ('insurance', 'indemnity', 'casualty'))
         if not has_insurance_keyword:
             has_insurance_keyword = bool(re.search(r'\bins\b', ll)) or bool(re.search(r'\bcas\b', ll))
         
@@ -1446,7 +1508,15 @@ class StatefulExtractor:
         if has_loan_label and ("loan_number" not in self.fields or existing_is_unlabeled):
             if ":" in line:
                 _, _, v = line.partition(":")
-                digits = ''.join(c for c in v if c.isdigit())
+                v = v.strip()
+                # CRITICAL FIX: Extract only the first contiguous digit sequence
+                # instead of ALL digits from the line. This prevents digit bleed
+                # from adjacent OCR fields (e.g., "0580239576" + "4" from zip "48007")
+                m_loan = re.search(r'(\d[\d\s\-]*\d)', v)
+                if m_loan:
+                    digits = re.sub(r'[\s\-]', '', m_loan.group(1))
+                else:
+                    digits = ''.join(c for c in v if c.isdigit())
             else:
                 # Try to find number on line
                 digits = ''
@@ -2011,6 +2081,21 @@ class StatefulExtractor:
                         self.fields["insured_name"]["value"] = clean_line
                     self._partial_insured = ""
                     return
+                # CRITICAL FIX: If the new line looks like a SEPARATE person name
+                # (e.g., "BORGESS, REBECCA" after "CLAY, MYRA"), do NOT combine.
+                # Only combine if it looks like a business suffix/extension.
+                _business_ext = ("llc", "inc", "corp", "ltd", "co", "properties",
+                                 "enterprises", "holdings", "investments", "group",
+                                 "associates", "partners", "trust", "estate",
+                                 "dba", "company", "services")
+                cl_lower = clean_line.lower().strip().rstrip(".,")
+                is_business_extension = any(cl_lower.startswith(s) or cl_lower.endswith(s)
+                                            or s in cl_lower for s in _business_ext)
+                if not is_business_extension:
+                    # This is a separate person/entity name (e.g., co-insured),
+                    # NOT an extension of the primary insured. Keep the first name.
+                    self._partial_insured = ""
+                    return
                 combined = self._partial_insured + " " + clean_line
                 if _looks_like_name(combined):
                     self.fields["insured_name"] = {
@@ -2234,6 +2319,9 @@ class StatefulExtractor:
             "mortgagee copy", "mortgagee certificate",
             "other interest", "type of interest",
             "third party interest",  # DOI: "Third party interest added/removed" lines
+            "additional interest information",
+            "mortgagees additional interest information",
+            "direct rating information",
         ]
         # CRITICAL: Don't skip lines that just contain "mortgagee" as the ONLY matching word
         # "0400004466 MORTGAGEE" was handled above; "PLANET HOME LENDING LLC" should pass through
@@ -2308,7 +2396,7 @@ class StatefulExtractor:
                 # Remove numbering prefixes
                 clean = re.sub(r'^(\d+\.?\s*|first\s+|second\s+|third\s+)', '', clean, flags=re.I)
                 
-                if len(clean) > 5:
+                if len(clean) > 5 and not _is_mortgage_heading_noise(clean):
                     self.fields["mortgage_company"] = {
                         "value": clean,
                         "confidence": 0.94,
@@ -2410,6 +2498,8 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                         break
                 if "policy_number" in fields:
                     break
+    if "policy_number" not in fields:
+        _extract_policy_from_account_label(lines, fields)
     
     # --- Insured Name fallback (IMPROVED) ---
     if "insured_name" not in fields:
@@ -2484,7 +2574,48 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
     
     # --- Carrier Name fallback (scan first 20 lines) ---
     if "carrier_name" not in fields:
-        # First, look for "underwritten by" or "your insurer" patterns
+        # FIRST: check for explicit "Insurance provided by:" / "policy provided by:" label
+        # This is the most reliable pattern — value is on the next line(s)
+        for i, line in enumerate(lines[:40]):
+            ll = line.lower()
+            if re.search(r'(?:insurance|policy)\s+provided\s+by\s*:', ll):
+                # Collect carrier name from subsequent lines
+                parts = []
+                for off in range(1, 4):
+                    if i + off >= len(lines):
+                        break
+                    nxt_line = lines[i + off].strip()
+                    if not nxt_line or len(nxt_line) < 3:
+                        break
+                    # Stop at boilerplate/next-section labels
+                    if re.match(r'(?i)(you may|contact|visit|phone|www\.|http|all references)', nxt_line):
+                        break
+                    parts.append(nxt_line)
+                    # Stop if we have a company-type word
+                    nxt_lower = nxt_line.lower()
+                    if any(w in nxt_lower for w in ("company", "exchange", "mutual", "group", "corp")):
+                        break
+                if parts:
+                    carrier_raw = " ".join(parts).strip()
+                    # Strip trailing noise like "Customer assistance number: ..."
+                    carrier_raw = re.sub(
+                        r'\s*(customer\s*(assistance|service)\s*(number|phone|tel)[:\s]?.*|'
+                        r'phone[:\s].*|tel[:\s].*|fax[:\s].*|\(\d{3}\).*)',
+                        '', carrier_raw, flags=re.I
+                    ).strip()
+                    # Also truncate at company-type word
+                    carrier_clean = _extract_carrier_name(carrier_raw) if carrier_raw else ""
+                    if not carrier_clean:
+                        carrier_clean = carrier_raw
+                    if carrier_clean and len(carrier_clean) > 5:
+                        fields["carrier_name"] = {
+                            "value": carrier_clean.upper(),
+                            "confidence": 0.95,
+                            "source": "sweep_provided_by",
+                        }
+                break  # Only process first "provided by" match
+        
+        # Then look for "underwritten by" or "your insurer" patterns
         for line in lines[:30]:
             ll = line.lower()
             if "underwritten by" in ll or "your insurer" in ll:
@@ -2518,20 +2649,32 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
         # Known carrier name fallback — carriers without "insurance"/"company" keywords
         # (e.g., "ALLIED TRUST", "TOWER HILL", "SOUTHERN OAK")
         if "carrier_name" not in fields:
-            _KNOWN_CARRIERS_SWEEP = {
+            # Tier 1: Multi-word carrier names (high confidence, commit immediately)
+            _KNOWN_CARRIERS_SWEEP_MULTI = {
                 "allied trust", "tower hill", "southern oak", "peoples trust",
                 "security first", "homeowners choice", "heritage",
                 "florida peninsula", "citizens property", "federated national",
-                "universal property", "auto-owners", "encompass",
-                # Major national carriers (brand names from logos)
-                "nationwide", "allstate", "state farm", "geico", "progressive",
-                "travelers", "liberty mutual", "farmers", "usaa", "erie",
-                "safeco", "hartford", "hanover", "american family",
+                "universal property", "auto-owners",
+                "state farm", "liberty mutual", "american family",
+                "texas farmers",  # NFIP WYO carrier
+                "encompass indemnity",  # Encompass Indemnity Company
+            }
+            # Tier 2: Single-word brand names (lower confidence — only use as fallback)
+            # These often appear in logos and may NOT be the full carrier name.
+            # E.g., "FARMERS" logo → actual carrier is "Texas Farmers Insurance Company"
+            _KNOWN_CARRIERS_SWEEP_BRAND = {
+                "nationwide", "allstate", "geico", "progressive",
+                "travelers", "farmers", "usaa", "erie",
+                "safeco", "hartford", "hanover", "encompass",
                 "chubb", "amica", "kemper", "mercury", "shelter",
             }
+            
+            brand_fallback = None  # Store brand-only match as fallback
+            
             for line in lines[:15]:
                 ll = line.lower().strip().rstrip("'\"")
-                for c in _KNOWN_CARRIERS_SWEEP:
+                # First try multi-word carriers (commit immediately)
+                for c in _KNOWN_CARRIERS_SWEEP_MULTI:
                     if c == ll or ll.startswith(c):
                         carrier_val = line.strip().rstrip("'\".,;:").strip()
                         fields["carrier_name"] = {
@@ -2542,6 +2685,38 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                         break
                 if "carrier_name" in fields:
                     break
+                # Then check single-word brands (save as fallback only)
+                if brand_fallback is None:
+                    for c in _KNOWN_CARRIERS_SWEEP_BRAND:
+                        if c == ll or ll.startswith(c):
+                            brand_fallback = {
+                                "value": line.strip().rstrip("'\".,;:").strip(),
+                                "confidence": 0.70,
+                                "source": "sweep_brand_fallback",
+                            }
+                            break
+            
+            # Before committing brand fallback, re-scan for full carrier name
+            # with "insurance" keyword in the header area (may have been missed
+            # by sweep_header due to line formatting or OCR issues)
+            if "carrier_name" not in fields:
+                for line in lines[:25]:
+                    ll = line.lower()
+                    if any(w in ll for w in ('insurance', 'indemnity', 'casualty', 'assurance')):
+                        if any(w in ll for w in ('company', 'exchange', 'group', 'mutual', 'corp')):
+                            if not any(w in ll for w in ('agency', 'agent', 'services', 'processing', 'center')):
+                                carrier_val = _extract_carrier_name(line.strip())
+                                if carrier_val and _looks_like_carrier(carrier_val):
+                                    fields["carrier_name"] = {
+                                        "value": carrier_val.upper(),
+                                        "confidence": 0.92,
+                                        "source": "sweep_header_over_brand",
+                                    }
+                                    break
+            
+            # Only use brand fallback if nothing better was found
+            if "carrier_name" not in fields and brand_fallback:
+                fields["carrier_name"] = brand_fallback
     
     # --- Loan Number fallback ---
     if "loan_number" not in fields:
@@ -2564,7 +2739,13 @@ def _safe_sweep(lines: List[str], fields: Dict[str, Dict]) -> None:
                             "source": "sweep",
                         }
                         break
-                    digits = ''.join(c for c in v if c.isdigit())
+                    # CRITICAL FIX: Extract first contiguous digit group only
+                    # Prevents digit bleed from adjacent OCR fields
+                    m_loan = re.search(r'(\d[\d\s\-]*\d)', v)
+                    if m_loan:
+                        digits = re.sub(r'[\s\-]', '', m_loan.group(1))
+                    else:
+                        digits = ''.join(c for c in v if c.isdigit())
                 else:
                     digits = ''.join(c for c in line if c.isdigit())
                 
@@ -2835,6 +3016,7 @@ def _extract_can_inv_fields(lines: List[str], fields: Dict[str, Dict]) -> None:
     # INSURED NAME: "Name and address of Insured:\n<name>"
     # =================================================================
     _extract_insured_from_label(lines, fields)
+    _override_insured_from_customer_label(lines, fields)
 
     # =================================================================
     # POLICY NUMBER: prefer labeled values, then clean POBOX contamination
@@ -3330,7 +3512,7 @@ def _extract_carrier_provided_by(lines: List[str], fields: Dict) -> None:
             return  # Already have a good carrier name
 
     for i, line in enumerate(lines):
-        if re.search(r'(?i)your\s+policy\s+provided\s+by', line):
+        if re.search(r'(?i)(?:your\s+policy\s+provided\s+by|insurance\s+provided\s+by)', line):
             # Collect next 1-3 lines as carrier name
             parts = []
             for off in range(1, 4):
@@ -3400,8 +3582,178 @@ def _clean_policy_number(fields: Dict) -> None:
 
     # Strip trailing "Loan Number" text
     val = re.sub(r'\s*Loan\s*Number.*$', '', val, flags=re.I).strip()
+
+    # Strip accidental trailing year bleed from policy numbers.
+    # Example: "99047002652020" where "2020" comes from nearby date text.
+    if val.isdigit() and len(val) >= 12:
+        suffix_year = val[-4:]
+        if re.fullmatch(r'(?:19|20)\d{2}', suffix_year):
+            prefix = val[:-4]
+            if 8 <= len(prefix) <= 12:
+                eff = str(fields.get("effective_date", {}).get("value", ""))
+                exp = str(fields.get("expiration_date", {}).get("value", ""))
+                known_years = set(re.findall(r'(?:19|20)\d{2}', f"{eff} {exp}"))
+                if suffix_year in known_years:
+                    val = prefix
+
     if val != fields["policy_number"]["value"]:
         fields["policy_number"]["value"] = val
+
+
+def _extract_policy_from_account_label(lines: List[str], fields: Dict[str, Dict]) -> None:
+    """
+    Fallback for renewal docs where the policy id is printed as "Account Number".
+    Guarded to avoid overriding normal policy-number extraction behavior.
+    """
+    if "policy_number" in fields:
+        return
+
+    joined = " ".join(lines).lower()
+    # If explicit policy-number labels are present, do not use account fallback.
+    if re.search(r"\bpolicy\s*(?:number|no\.?|#)\b", joined):
+        return
+
+    noise_trail = re.compile(
+        r"\s+(?:agency|agent|eff\.?|effective|date|page|continued|loan|"
+        r"policy|description|type|period|info|information)\b.*$",
+        re.I,
+    )
+
+    for i, line in enumerate(lines):
+        if not re.search(r"(?i)\b(?:your\s+)?account\s+number\b", line):
+            continue
+
+        candidate = ""
+        if ":" in line:
+            _, _, v = line.partition(":")
+            candidate = v.strip()
+        else:
+            m = re.search(r"(?i)\baccount\s+number\b\s*([A-Z0-9][A-Z0-9\-\s]{3,})", line)
+            if m:
+                candidate = m.group(1).strip()
+
+        if not candidate and i + 1 < len(lines):
+            candidate = lines[i + 1].strip()
+
+        candidate = noise_trail.sub("", _clean(candidate)).strip()
+        compact = candidate.replace(" ", "")
+        if _looks_like_policy(compact):
+            fields["policy_number"] = {
+                "value": compact,
+                "confidence": 0.83,
+                "source": "stage1_account_policy_fallback",
+            }
+            return
+
+
+def _clean_insured_name(fields: Dict) -> None:
+    """
+    Normalize duplicated mirrored names from OCR merge artifacts.
+    Example: "REBECCA borgess BORGESS, REBECCA" -> "BORGESS, REBECCA"
+    """
+    if "insured_name" not in fields:
+        return
+    raw = str(fields["insured_name"].get("value", "")).strip()
+    if not raw:
+        return
+
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    # Exact mirrored pattern: "FIRST LAST LAST, FIRST"
+    m = re.match(
+        r'^\s*([A-Za-z][A-Za-z\'\-]+)\s+([A-Za-z][A-Za-z\'\-]+)\s+\2,\s*\1\s*$',
+        raw,
+        re.I,
+    )
+    if m:
+        cleaned = f"{m.group(2).upper()}, {m.group(1).upper()}"
+        fields["insured_name"]["value"] = cleaned
+        return
+
+    # Token-level fallback for similar mirrored duplicates.
+    toks = re.findall(r"[A-Za-z][A-Za-z'\-]*", raw)
+    if len(toks) >= 4:
+        t0, t1, t2, t3 = toks[0].lower(), toks[1].lower(), toks[2].lower(), toks[3].lower()
+        if t0 == t3 and t1 == t2:
+            fields["insured_name"]["value"] = f"{toks[1].upper()}, {toks[0].upper()}"
+
+
+def _is_mortgage_heading_noise(text: str) -> bool:
+    ll = (text or "").lower()
+    noise_phrases = (
+        "additional interest information",
+        "mortgagees additional interest information",
+        "mortgagees/additional interest information",
+        "direct rating information",
+    )
+    return any(p in ll for p in noise_phrases)
+
+
+def _extract_nfip_direct_carrier(lines: List[str], fields: Dict) -> None:
+    """
+    Flood direct-rating docs often include 'NFIP Direct Rating Information'
+    without a standard insurer header. Use a deterministic carrier fallback.
+    """
+    if fields.get("carrier_name", {}).get("value"):
+        return
+    joined = " ".join(lines).lower()
+    if "nfip" in joined and ("direct rating" in joined or "drect ratng" in joined):
+        fields["carrier_name"] = {
+            "value": "NATIONAL FLOOD INSURANCE PROGRAM",
+            "confidence": 0.86,
+            "source": "stage1_nfip_direct",
+        }
+
+
+def _extract_carrier_full_scan(lines: List[str], fields: Dict) -> None:
+    """
+    Whole-document carrier fallback for packets where insurer appears later pages.
+    """
+    existing = fields.get("carrier_name", {})
+    existing_val = existing.get("value", "")
+    existing_src = existing.get("source", "")
+    # Skip if we already have a high-quality carrier name
+    # But DO override low-confidence brand-only fallbacks
+    if existing_val and existing_src not in ("sweep_brand_fallback",):
+        return
+
+    # Strategy A: explicit '<name> Insurance Company/Exchange/Group/...'
+    rx = re.compile(
+        r'(?i)\b([A-Z][A-Z&.,/\-\s]{3,100}?)\s+'
+        r'(INSURANCE|INDEMNITY|CASUALTY|ASSURANCE|MUTUAL)\s+'
+        r'(COMPANY|EXCHANGE|GROUP|CORPORATION|CORP|CO)\b'
+    )
+    for line in lines:
+        ll = line.lower()
+        if any(bad in ll for bad in ("agency", "agent", "services", "producer", "underwriter")):
+            continue
+        m = rx.search(line.upper())
+        if not m:
+            continue
+        candidate = f"{m.group(1).strip()} {m.group(2)} {m.group(3)}"
+        candidate = re.sub(r"\s+", " ", candidate).strip(" ,.;:-")
+        if candidate and _looks_like_carrier(candidate):
+            fields["carrier_name"] = {
+                "value": candidate,
+                "confidence": 0.88,
+                "source": "stage1_carrier_full_scan",
+            }
+            return
+
+    # Strategy B: catch title-case lines missed by uppercase regex.
+    for line in lines:
+        ll = line.lower()
+        has_ins = any(w in ll for w in ("insurance", "indemnity", "casualty", "assurance"))
+        has_ent = any(w in ll for w in ("company", "exchange", "group", "mutual", "corp"))
+        if has_ins and has_ent and not any(b in ll for b in ("agency", "agent", "services", "producer")):
+            candidate = _extract_carrier_name(line.strip())
+            if candidate and _looks_like_carrier(candidate):
+                fields["carrier_name"] = {
+                    "value": candidate.upper(),
+                    "confidence": 0.86,
+                    "source": "stage1_carrier_full_scan_relaxed",
+                }
+                return
 
 
 def _override_policy_from_label(lines: List[str], fields: Dict) -> None:
@@ -3466,6 +3818,54 @@ def _override_policy_from_label(lines: List[str], fields: Dict) -> None:
                         "source": "stage1_labeled_policy_nextline",
                     }
                     return
+
+    # Strategy C: Two-column OCR — "Policy number:" label found but value is
+    # on a DIFFERENT line (not adjacent) due to column extraction order.
+    # E.g., OCR extracts left column first: "July 2020\n123456789\nMailing address:"
+    # then right column: "Policy number:\n24-hour claim..."
+    # The value "123456789" is an orphaned pure-digit line in the header area.
+    # Also handles merged-column artifacts like "123456789 24-hour claim reporting"
+    has_policy_label = any(re.search(r'(?i)policy\s+number\s*:', line) for line in lines)
+    if has_policy_label:
+        # Find orphaned numeric values in the first 40 lines (header area)
+        for line in lines[:40]:
+            candidate = line.strip()
+            if not candidate:
+                continue
+            # Strategy C1: Pure numeric standalone line
+            candidate_clean = candidate.replace(" ", "").replace("-", "")
+            if candidate_clean.isdigit() and _looks_like_policy(candidate_clean):
+                if not DATE_RE.search(candidate) and not _is_phone_number(candidate):
+                    fields["policy_number"] = {
+                        "value": candidate_clean,
+                        "confidence": 0.82,
+                        "source": "stage1_orphaned_policy_value",
+                    }
+                    return
+            # Strategy C2: Line starts with digits followed by column-merge noise
+            # e.g., "123456789 24-hour claim reporting" or "12345678924-hour..."
+            m_leading = re.match(r'^(\d{6,16})\s*[-\s]?\s*\d{0,2}[-\s]?(?:hour|h\b)', candidate, re.I)
+            if m_leading:
+                pol_val = m_leading.group(1)
+                if _looks_like_policy(pol_val):
+                    fields["policy_number"] = {
+                        "value": pol_val,
+                        "confidence": 0.80,
+                        "source": "stage1_orphaned_policy_merged",
+                    }
+                    return
+            # Strategy C3: Leading digits before any alpha chars on the line
+            m_digits = re.match(r'^(\d{6,16})(?:\s|[^0-9A-Za-z]|[A-Za-z])', candidate)
+            if m_digits:
+                pol_val = m_digits.group(1)
+                if _looks_like_policy(pol_val) and not _is_phone_number(pol_val):
+                    if not DATE_RE.search(candidate[:len(pol_val)+5]):
+                        fields["policy_number"] = {
+                            "value": pol_val,
+                            "confidence": 0.78,
+                            "source": "stage1_orphaned_policy_leading_digits",
+                        }
+                        return
 
 
 def _clean_mortgage_suffixes(fields: Dict) -> None:
@@ -3625,6 +4025,7 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         "LIBERTY MUTUAL FIRE INSURANCE COMPANY",
         "LIBERTY MUTUAL INSURANCE COMPANY",
         "FARMERS INSURANCE EXCHANGE",
+        "TEXAS FARMERS INSURANCE COMPANY",
         "SAFECO INSURANCE COMPANY OF AMERICA",
         "SAFECO INSURANCE COMPANY OF ILLINOIS",
         "ERIE INSURANCE EXCHANGE",
@@ -3655,6 +4056,7 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         "AUTO-OWNERS INSURANCE COMPANY",
         "CSAA INSURANCE EXCHANGE",
         "ENCOMPASS INSURANCE COMPANY",
+        "ENCOMPASS INDEMNITY COMPANY",
         "AMERICAN STRATEGIC INSURANCE COMPANY",
         "ORCHID UNDERWRITERS AGENCY",
         "ANCHOR SPECIALTY INSURANCE COMPANY",
@@ -3671,7 +4073,10 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         # but only if the current value contains "insurance" or similar keywords
         val_lower = val.lower()
         has_ins_word = any(w in val_lower for w in ('insurance', 'indemnity', 'casualty', 'assurance', 'exchange', 'mutual'))
-        if best_score > 0.60 and has_ins_word and best_match:
+        has_ins_abbrev = bool(re.search(r'\bins\b', val_lower)) or bool(re.search(r'\bcas\b', val_lower))
+        has_prop_abbrev = " prop " in f" {val_lower} "
+        has_ins_signal = has_ins_word or has_ins_abbrev or has_prop_abbrev
+        if best_score > 0.60 and has_ins_signal and best_match:
             fields["carrier_name"]["value"] = best_match
             fields["carrier_name"]["confidence"] = min(fields["carrier_name"].get("confidence", 0.90), 0.92)
             fields["carrier_name"]["source"] = fields["carrier_name"].get("source", "") + "_fuzzy_corrected"
@@ -4016,6 +4421,96 @@ def _extract_policy_period_dates(lines: List[str], fields: Dict) -> None:
                 }
 
 
+def _upgrade_brand_to_full_carrier(lines: List[str], fields: Dict) -> None:
+    """
+    Post-extraction: if carrier_name is a single-word brand (e.g., "ENCOMPASS",
+    "FARMERS", "HARTFORD"), scan the document for the full carrier name
+    (e.g., "Encompass Indemnity Company") and upgrade.
+    """
+    if "carrier_name" not in fields:
+        return
+    val = fields["carrier_name"].get("value", "").strip()
+    # Only upgrade if carrier is 1-2 words (brand-only)
+    if not val or len(val.split()) > 2:
+        return
+    brand = val.lower().rstrip(".,;:-")
+    
+    # Scan ALL lines for a full carrier name containing this brand
+    for line in lines:
+        ll = line.lower()
+        if brand not in ll:
+            continue
+        # Must also have insurer keyword + company type
+        has_ins = any(w in ll for w in ('insurance', 'indemnity', 'casualty', 'assurance'))
+        has_ent = any(w in ll for w in ('company', 'exchange', 'group', 'mutual', 'corp'))
+        has_bad = any(w in ll for w in ('agency', 'agent', 'services', 'producer'))
+        if has_ins and has_ent and not has_bad:
+            carrier_val = _extract_carrier_name(line.strip())
+            if carrier_val and _looks_like_carrier(carrier_val):
+                if brand in carrier_val.lower():
+                    fields["carrier_name"] = {
+                        "value": carrier_val.upper(),
+                        "confidence": 0.93,
+                        "source": "brand_upgrade",
+                    }
+                    return
+
+
+def _clean_policy_column_merge(fields: Dict) -> None:
+    """
+    Post-extraction: clean policy_number that has column-merge alpha noise.
+    E.g., "12345678924hourclaimreporting" → "123456789"
+    E.g., "HO-29-3847-F29-23TAgency" → "HO-29-3847-F29-23T"
+    
+    When two-column OCR merges a policy number with text from an adjacent column,
+    the result contains the real policy number followed by garbage alpha characters.
+    Extract just the leading numeric/policy portion.
+    """
+    if "policy_number" not in fields:
+        return
+    val = fields["policy_number"].get("value", "")
+    if not val:
+        return
+    
+    # Detect: digits followed by lowercase alpha run (no spaces) = column merge artifact
+    # E.g., "12345678924hourclaimreporti" → leading "123456789" is the real policy number
+    m = re.match(r'^(\d{6,16})(\d{0,2}[a-z]{3,})', val)
+    if m:
+        pol_part = m.group(1)
+        noise = m.group(2)
+        # The transition digit(s) between policy and noise could belong to either.
+        # If removing them still gives a valid policy number, do so.
+        # E.g., "12345678924hour" → "123456789" (strip "24hour")
+        # Check if the noise starts with digits that are part of the adjacent text
+        # (e.g., "24" from "24-hour")
+        noise_digits = re.match(r'^(\d+)', noise)
+        if noise_digits:
+            # Try without the transitional digits first
+            if _looks_like_policy(pol_part):
+                fields["policy_number"]["value"] = pol_part
+                fields["policy_number"]["source"] += "_cleaned"
+                return
+            # Try including them
+            with_digits = pol_part + noise_digits.group(1)
+            if _looks_like_policy(with_digits):
+                fields["policy_number"]["value"] = with_digits
+                fields["policy_number"]["source"] += "_cleaned"
+                return
+        elif _looks_like_policy(pol_part):
+            fields["policy_number"]["value"] = pol_part
+            fields["policy_number"]["source"] += "_cleaned"
+            return
+    
+    # Also handle: alphanumeric policy followed by alpha noise
+    # E.g., "HO293847F2923TAgencyName" — strip trailing lowercase words
+    m2 = re.match(r'^([A-Z0-9\-]{6,25}?)([A-Z][a-z]{2,}.*)', val)
+    if m2:
+        pol_part = m2.group(1)
+        if _looks_like_policy(pol_part):
+            fields["policy_number"]["value"] = pol_part
+            fields["policy_number"]["source"] += "_cleaned"
+
+
 def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     """Main entry point for Stage 1 extraction"""
     if not lines:
@@ -4036,7 +4531,13 @@ def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     _extract_mortgage_from_doi_address_block(lines, extractor.fields)  # ← DOI: mortgage from mailing address block
     _extract_policy_period_dates(lines, extractor.fields)  # ← RNW/FIR: robust policy-period date recovery
     _extract_can_inv_fields(lines, extractor.fields)   # ← NEW: CAN + INV fields
+    _extract_carrier_full_scan(lines, extractor.fields)
+    _extract_nfip_direct_carrier(lines, extractor.fields)
+    _clean_policy_number(extractor.fields)
+    _clean_insured_name(extractor.fields)
     _clean_carrier_ocr_bleed(extractor.fields)         # ← Fix OCR bleed on carrier name
+    _upgrade_brand_to_full_carrier(lines, extractor.fields)  # ← Upgrade single-word brand to full carrier
+    _clean_policy_column_merge(extractor.fields)        # ← Strip column-merge alpha noise from policy number
     
     return extractor.fields
 
@@ -4089,6 +4590,10 @@ def debug_extract(lines, print_lines=True):
     _extract_mortgage_from_doi_address_block(lines, ext.fields)
     _extract_policy_period_dates(lines, ext.fields)
     _extract_can_inv_fields(lines, ext.fields)
+    _extract_carrier_full_scan(lines, ext.fields)
+    _extract_nfip_direct_carrier(lines, ext.fields)
+    _clean_policy_number(ext.fields)
+    _clean_insured_name(ext.fields)
     _clean_carrier_ocr_bleed(ext.fields)
     
     print("\n" + "=" * 70)

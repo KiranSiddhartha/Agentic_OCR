@@ -337,7 +337,7 @@ def _extract_with_rules(
                 val = line[m.end():].strip()
                 if val and len(val) > 3:
                     out["carrier_name"] = _r(val, "sc_carrier_label", 0.85)
-            elif re.search(r'(?i)policy\s+provided\s+by', ll):
+            elif re.search(r'(?i)(?:policy|insurance)\s+provided\s+by', ll):
                 if nxt and len(nxt) > 3 and len(nxt) < 80:
                     # Try to merge multi-line carrier name
                     carrier_val = nxt.strip()
@@ -390,6 +390,12 @@ def _extract_with_rules(
         # --- LOAN NUMBER ---
         if "loan_number" in missing_fields and "loan_number" not in out:
             val = _try_labels(line, nxt, _LOAN_LABELS, nxt2)
+            if val:
+                # CRITICAL: If the value came from the next line (no digits on label line),
+                # verify it actually looks like a loan number candidate (must have digits)
+                val_digits = sum(c.isdigit() for c in val)
+                if val_digits < 3:
+                    val = None  # Reject non-numeric next-line values like "Type of Interest"
             if val:
                 clean = re.sub(r'[^0-9A-Za-z]', '', val)
                 if _valid_loan_number(clean):
@@ -699,6 +705,8 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
         "FEDERATED NATIONAL INSURANCE COMPANY",
         "AEGIS SECURITY INSURANCE COMPANY",
         "HARTFORD FIRE INSURANCE COMPANY",
+        "TEXAS FARMERS INSURANCE COMPANY",
+        "ENCOMPASS INDEMNITY COMPANY",
         "ANCHOR SPECIALTY INSURANCE COMPANY",
     ]
     

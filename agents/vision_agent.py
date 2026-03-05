@@ -1,726 +1,3 @@
-# # agents/vision_agent.py - MAXIMUM RECALL MODE
-# # Proper OCR integration with PP-OCRv3 and LayoutXLM
-
-# from PIL import Image
-# import torch
-# import numpy as np
-
-# # ============================================================
-# # VISION AGENT – INTELLIGENT CASCADING HYBRID
-# # ============================================================
-# class VisionAgent:
-#     def __init__(self, use_layoutxlm=True):
-#         """
-#         Stage-aware Vision Agent
-#         Stage 0 : PP-OCRv3
-#         Stage 1 : Rule-based layout
-#         Stage 2 : LayoutLMv3 (LAZY — loaded only when needed)
-#         """
-#         from api.ocr_engine import OCREngine
-#         self.ocr_engine = OCREngine()
-#         print("[VisionAgent] PP-OCRv3 loaded")
-
-#         self.use_layoutxlm = use_layoutxlm
-#         self.processor = None
-#         self.model = None
-#         self._layoutlm_load_attempted = False
-
-#     def _ensure_layoutlm(self):
-#         """Lazy-load LayoutLMv3 only when first needed."""
-#         if self._layoutlm_load_attempted:
-#             return self.model is not None
-#         self._layoutlm_load_attempted = True
-#         try:
-#             from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
-#             self.processor = LayoutLMv3Processor.from_pretrained(
-#                 "microsoft/layoutlmv3-base",
-#                 apply_ocr=False
-#             )
-#             self.model = LayoutLMv3ForTokenClassification.from_pretrained(
-#                 "microsoft/layoutlmv3-base"
-#             )
-#             self.model.eval()
-#             print("[VisionAgent] LayoutLMv3 loaded (lazy)")
-#             return True
-#         except Exception as e:
-#             print(f"[VisionAgent] LayoutLMv3 unavailable: {e}")
-#             self.use_layoutxlm = False
-#             return False
-
-#     # --------------------------------------------------------
-#     # STAGE 0 – OCR (STANDARD)
-#     # --------------------------------------------------------
-#     def run_vision(self, image):
-#         return self.ocr_engine.run(image)
-
-#     # --------------------------------------------------------
-#     # NEW: RAW OCR OUTPUT (100% UNFILTERED)
-#     # --------------------------------------------------------
-#     def run_vision_raw(self, image):
-#         """
-#         Return 100% raw OCR text with NO filtering.
-#         Use this for debugging missing text.
-#         """
-#         try:
-#             ocr_results = self.ocr_engine.run_with_boxes(image)
-            
-#             # Return EVERYTHING - no filtering
-#             all_text = []
-#             for word, box, conf in zip(
-#                 ocr_results.get("text", []),
-#                 ocr_results.get("boxes", []),
-#                 ocr_results.get("confidences", [])
-#             ):
-#                 all_text.append({
-#                     "text": word,
-#                     "box": box,
-#                     "confidence": conf,
-#                     "raw": True  # Flag to indicate unfiltered
-#                 })
-            
-#             print(f"[VisionAgent] Raw OCR extracted {len(all_text)} items")
-#             return all_text
-            
-#         except Exception as e:
-#             print(f"[VisionAgent] Raw OCR failed: {e}")
-#             return []
-
-#     # --------------------------------------------------------
-#     # NEW: EXPORT RAW OCR TO TEXT FILE
-#     # --------------------------------------------------------
-#     def export_raw_ocr(self, image, output_path="full_ocr_output.txt"):
-#         """
-#         Export 100% raw OCR to text file for debugging.
-#         """
-#         raw_ocr = self.run_vision_raw(image)
-        
-#         try:
-#             with open(output_path, "w", encoding="utf-8") as f:
-#                 f.write("=" * 80 + "\n")
-#                 f.write("COMPLETE RAW OCR OUTPUT (100% UNFILTERED)\n")
-#                 f.write("=" * 80 + "\n\n")
-                
-#                 for idx, item in enumerate(raw_ocr):
-#                     f.write(f"{idx:4d} | {item['confidence']:.3f} | {item['text']}\n")
-                
-#                 f.write("\n" + "=" * 80 + "\n")
-#                 f.write(f"TOTAL LINES: {len(raw_ocr)}\n")
-#                 f.write("=" * 80 + "\n")
-            
-#             print(f"[VisionAgent] Raw OCR exported to {output_path}")
-#             return output_path
-            
-#         except Exception as e:
-#             print(f"[VisionAgent] Export failed: {e}")
-#             return None
-
-#     # --------------------------------------------------------
-#     # INTELLIGENT CASCADING LAYOUT ANALYSIS
-#     # --------------------------------------------------------
-#     def analyze_layout(self, image, ocr_results=None):
-#         """
-#         INTELLIGENT CASCADE:
-#         1. OCR
-#         2. Rule-based layout
-#         3. LayoutLMv3 ONLY if ambiguity detected
-#         """
-
-#         if ocr_results is None:
-#             try:
-#                 ocr_results = self.ocr_engine.run_with_boxes(image)
-#             except Exception as e:
-#                 print(f"[VisionAgent] OCR failed: {e}")
-#                 return []
-
-#         if not ocr_results.get("text"):
-#             return []
-
-#         # ---------- STAGE 1: RULE-BASED (FAST, FREE) ----------
-#         basic_layout = self._basic_layout_analysis(image, ocr_results)
-
-#         if not self.use_layoutxlm:
-#             return basic_layout
-
-#         # ---------- DECISION: SHOULD WE RUN LAYOUTLM? ----------
-#         if not self._needs_semantic_layout(basic_layout):
-#             return basic_layout
-
-#         # ---------- STAGE 2: LAYOUTLMv3 (EXPENSIVE, LAZY-LOADED) ----------
-#         if not self._ensure_layoutlm():
-#             return basic_layout
-#         try:
-#             return self._layoutlm_analysis(image, ocr_results)
-#         except Exception as e:
-#             print(f"[VisionAgent] LayoutLM failed: {e}")
-#             return basic_layout
-
-#     # --------------------------------------------------------
-#     # DECISION LOGIC (CRITICAL)
-#     # --------------------------------------------------------
-#     def _needs_semantic_layout(self, layout_elements):
-#         """
-#         Run LayoutLM ONLY if:
-#         - Labels exist without nearby values
-#         - Dense table-like structure
-
-
-#         """
-
-#         labels = [e for e in layout_elements if e["element_type"] == "label"]
-#         values = [e for e in layout_elements if e["element_type"] == "value"]
-
-
-#         if not labels or not values:
-#             return False
-
-#         # Too many labels with no values → ambiguity
-#         orphan_labels = 0
-
-#         for lbl in labels:
-#             lx0, ly0, lx1, ly1 = lbl["box"]
-#             matched = False
-
-#             for val in values:
-#                 vx0, vy0, vx1, vy1 = val["box"]
-#                 if vx0 > lx1 and abs(vy0 - ly0) < 40:
-
-
-#                     matched = True
-#                     break
-
-#             if not matched:
-#                 orphan_labels += 1
-
-#         return orphan_labels >= 2
-
-
-
-
-#     # --------------------------------------------------------
-#     # STAGE 2 – LAYOUTLMv3 (SAFE)
-#     # --------------------------------------------------------
-#     def _layoutlm_analysis(self, image, ocr_results):
-#         if isinstance(image, np.ndarray):
-#             image = Image.fromarray(image[:, :, ::-1])
-
-#         encoding = self.processor(
-#             image,
-#             ocr_results["text"],
-#             boxes=ocr_results["boxes"],
-#             return_tensors="pt",
-#             truncation=True,
-#             padding="max_length",
-#             max_length=512
-#         )
-
-#         with torch.no_grad():
-#             logits = self.model(**encoding).logits
-
-#         predictions = logits.argmax(-1)[0]
-#         word_ids = encoding.word_ids(batch_index=0)
-
-#         return self._parse_layout(predictions, word_ids, ocr_results)
-
-#     # --------------------------------------------------------
-#     # PARSE LAYOUTLM OUTPUT
-#     # --------------------------------------------------------
-#     def _parse_layout(self, predictions, word_ids, ocr_results):
-#         label_map = {
-#             0: "O",
-#             1: "B-HEADER",
-#             2: "I-HEADER",
-#             3: "B-QUESTION",
-#             4: "I-QUESTION",
-#             5: "B-ANSWER",
-#             6: "I-ANSWER",
-#         }
-
-#         seen = set()
-#         layout_elements = []
-
-#         for t_idx, w_idx in enumerate(word_ids):
-#             if w_idx is None or w_idx in seen:
-#                 continue
-#             if w_idx >= len(ocr_results["text"]):
-#                 continue
-
-#             seen.add(w_idx)
-
-#             label = label_map.get(predictions[t_idx].item(), "O")
-#             word = ocr_results["text"][w_idx]
-#             box = ocr_results["boxes"][w_idx]
-#             conf = ocr_results["confidences"][w_idx]
-
-#             if "HEADER" in label:
-#                 etype = "header"
-#             elif "QUESTION" in label:
-#                 etype = "label"
-#             elif "ANSWER" in label:
-#                 etype = "value"
-#             else:
-#                 etype = "text"
-
-#             layout_elements.append({
-#                 "text": word,
-#                 "box": box,
-#                 "element_type": etype,
-#                 "confidence": conf,
-#                 "layoutlm_label": label
-#             })
-
-#         return layout_elements
-
-#     # --------------------------------------------------------
-#     # STAGE 1 – RULE-BASED LAYOUT (FALLBACK)
-#     # --------------------------------------------------------
-#     def _basic_layout_analysis(self, image, ocr_results):
-#         elements = []
-
-#         for word, box, conf in zip(
-#             ocr_results["text"],
-#             ocr_results["boxes"],
-#             ocr_results["confidences"]
-#         ):
-#             word_clean = word.strip()
-#             etype = "text"
-
-#             if word_clean.endswith(":"):
-#                 etype = "label"
-#             elif word_clean.isupper() and box[1] < 200:
-#                 etype = "header"
-#             elif any(c.isdigit() for c in word_clean):
-#                 etype = "value"
-
-#             elements.append({
-#                 "text": word,
-#                 "box": box,
-#                 "element_type": etype,
-#                 "confidence": conf
-#             })
-
-#         return elements
-
-#     # --------------------------------------------------------
-#     # KEY–VALUE PAIR EXTRACTION
-#     # --------------------------------------------------------
-#     def extract_key_value_pairs(self, layout_elements):
-#         pairs = []
-#         labels = [e for e in layout_elements if e["element_type"] in ("label", "header")]
-#         values = [e for e in layout_elements if e["element_type"] == "value"]
-
-#         for lbl in labels:
-#             lx0, ly0, lx1, ly1 = lbl["box"]
-#             best, dist = None, 1e9
-
-#             for val in values:
-#                 vx0, vy0, vx1, vy1 = val["box"]
-#                 if vx0 > lx1 and abs(vy0 - ly0) < 50:
-#                     d = vx0 - lx1
-#                 elif vy0 > ly1 and vy0 - ly1 < 120:
-#                     d = vy0 - ly1
-#                 else:
-#                     continue
-
-#                 if d < dist:
-#                     dist = d
-#                     best = val
-
-#             if best:
-#                 pairs.append((lbl["text"], best["text"]))
-
-#         return pairs
-
-
-# # ============================================================
-# # BACKWARD-COMPATIBLE SINGLETON
-# # ============================================================
-# _agent = None
-
-# def run_vision(image):
-#     global _agent
-#     if _agent is None:
-#         _agent = VisionAgent(use_layoutxlm=False)
-#     return _agent.run_vision(image)
-
-
-# def run_vision_raw(image):
-#     """
-#     Global function for 100% raw OCR output.
-#     """
-#     global _agent
-#     if _agent is None:
-#         _agent = VisionAgent(use_layoutxlm=False)
-#     return _agent.run_vision_raw(image)
-
-
-# def export_raw_ocr(image, output_path="full_ocr_output.txt"):
-#     """
-#     Global function to export raw OCR to file.
-#     """
-#     global _agent
-#     if _agent is None:
-#         _agent = VisionAgent(use_layoutxlm=False)
-#     return _agent.export_raw_ocr(image, output_path)
-
-
-# # agents/vision_agent.py
-# # DOCUMENT-AWARE LAYOUT RECONSTRUCTION ENGINE
-# # Strategy: Line grouping → Section detection → Form pairing / Table grid alignment
-
-# from PIL import Image
-# import torch
-# import numpy as np
-# import re
-
-# class VisionAgent:
-#     def __init__(self, use_layoutxlm=True):
-#         from api.ocr_engine import OCREngine
-#         self.ocr_engine = OCREngine()
-#         print("[VisionAgent] Document-Aware Layout Engine Loaded")
-
-#         self.use_layoutxlm = use_layoutxlm
-#         self.processor = None
-#         self.model = None
-#         self._layoutlm_load_attempted = False
-
-#     # ============================================================
-#     # STEP 1: GROUP RAW WORDS INTO LINES BY Y-COORDINATE
-#     # ============================================================
-
-#     def _group_into_lines(self, words, y_tolerance=12):
-#         """
-#         Groups word tuples into lines based on Y-coordinate proximity.
-#         Returns list of lines, each line is a list of (text, box, conf) sorted left-to-right.
-#         """
-#         if not words:
-#             return []
-
-#         words.sort(key=lambda w: (w[1][1], w[1][0]))
-
-#         lines = []
-#         current_line = [words[0]]
-#         current_y = words[0][1][1]
-
-#         for w in words[1:]:
-#             if abs(w[1][1] - current_y) <= y_tolerance:
-#                 current_line.append(w)
-#             else:
-#                 current_line.sort(key=lambda x: x[1][0])
-#                 lines.append(current_line)
-#                 current_line = [w]
-#                 current_y = w[1][1]
-
-#         if current_line:
-#             current_line.sort(key=lambda x: x[1][0])
-#             lines.append(current_line)
-
-#         return lines
-
-#     # ============================================================
-#     # STEP 2: FIND TABLE HEADER ROW
-#     # ============================================================
-
-#     def _find_table_header(self, lines):
-#         """
-#         Finds the 'Coverages | Limits | ... | Premiums' header line.
-#         Returns (header_line_index, column_boundaries_dict) or (None, None).
-#         """
-#         for idx, line in enumerate(lines):
-#             line_text_lower = " ".join(w[0].lower() for w in line)
-
-#             if 'coverages' in line_text_lower and 'limits' in line_text_lower:
-#                 col_bounds = {}
-#                 for w in line:
-#                     txt_l = w[0].lower()
-#                     if 'coverages' in txt_l:
-#                         col_bounds['coverages'] = w[1][0]
-#                     elif 'applicable' in txt_l or 'deductible' in txt_l:
-#                         col_bounds['deductibles'] = w[1][0]
-#                     elif 'premium' in txt_l:
-#                         col_bounds['premiums'] = w[1][0]
-#                     elif 'limits' in txt_l:
-#                         col_bounds['limits'] = w[1][0]
-#                 return idx, col_bounds
-
-#         return None, None
-
-#     # ============================================================
-#     # STEP 3: RENDER FORM SECTION (label:value pairing)
-#     # ============================================================
-
-#     def _render_form_section(self, lines):
-#         """
-#         Renders form/header area.
-#         - Labels ending ':' with value on same line → "Label: Value"
-#         - Labels ending ':' with value directly below → merge vertically
-#         - Otherwise plain text line
-#         """
-#         output = []
-#         skip_next = set()
-
-#         for i, line in enumerate(lines):
-#             if i in skip_next:
-#                 continue
-
-#             line_text = self._join_line_words(line)
-#             stripped = line_text.strip()
-
-#             # Check: standalone label ending with ':'
-#             if stripped.endswith(':') and i + 1 < len(lines) and (i + 1) not in skip_next:
-#                 next_line = lines[i + 1]
-#                 next_text = self._join_line_words(next_line).strip()
-
-#                 # Don't merge if next line is also a label
-#                 if not next_text.endswith(':'):
-#                     curr_x = line[0][1][0]
-#                     next_x = next_line[0][1][0]
-#                     curr_y_bot = max(w[1][3] for w in line)
-#                     next_y_top = min(w[1][1] for w in next_line)
-
-#                     vertically_close = (next_y_top - curr_y_bot) < 30
-#                     left_aligned = abs(curr_x - next_x) < 40
-
-#                     if vertically_close and left_aligned:
-#                         output.append(f"{stripped} {next_text}")
-#                         skip_next.add(i + 1)
-#                         continue
-
-#             output.append(line_text)
-
-#         return output
-
-#     def _join_line_words(self, line_words):
-#         """Joins words in a line with gap-aware spacing."""
-#         if not line_words:
-#             return ""
-
-#         parts = [line_words[0][0]]
-#         last_x_end = line_words[0][1][2]
-
-#         for w in line_words[1:]:
-#             gap = w[1][0] - last_x_end
-#             if gap > 100:
-#                 parts.append("   ")
-#             elif gap > 30:
-#                 parts.append("  ")
-#             else:
-#                 parts.append(" ")
-#             parts.append(w[0])
-#             last_x_end = w[1][2]
-
-#         return "".join(parts)
-
-#     # ============================================================
-#     # STEP 4: RENDER TABLE SECTION (grid-based column slotting)
-#     # ============================================================
-
-#     def _render_table_section(self, lines, col_bounds):
-#         """
-#         Slots each word into the correct column based on X-position
-#         relative to the header boundaries.
-#         """
-#         output = []
-
-#         cov_x = col_bounds.get('coverages', 0)
-#         lim_x = col_bounds.get('limits', 400)
-#         ded_x = col_bounds.get('deductibles', 600)
-#         prem_x = col_bounds.get('premiums', 800)
-
-#         # Emit header
-#         output.append("Coverages | Limits | Applicable Deductibles | Premiums")
-
-#         for line in lines[1:]:  # skip the header row itself
-#             cols = [[], [], [], []]
-
-#             for w in line:
-#                 cx = (w[1][0] + w[1][2]) / 2
-
-#                 if prem_x and cx >= prem_x - 20:
-#                     cols[3].append(w[0])
-#                 elif ded_x and cx >= ded_x - 20:
-#                     cols[2].append(w[0])
-#                 elif cx >= lim_x - 20:
-#                     cols[1].append(w[0])
-#                 else:
-#                     cols[0].append(w[0])
-
-#             c0 = " ".join(cols[0])
-#             c1 = " ".join(cols[1])
-#             c2 = " ".join(cols[2])
-#             c3 = " ".join(cols[3])
-
-#             row_text = f"{c0} {c1} {c2} {c3}".strip()
-#             if row_text:
-#                 parts = [c0]
-#                 if c1: parts.append(c1)
-#                 if c2: parts.append(c2)
-#                 if c3: parts.append(c3)
-#                 output.append(" ".join(parts))
-
-#         return output
-
-#     # ============================================================
-#     # STEP 5: DETECT TABLE END
-#     # ============================================================
-
-#     def _find_table_end(self, table_lines):
-#         """
-#         Scans table lines to find where the coverage table ends.
-#         Returns index within table_lines where non-table content starts.
-#         """
-#         end_markers = [
-#             'mortgagee', 'policy number', 'total residence',
-#             'form number', 'ed. date', 'biological irritants',
-#             'medical expenses', 'scheduled personal',
-#             'encompassone', 'your encompass agency',
-#             'home protection', 'coverage detail for'
-#         ]
-
-#         for t_idx in range(1, len(table_lines)):
-#             tline_text = " ".join(w[0] for w in table_lines[t_idx]).lower()
-#             if any(marker in tline_text for marker in end_markers):
-#                 return t_idx
-
-#         return len(table_lines)
-
-#     # ============================================================
-#     # STEP 6: NOISE FILTERING
-#     # ============================================================
-
-#     def _filter_noise(self, lines):
-#         """Remove OCR artifacts, duplicates, and junk."""
-#         cleaned = []
-#         seen = set()
-
-#         noise_patterns = [
-#             r'^\.?\s*ECECEs\s*$',
-#             r'^\.?\s*SCCEPPET5\s*$',
-#             r'^\.?\s*L03335\s*$',
-#             r'^\d{13,}',
-#             r'^1000[02].*0{4,}',
-#             r'^2000[03].*\d{3}$',
-#             r'^190415\d+',
-#             r'^198415\d+',
-#             r'^\.\s*$',
-#             r'^f:\s*$',
-#             r'^Creating protection around you',
-#             r'^Page \d+ of \d+',
-#             r'^Producer Code:',
-#             r'^Short Code#',
-#             r'^Office Use Space',
-#             r'^Coverage applies only if',
-#             r'^All references to .You.',
-#             r'^\*?The Property Location Limit is the sum',
-#             r'^individual limits of your',
-#             r'^\.?Excludes misplacing',
-#             r'^watches,?\s*stones',
-#             r'^\(Your Total Limit',
-#             r'^\(Refer to your Schedule',
-#             r'^The coverages and limits shown',
-#             r'^endorsements\.\s*$',
-#             r'^The policy is subject to',
-#             r'^See PLL deductibles',
-#             r'^\.\s*See PLL',
-#             r'^Per Endorsement\s*$',
-#             r'^\(continued\)\s*$',
-#         ]
-
-#         for line in lines:
-#             line = line.strip()
-#             if not line:
-#                 continue
-#             if line in seen:
-#                 continue
-
-#             is_noise = False
-#             for pattern in noise_patterns:
-#                 if re.match(pattern, line, re.IGNORECASE):
-#                     is_noise = True
-#                     break
-
-#             if not is_noise:
-#                 cleaned.append(line)
-#                 seen.add(line)
-
-#         return cleaned
-
-#     # ============================================================
-#     # STEP 7: MAIN PIPELINE
-#     # ============================================================
-
-#     def run_vision(self, image):
-#         try:
-#             ocr_results = self.ocr_engine.run_with_boxes(image)
-#         except Exception:
-#             lines, _ = self.ocr_engine.run(image)
-#             return "\n".join(lines)
-
-#         if not ocr_results or not ocr_results.get("text"):
-#             return ""
-
-#         words = list(zip(
-#             ocr_results["text"],
-#             ocr_results["boxes"],
-#             ocr_results["confidences"]
-#         ))
-
-#         # 1. Group words into lines by Y-coordinate
-#         lines = self._group_into_lines(words)
-
-#         # 2. Find all table headers (there may be multiple on multi-page docs)
-#         output_lines = []
-#         processed_up_to = 0
-
-#         while processed_up_to < len(lines):
-#             # Search for next table header from current position
-#             remaining = lines[processed_up_to:]
-#             header_idx, col_bounds = self._find_table_header(remaining)
-
-#             if header_idx is not None:
-#                 # Render form section before this table
-#                 form_lines = remaining[:header_idx]
-#                 if form_lines:
-#                     output_lines.extend(self._render_form_section(form_lines))
-
-#                 # Find where this table ends
-#                 table_start = remaining[header_idx:]
-#                 table_end = self._find_table_end(table_start)
-
-#                 # Render the table
-#                 table_output = self._render_table_section(table_start[:table_end], col_bounds)
-#                 output_lines.extend(table_output)
-
-#                 # Move cursor past the table
-#                 processed_up_to += header_idx + table_end
-#             else:
-#                 # No more tables — render rest as form
-#                 output_lines.extend(self._render_form_section(remaining))
-#                 break
-
-#         # 3. Filter noise
-#         final_lines = self._filter_noise(output_lines)
-
-#         return "\n".join(final_lines)
-
-#     # ============================================================
-#     # COMPATIBILITY
-#     # ============================================================
-
-#     def run_vision_raw(self, image):
-#         try:
-#             r = self.ocr_engine.run_with_boxes(image)
-#             return [{"text": t, "box": b, "confidence": c}
-#                     for t, b, c in zip(r["text"], r["boxes"], r["confidences"])]
-#         except:
-#             return []
-
-#     def analyze_layout(self, image, ocr_results=None):
-#         if ocr_results is None:
-#             ocr_results = self.ocr_engine.run_with_boxes(image)
-#         return [{"text": t, "box": b, "element_type": "text"}
-#                 for t, b in zip(ocr_results["text"], ocr_results["boxes"])]
-
-
 # # SINGLETON
 # _agent = None
 
@@ -1040,14 +317,21 @@ class VisionAgent:
         if not rows or not cols:
             return [], [0]
         nr, nc = len(rows), len(cols)
-        grid = [[""] * nc for _ in range(nr)]
+        grid_words = [[[] for _ in range(nc)] for _ in range(nr)]
         tx, ty = tbl_bbox[0], tbl_bbox[1]
-        for t, b, _ in words_px:
+        for t, b, _ in sorted(words_px, key=lambda w: ((w[1][1] + w[1][3]) / 2, (w[1][0] + w[1][2]) / 2)):
             cx, cy = (b[0]+b[2])/2 - tx, (b[1]+b[3])/2 - ty
             ri = self._nearest(cy, rows, "y")
             ci = self._nearest(cx, cols, "x")
             if ri >= 0 and ci >= 0:
-                grid[ri][ci] = (grid[ri][ci] + " " + t).strip()
+                grid_words[ri][ci].append((cy, cx, t))
+        grid = []
+        for r in grid_words:
+            row = []
+            for c in r:
+                c.sort(key=lambda it: (it[0], it[1]))
+                row.append(" ".join(tok for _, _, tok in c).strip())
+            grid.append(row)
         hdr = set()
         for h in st.get("headers", []):
             hy = (h["bbox"][1]+h["bbox"][3])/2
@@ -1055,7 +339,7 @@ class VisionAgent:
                 if rw["bbox"][1] <= hy <= rw["bbox"][3]:
                     hdr.add(ri)
                     break
-        return grid, sorted(hdr) or [0]
+        return self._normalize_grid(grid, sorted(hdr) or [0])
 
     @staticmethod
     def _nearest(c, items, axis):
@@ -1069,6 +353,64 @@ class VisionAgent:
                 bd, best = d, i
         return best
 
+    @staticmethod
+    def _normalize_grid(grid, hdr):
+        if not grid:
+            return [], [0]
+
+        # Drop entirely empty columns.
+        keep_cols = [ci for ci in range(len(grid[0])) if any((row[ci] or "").strip() for row in grid)]
+        if not keep_cols:
+            return [], [0]
+        grid = [[(row[ci] or "").strip() for ci in keep_cols] for row in grid]
+
+        # Drop entirely empty rows and remap header indices.
+        old_to_new = {}
+        compact = []
+        for oi, row in enumerate(grid):
+            if any(c.strip() for c in row):
+                old_to_new[oi] = len(compact)
+                compact.append(row)
+        grid = compact
+        if not grid:
+            return [], [0]
+        hdr = sorted(old_to_new[i] for i in hdr if i in old_to_new)
+
+        # Infer header rows from top rows if model missed header labels.
+        key = re.compile(r"\b(coverage|coverages|limits?|deductible|deductibles|premium|premiums|applicable)\b", re.I)
+        inferred = [ri for ri in range(min(3, len(grid))) if key.search(" ".join(grid[ri]))]
+        hdr = sorted(set(hdr + inferred))
+
+        # Merge split headers into a single canonical header row.
+        if len(hdr) > 1:
+            merged = []
+            for ci in range(len(grid[0])):
+                parts = []
+                for hi in hdr:
+                    cell = grid[hi][ci].strip()
+                    if cell and cell.lower() not in {p.lower() for p in parts}:
+                        parts.append(cell)
+                merged.append(" ".join(parts).strip())
+            body = [row for ri, row in enumerate(grid) if ri not in set(hdr)]
+            grid = [merged] + body
+            hdr = [0]
+        elif not hdr:
+            hdr = [0]
+        return grid, hdr
+
+    @staticmethod
+    def _has_table_signature(grid, hdr):
+        if not grid or len(grid) < 2 or len(grid[0]) < 2:
+            return False
+        hr = sorted(set(hdr or [0]))
+        header_text = " ".join(" ".join(grid[i]) for i in hr if 0 <= i < len(grid)).lower()
+        has_cov = bool(re.search(r"\bcoverage(s)?\b", header_text))
+        has_lim = bool(re.search(r"\blimit(s)?\b", header_text))
+        has_right = bool(re.search(r"\bpremium(s)?\b", header_text)) or bool(
+            re.search(r"\bdeductible(s)?\b", header_text)
+        )
+        return has_cov and has_lim and has_right
+
     # ================================================================
     #  GENERIC RULE-BASED TABLE DETECTOR
     # ================================================================
@@ -1078,11 +420,50 @@ class VisionAgent:
             if len(line) < 2:
                 continue
             sorted_w = sorted(line, key=lambda w: w[1][0])
+            line_text = " ".join(w[0] for w in sorted_w).lower()
+            texts = [w[0] for w in sorted_w]
+
+            # Avoid treating key/value summary rows as tables.
+            colon_tokens = sum(1 for t in texts if t.strip().endswith(":"))
+            if colon_tokens >= 2:
+                continue
+
+            # Require the left-side header anchors first.
+            has_coverages = bool(re.search(r"\bcoverage(s)?\b", line_text))
+            has_limits = bool(re.search(r"\blimit(s)?\b", line_text))
+            if not (has_coverages and has_limits):
+                continue
+
+            # Support OCR where right-side header appears on the same line
+            # or a nearby line (e.g., "Applicable Deductible(s) Premiums").
+            header_words = list(sorted_w)
+            right_hdr_idx = idx
+            has_right = bool(re.search(r"\bpremium(s)?\b", line_text)) and (
+                bool(re.search(r"\bdeductible(s)?\b", line_text))
+                or bool(re.search(r"\bapplicable\b", line_text))
+            )
+            if not has_right:
+                for j in range(idx, min(len(lines), idx + 8)):
+                    cand = sorted(lines[j], key=lambda w: w[1][0])
+                    cand_text = " ".join(w[0] for w in cand).lower()
+                    if (
+                        bool(re.search(r"\bpremium(s)?\b", cand_text))
+                        and (
+                            bool(re.search(r"\bdeductible(s)?\b", cand_text))
+                            or bool(re.search(r"\bapplicable\b", cand_text))
+                        )
+                    ):
+                        right_hdr_idx = j
+                        has_right = True
+                        header_words.extend(cand)
+                        break
+            if not has_right:
+                continue
+
             gaps = [sorted_w[i][1][0] - sorted_w[i-1][1][2]
                     for i in range(1, len(sorted_w))]
             if not any(g > 50 for g in gaps):
                 continue
-            texts = [w[0] for w in sorted_w]
             if not all(len(t) < 35 for t in texts):
                 continue
             if any('$' in t for t in texts):
@@ -1090,13 +471,35 @@ class VisionAgent:
             if any(t.strip().endswith(':') for t in texts):
                 continue
             if any(t[0].isupper() for t in texts if t.strip() and not t.startswith('$')):
+                anchors = {}
+                for w in sorted(header_words, key=lambda x: x[1][0]):
+                    txt = w[0].lower()
+                    if "coverag" in txt and "coverages" not in anchors:
+                        anchors["coverages"] = w
+                    elif "limit" in txt and "limits" not in anchors:
+                        anchors["limits"] = w
+                    elif ("deductible" in txt or "applicable" in txt) and "deductibles" not in anchors:
+                        anchors["deductibles"] = w
+                    elif "premium" in txt and "premiums" not in anchors:
+                        anchors["premiums"] = w
+
+                if not {"coverages", "limits", "deductibles", "premiums"}.issubset(set(anchors.keys())):
+                    continue
+
+                ordered = [
+                    ("Coverages", anchors["coverages"]),
+                    ("Limits", anchors["limits"]),
+                    ("Applicable Deductible(s)", anchors["deductibles"]),
+                    ("Premiums", anchors["premiums"]),
+                ]
                 col_bounds = [{
-                    "label": w[0],
-                    "x_start": w[1][0],
-                    "x_end": w[1][2],
-                    "x_center": (w[1][0] + w[1][2]) / 2,
-                } for w in sorted_w]
-                return idx, col_bounds
+                    "label": lbl,
+                    "x_start": ww[1][0],
+                    "x_end": ww[1][2],
+                    "x_center": (ww[1][0] + ww[1][2]) / 2,
+                } for lbl, ww in ordered]
+                col_bounds.sort(key=lambda c: c["x_center"])
+                return min(idx, right_hdr_idx), col_bounds
         return None, None
 
     def _find_table_end(self, lines, header_idx, col_bounds):
@@ -1341,17 +744,18 @@ class VisionAgent:
         self._ensure_dsm()
 
         if tsr_ok:
-            print("[VisionAgent] ▶ Using FULL pipeline (TD + TSR)")
-            return self._full(pil, wn, wp, iw, ih)
+            print("[VisionAgent] ▶ Using HYBRID pipeline (TD + TSR + fallback)")
+            return self._hybrid_layout_reconstruction(pil, wn, wp, iw, ih, tsr_ok=True)
         else:
-            print(f"[VisionAgent] ▶ Using FALLBACK pipeline (reason: {self._tsr_error})")
-            return self._fb(wn)
+            print(f"[VisionAgent] ▶ Using HYBRID pipeline (rule-based only, reason: {self._tsr_error})")
+            return self._hybrid_layout_reconstruction(pil, wn, wp, iw, ih, tsr_ok=False)
 
     # ================================================================
-    #  FULL PIPELINE  (TSR + optional DiT)
+    #  HYBRID LAYOUT RECONSTRUCTION
+    #  (TSR tables + rule-based fallback for uncovered regions)
     # ================================================================
 
-    def _full(self, pil, wn, wp, iw, ih):
+    def _hybrid_layout_reconstruction(self, pil, wn, wp, iw, ih, tsr_ok=True):
         tables = self._detect_tables(pil)
         if not tables:
             print("[VisionAgent] TD found 0 tables → falling back to rule-based")
@@ -1365,14 +769,16 @@ class VisionAgent:
             pad = 10
             crop = pil.crop((max(0, bb[0]-pad), max(0, bb[1]-pad),
                              min(iw, bb[2]+pad), min(ih, bb[3]+pad)))
-            st = self._recognise_tsr(crop)
+            st = self._recognise_tsr(crop) if tsr_ok else None
             grid, hdr = None, [0]
             if st and st["rows"] and st["columns"]:
                 tw = self._in_rgn(wp, bb, m=10)
                 grid, hdr = self._tsr_grid(tw, st, bb)
-                if grid:
+                if grid and self._has_table_signature(grid, hdr):
                     print(f"[VisionAgent] ✓ TSR grid: {len(grid)}×{len(grid[0])} "
                           f"(headers at rows {hdr})")
+                else:
+                    grid = None
             if grid:
                 sections.append((bb[1], self._grid_to_md(grid, hdr)))
             else:
@@ -1387,18 +793,22 @@ class VisionAgent:
                     if g:
                         sections.append((bb[1], self._grid_to_md(g, [0])))
 
+        # Run rule-based fallback on non-table words so missed table regions
+        # can still be reconstructed while preserving form lines.
         fwp = self._outside(wp, tbl_bbs)
         fwn = [(t, self._p2n(b, iw, ih), c) for t, b, c in fwp]
-        fl = self._group(fwn)
-        if fl:
-            rendered = self._render_form(fl)
-            cleaned = self._clean(rendered)
-            if cleaned:
-                y0 = fwn[0][1][1] if fwn else 0
-                sections.append((y0, "\n".join(cleaned)))
+        if fwn:
+            tail = self._fb(fwn).strip()
+            if tail:
+                y0 = min(w[1][1] for w in fwn)
+                sections.append((y0, tail))
 
         sections.sort(key=lambda s: s[0])
         return "\n\n".join(s[1] for s in sections)
+
+    # Backward-compatible alias.
+    def _full(self, pil, wn, wp, iw, ih):
+        return self._hybrid_layout_reconstruction(pil, wn, wp, iw, ih, tsr_ok=True)
 
     # ================================================================
     #  FALLBACK PIPELINE
@@ -1455,7 +865,7 @@ class VisionAgent:
                 if st and st["rows"] and st["columns"]:
                     tw = self._in_rgn(wp, bb)
                     g, hr = self._tsr_grid(tw, st, bb)
-                    if g:
+                    if g and self._has_table_signature(g, hr):
                         th.append(self._grid_to_html(g, hr))
                         tj.append(g)
                         continue

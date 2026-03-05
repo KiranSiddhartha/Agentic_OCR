@@ -413,8 +413,8 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
     # CRITICAL: Accept known carrier brand names that don't contain "insurance"
     KNOWN_CARRIER_BRANDS = {
         "nationwide", "allstate", "state farm", "geico", "progressive",
-        "travelers", "liberty mutual", "farmers", "usaa", "erie",
-        "safeco", "hartford", "hanover", "encompass", "auto-owners",
+        "travelers", "liberty mutual", "farmers", "texas farmers", "usaa", "erie",
+        "safeco", "hartford", "hanover", "encompass", "encompass indemnity", "auto-owners",
         "american family", "citizens", "universal", "federated", "aegis",
         "chubb", "amica", "kemper", "mercury", "shelter",
     }
@@ -455,6 +455,8 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
             "CITIZENS PROPERTY INSURANCE CORPORATION",
             "AEGIS SECURITY INSURANCE COMPANY",
             "ANCHOR SPECIALTY INSURANCE COMPANY",
+            "TEXAS FARMERS INSURANCE COMPANY",
+            "ENCOMPASS INDEMNITY COMPANY",
         ]
         try:
             from difflib import SequenceMatcher
@@ -747,6 +749,78 @@ def _salvage_from_lines(
             )
             if m:
                 candidates["property_address"] = m.group(1).split("\n")[0].strip()
+
+        # Common HO/RNW phrasing: "Location of Residence Premises: <address>"
+        if "property_address" not in candidates:
+            m = re.search(
+                r'(?i)location\s+of\s+residence\s+premises\s*:\s*(.+)',
+                text,
+            )
+            if m:
+                candidates["property_address"] = m.group(1).split("\n")[0].strip()
+
+        # Split-line variant:
+        # "Location of Residence Premises"
+        # "123 Main St, City ST 12345"
+        if "property_address" not in candidates:
+            for i, line in enumerate(lines):
+                if re.search(r'(?i)^location\s+of\s+residence\s+premises\s*$', line.strip()):
+                    for j in range(i + 1, min(i + 4, len(lines))):
+                        cand = lines[j].strip()
+                        if not cand:
+                            continue
+                        if re.search(r'(?i)^(policy|loan|named\s+insured|mortgagee|premium|deductible)\b', cand):
+                            break
+                        if re.search(r'\d{1,6}\s+\S+', cand):
+                            candidates["property_address"] = cand
+                            break
+                    if "property_address" in candidates:
+                        break
+
+    # Insured name from labeled blocks
+    if "insured_name" in missing:
+        for i, line in enumerate(lines):
+            m = re.search(
+                r'(?i)(?:first\s+named\s+insured|named\s+insured|policyholder(?:/named\s+insured)?)\s*:\s*(.+)',
+                line,
+            )
+            if m:
+                cand = m.group(1).strip()
+                if cand and not re.search(r'(?i)\b(policy|number|period|effective|expiration|loan|mortgage|agent)\b', cand):
+                    candidates["insured_name"] = cand
+                    break
+            if re.search(r'(?i)^(?:first\s+named\s+insured|named\s+insured|policyholder(?:/named\s+insured)?)\s*:?\s*$', line.strip()):
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    cand = lines[j].strip()
+                    if not cand:
+                        continue
+                    if re.search(r'(?i)^(policy|loan|effective|expiration|mailing|location|address|premium|deductible)\b', cand):
+                        break
+                    candidates["insured_name"] = cand
+                    break
+                if "insured_name" in candidates:
+                    break
+
+    # Mortgage company from labeled blocks
+    if "mortgage_company" in missing:
+        for i, line in enumerate(lines):
+            m = re.search(r'(?i)(?:mortgagee|mortgage\s+company|lender|loss\s+payee)\s*:\s*(.+)', line)
+            if m:
+                cand = m.group(1).strip().rstrip(".,;:")
+                if cand and not re.search(r'(?i)\b(loan|number|policy|page|copy)\b', cand):
+                    candidates["mortgage_company"] = cand
+                    break
+            if re.search(r'(?i)^(?:mortgagee|mortgage\s+company|lender|loss\s+payee)\s*:?\s*$', line.strip()):
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    cand = lines[j].strip().rstrip(".,;:")
+                    if not cand:
+                        continue
+                    if re.search(r'(?i)^(loan|policy|number|page|copy|address)\b', cand):
+                        continue
+                    candidates["mortgage_company"] = cand
+                    break
+                if "mortgage_company" in candidates:
+                    break
 
     # Total premium from totals lines
     if "total_premium" in missing:

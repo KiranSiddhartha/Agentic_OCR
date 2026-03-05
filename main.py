@@ -221,8 +221,20 @@ def order_expected_fields(field_names):
 
 
 def _extract_carrier_name_from_lines(lines):
-    # Prefer compact carrier brand name for UI consistency.
+    text = "\n".join(lines)
+
+    # First preference: explicit label in renewal docs.
+    for m in re.finditer(
+        r"(?im)\b(?:carrier|company|insurer)\s*name\s*[:\-]?\s*([^\n]+)",
+        text,
+    ):
+        cand = re.sub(r"\s+", " ", m.group(1)).strip(" .,:;-")
+        if cand and len(cand) >= 4:
+            return cand
+
+    # Fallback: common carrier keywords.
     carrier_patterns = [
+        (r"\badirondack\s+insurance\s+exchange\b", "Adirondack Insurance Exchange"),
         (r"\bencompass\b", "Encompass"),
         (r"\berie\b", "Erie"),
         (r"\ballstate\b", "Allstate"),
@@ -234,18 +246,113 @@ def _extract_carrier_name_from_lines(lines):
         (r"\bliberty\s+mutual\b", "Liberty Mutual"),
         (r"\bchubb\b", "Chubb"),
     ]
-    text = " ".join(lines).lower()
+    joined_lower = " ".join(lines).lower()
     for pattern, normalized in carrier_patterns:
-        if re.search(pattern, text, re.I):
+        if re.search(pattern, joined_lower, re.I):
             return normalized
+    return None
+
+
+def _extract_policy_number_from_lines(lines):
+    text = "\n".join(lines)
+    noise_suffix = re.compile(
+        r"(?i)(24\s*hour|claim\s*report|reporting|agent|insured|effective|expiration|policy\s*period).*"
+    )
+
+    # Inline labeled pattern: "Policy number: 123456789" / "Policy No: ABC12345"
+    for m in re.finditer(
+        r"policy\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\s]{4,30})",
+        text,
+        re.I,
+    ):
+        cand = re.sub(r"\s+", " ", m.group(1)).strip()
+        cand = noise_suffix.sub("", cand).strip()
+        cand = re.split(
+            r"\s+(?:policy\s*(?:description|type|period|number|info|information)|"
+            r"effective|expiration|insured|loan|agent|premium|deductible)\b",
+            cand,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .,:;-")
+        compact = re.sub(r"[^A-Z0-9\-]", "", cand.upper())
+        if len(compact) >= 6 and re.search(r"\d{4,}", compact):
+            # OCR bleed fix: keep leading numeric policy core when token is
+            # "12345678924hourclaimreporti" or "12345678924-HOUR" style.
+            bleed = re.match(r"^(\d{6,16})(?:[-A-Z].*)$", compact)
+            if bleed:
+                return bleed.group(1)
+            return compact
+
+    # OCR variant: "Policy Number ; 2004939477" etc.
+    for m in re.finditer(
+        r"policy\s*(?:number|no\.?|#)\s*[\:\-\.;]?\s*([A-Z0-9][A-Z0-9\-\s]{4,40})",
+        text,
+        re.I,
+    ):
+        cand = re.sub(r"\s+", " ", m.group(1)).strip(" .,:;-")
+        cand = re.split(
+            r"\s+(?:effective|expiration|insured|loan|agent|premium|deductible)\b",
+            cand,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" .,:;-")
+        compact = re.sub(r"[^A-Z0-9\-]", "", cand.upper())
+        if len(compact) >= 6 and re.search(r"\d{4,}", compact):
+            return compact
+
+    # Header/value split pattern:
+    #   "Policy number"  (line N)
+    #   "123456789"      (line N+1..N+5)
+    for idx, line in enumerate(lines):
+        if re.search(r"(?i)^policy\s*(?:number|no\.?|#)\s*:?\s*$", str(line).strip()):
+            for off in range(1, 6):
+                if idx + off >= len(lines):
+                    break
+                cand = str(lines[idx + off]).strip()
+                if not cand:
+                    continue
+                if re.search(r"(?i)^(policy|loan|insured|agent|premium|deductible|page)\b", cand):
+                    continue
+                token = cand.split()[0]
+                compact = re.sub(r"[^A-Z0-9]", "", token.upper())
+                if len(compact) >= 6 and re.search(r"\d{4,}", compact):
+                    bleed = re.match(r"^(\d{6,16})(?:[-A-Z].*)$", compact)
+                    if bleed:
+                        return bleed.group(1)
+                    return compact
     return None
 
 
 def _extract_loan_number_from_lines(lines):
     text = "\n".join(lines)
-    m = re.search(r"loan\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9\-]{4,})", text, re.I)
-    if m:
-        return m.group(1).strip()
+
+    # Prefer inline labeled values, but reject column headers like "Type".
+    for m in re.finditer(
+        r"loan\s*(?:number|no\.?|#)\s*[\:\-\.;]?\s*([A-Z0-9\-]{3,})",
+        text,
+        re.I,
+    ):
+        cand = m.group(1).strip()
+        if cand.lower() in {"type", "number", "loan", "acct", "account", "id"}:
+            continue
+        digits = re.sub(r"\D", "", cand)
+        if 7 <= len(digits) <= 16:
+            return digits
+
+    # Fallback: value on following line within a short lookahead window.
+    for idx, line in enumerate(lines):
+        if re.search(r"loan\s*(?:number|no\.?|#)\s*[:\-]?\s*$", line, re.I):
+            for off in range(1, 5):
+                if idx + off >= len(lines):
+                    break
+                cand = str(lines[idx + off]).strip()
+                if not cand:
+                    continue
+                if re.search(r"(?i)^(type|number|loan|account|acct)\b", cand):
+                    continue
+                digits = re.sub(r"\D", "", cand)
+                if 7 <= len(digits) <= 16:
+                    return digits
     return None
 
 
@@ -267,11 +374,33 @@ def _extract_total_premium_from_lines(lines):
                 m = re.search(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]{2})?)", nxt)
                 if m:
                     return f"${m.group(1)}"
+
+    # Label form with punctuation/OCR noise: "Total Premium ; $500"
+    text = "\n".join(lines)
+    m = re.search(
+        r"(?im)\btotal(?:\s+residence)?\s+premium\b\s*[\:\-\.;]?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{2})?)",
+        text,
+    )
+    if m:
+        return f"${m.group(1)}"
+    return None
+
+
+def _extract_date_after_label(text: str, label_pattern: str):
+    m = re.search(
+        rf"(?im)\b{label_pattern}\b\s*[\:\-\.;]?\s*([0-1]?\d[\/\-][0-3]?\d[\/\-](?:19|20)\d{{2}}|[A-Za-z]+\s+\d{{1,2}},\s+\d{{4}})",
+        text,
+    )
+    if m:
+        return m.group(1).strip()
     return None
 
 
 def _extract_effective_date_from_lines(lines):
     text = "\n".join(lines)
+    direct = _extract_date_after_label(text, r"(?:policy\s+)?effective\s+date")
+    if direct:
+        return direct
     patterns = [
         r"policy effective date\s*(?:is|:)?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
         r"effective date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
@@ -286,6 +415,9 @@ def _extract_effective_date_from_lines(lines):
 
 def _extract_expiration_date_from_lines(lines):
     text = "\n".join(lines)
+    direct = _extract_date_after_label(text, r"(?:policy\s+)?expiration\s+date")
+    if direct:
+        return direct
     patterns = [
         r"expiration date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})",
         r"through\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})",
@@ -314,6 +446,93 @@ def _extract_property_address_from_lines(lines):
     return None
 
 
+def _extract_mailing_address_from_lines(lines):
+    text = "\n".join(lines)
+
+    # Same-line labeled address.
+    m = re.search(r"(?im)\bmailing\s+address\b\s*[\:\-\.;]?\s*([^\n]+)", text)
+    if m:
+        cand = re.sub(r"\s+", " ", m.group(1)).strip(" .,:;-")
+        if re.search(r"\d{5}(?:-\d{4})?$", cand):
+            return cand
+        if len(cand) >= 10:
+            return cand
+
+    # Next-line fallback after a standalone label.
+    for idx, line in enumerate(lines):
+        if re.search(r"(?i)^\s*mailing\s+address\s*[\:\-\.;]?\s*$", str(line).strip()):
+            parts = []
+            for off in range(1, 4):
+                if idx + off >= len(lines):
+                    break
+                cand = str(lines[idx + off]).strip()
+                if not cand:
+                    if parts:
+                        break
+                    continue
+                if re.search(r"(?i)^(policy|loan|effective|expiration|carrier|premium|named|insured)\b", cand):
+                    break
+                parts.append(cand)
+                if re.search(r"\d{5}(?:-\d{4})?$", cand):
+                    break
+            if parts:
+                return re.sub(r"\s+", " ", ", ".join(parts)).strip(" ,")
+    return None
+
+
+def _extract_insured_name_from_lines(lines):
+    text = "\n".join(lines)
+
+    def _clean_candidate(raw: str):
+        cand = re.sub(r"\s+", " ", (raw or "")).strip(" .,:;-")
+        cand = re.split(
+            r"(?i)\b(mailing\s+address|property\s+address|loan\s+number|policy\s+number|effective\s+date|expiration\s+date|total\s+premium)\b",
+            cand,
+            maxsplit=1,
+        )[0].strip(" .,:;-")
+        if not cand:
+            return None
+        # Names should not look like addresses or date/amount lines.
+        if re.search(r"\d{1,6}\s+\w+", cand):
+            return None
+        if re.search(r"\$|\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2}", cand):
+            return None
+        if len(cand) < 3:
+            return None
+        return cand
+
+    # Same-line labels.
+    for m in re.finditer(
+        r"(?im)\b(?:named\s+insured|insured\s+name|name\s+of\s+insured)\b\s*[\:\-\.;]?\s*([^\n]+)",
+        text,
+    ):
+        cand = _clean_candidate(m.group(1))
+        if cand:
+            return cand
+
+    # "Named insured and mailing address" block: name often starts on next line.
+    for idx, line in enumerate(lines):
+        if re.search(r"(?i)named\s+insured(?:\s+and\s+mailing\s+address)?", str(line)):
+            for off in range(1, 4):
+                if idx + off >= len(lines):
+                    break
+                cand = _clean_candidate(str(lines[idx + off]).strip())
+                if cand:
+                    return cand
+
+    # Generic "Insured:" label fallback.
+    for idx, line in enumerate(lines):
+        if re.search(r"(?i)^\s*insured\s*[\:\-\.;]?\s*$", str(line).strip()):
+            for off in range(1, 3):
+                if idx + off >= len(lines):
+                    break
+                cand = _clean_candidate(str(lines[idx + off]).strip())
+                if cand:
+                    return cand
+
+    return None
+
+
 def fill_missing_expected_fields(clean_fields: dict, expected_fields: list, all_lines: list):
     patched = dict(clean_fields)
 
@@ -332,11 +551,14 @@ def fill_missing_expected_fields(clean_fields: dict, expected_fields: list, all_
         }
 
     put_if_missing("carrier_name", _extract_carrier_name_from_lines(all_lines))
+    put_if_missing("policy_number", _extract_policy_number_from_lines(all_lines))
+    put_if_missing("insured_name", _extract_insured_name_from_lines(all_lines))
     put_if_missing("loan_number", _extract_loan_number_from_lines(all_lines))
     put_if_missing("total_premium", _extract_total_premium_from_lines(all_lines))
     put_if_missing("effective_date", _extract_effective_date_from_lines(all_lines))
     put_if_missing("expiration_date", _extract_expiration_date_from_lines(all_lines))
     put_if_missing("property_address", _extract_property_address_from_lines(all_lines))
+    put_if_missing("mailing_address", _extract_mailing_address_from_lines(all_lines))
     return patched
 
 
