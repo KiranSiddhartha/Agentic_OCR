@@ -1770,51 +1770,6 @@ def _dte_cancellation(lines: List[str]) -> Dict[str, Dict]:
             out["cancellation_date"]["value"],
             "dte_can_exp_from_cancel", 0.90)
 
-    # --- CANCELLATION DATE: post-loop fallback ---
-    # For two-column OCR where the label "POLICY CANCELLATION DATE IS:" is in the
-    # left column and the date "09/04/2020 AT 12:01 AM" is in the right column
-    # (appears many lines later), scan ALL lines for orphaned date+time patterns
-    # that look like cancellation dates.
-    if "cancellation_date" not in out:
-        # Check if we have a cancellation label somewhere (confirms this IS a CAN doc)
-        has_cancel_label = any(
-            any(k in line.lower() for k in (
-                "cancellation date", "policy cancellation", "cancel date",
-                "cancelled", "canceled", "notice of cancellation",
-            ))
-            for line in lines
-        )
-        if has_cancel_label:
-            # Scan for standalone "MM/DD/YYYY AT HH:MM AM/PM" lines (cancellation date+time)
-            for line in lines:
-                stripped = line.strip()
-                m = re.match(
-                    r'^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+'
-                    r'(?:AT\s+\d{1,2}:\d{2}\s*(?:AM|PM|A\.?M\.?|P\.?M\.?))',
-                    stripped, re.I
-                )
-                if m:
-                    out["cancellation_date"] = _candidate(
-                        m.group(1), "dte_can_date_orphaned", 0.85)
-                    break
-            # Also try: date on a line that has "cancelled" context nearby
-            if "cancellation_date" not in out:
-                text_joined = "\n".join(lines)
-                m = re.search(
-                    r'(?i)(?:cancellation|cancelled|canceled|cancel)\s+date'
-                    r'[\s\S]{0,500}?'
-                    r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})',
-                    text_joined
-                )
-                if m:
-                    out["cancellation_date"] = _candidate(
-                        m.group(1), "dte_can_date_proximity", 0.80)
-        # Update expiration from newly found cancellation date
-        if "cancellation_date" in out and "expiration_date" not in out:
-            out["expiration_date"] = _candidate(
-                out["cancellation_date"]["value"],
-                "dte_can_exp_from_cancel", 0.88)
-
     # --- EFFECTIVE DATE (policy inception / start date) ---
     for line in lines:
         ll = line.lower()
@@ -2224,14 +2179,71 @@ def _dte_doi(lines: List[str]) -> Dict[str, Dict]:
     # Policy number
     m = _POLICY_LABEL_RE.search(text)
     if m:
-        out["policy_number"] = _candidate(
-            m.group(1).strip(), "dte_doi_policy", 0.95)
+        val = m.group(1).strip()
+        if val and len(val) >= 4:
+            out["policy_number"] = _candidate(
+                val, "dte_doi_policy", 0.95)
 
-    # Mortgage company — try labeled first
-    m = _MORTGAGE_LABEL_RE.search(text)
-    if m:
-        out["mortgage_company"] = _candidate(
-            m.group(1).strip(), "dte_doi_mortgage", 0.93)
+    # Policy number — fallback for two-column OCR where label and value are separated
+    # "POLICY NO.:" on one line, "ADP  0038122530  7" much later
+    if "policy_number" not in out:
+        has_policy_label = any(
+            re.search(r'(?i)policy\s*(?:no\.?|number|#)\s*:?\s*$', line.strip())
+            for line in lines
+        )
+        if has_policy_label:
+            # Scan for "ADP XXXXXXXXXX N" Nationwide/AMCO format
+            for line in lines:
+                stripped = line.strip()
+                m_adp = re.match(r'^([A-Z]{2,4})\s+([\d][\d\s]{6,}[\d])\s+(\d)\s*$', stripped)
+                if m_adp:
+                    raw = re.sub(r'\s+', '', m_adp.group(2))
+                    policy_val = f"{m_adp.group(1)} {raw} {m_adp.group(3)}"
+                    out["policy_number"] = _candidate(
+                        policy_val, "dte_doi_policy_orphaned", 0.88)
+                    break
+
+    # Mortgage company — first check for entity in ISAOA/ATIMA address block
+    # Pattern: "SHELLPOINT MORTGAGE SERVICING\nISAOA/ATIMA\nPO BOX..."
+    if "mortgage_company" not in out:
+        for idx, line in enumerate(lines):
+            if re.search(r'\bISAOA\b', line, re.I):
+                # Look BACKWARDS for the company name (preceding lines)
+                name_parts = []
+                for back in range(1, 4):
+                    if idx - back < 0:
+                        break
+                    prev = lines[idx - back].strip()
+                    # Stop at empty/short lines, known labels, or page headers
+                    if not prev or len(prev) < 3:
+                        break
+                    if re.search(r'(?i)^(nationwide|po\s+box|troy|date|dear|page)', prev):
+                        break
+                    name_parts.insert(0, prev)
+                    # Stop if we find enough name content
+                    if len(name_parts) >= 2:
+                        break
+                if name_parts:
+                    name = " ".join(name_parts)
+                    # Clean: remove address-like content at the end
+                    name = re.sub(r'\s+(?:PO\s+BOX|P\.?O).*$', '', name, flags=re.I).strip()
+                    name = re.sub(r'\s+(?:ISAOA|ATIMA|ISAOA/ATIMA).*$', '', name, flags=re.I).strip()
+                    if name and len(name) > 5:
+                        out["mortgage_company"] = _candidate(
+                            name, "dte_doi_mortgage_isaoa_block", 0.88)
+                        break
+
+    # Mortgage company — try labeled regex
+    if "mortgage_company" not in out:
+        m = _MORTGAGE_LABEL_RE.search(text)
+        if m:
+            val = m.group(1).strip()
+            # Skip false positives
+            val_lower = val.lower()
+            if not any(fp in val_lower for fp in ("copy", "certificate", "or interested",
+                                                    "relations center", "servicing isaoa")):
+                out["mortgage_company"] = _candidate(
+                    val, "dte_doi_mortgage", 0.93)
     
     # --- INS batch Section 8: Flood mortgage patterns ---
     if "mortgage_company" not in out:
