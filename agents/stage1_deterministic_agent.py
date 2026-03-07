@@ -4033,6 +4033,7 @@ def _clean_carrier_ocr_bleed(fields: Dict) -> None:
         "ERIE INSURANCE COMPANY",
         "AMERICAN FAMILY INSURANCE COMPANY",
         "AMERICAN BANKERS INSURANCE COMPANY OF FLORIDA",
+        "AMERICAN MODERN PROPERTY AND CASUALTY INSURANCE COMPANY",
         "AMCO INSURANCE COMPANY",
         "CITIZENS PROPERTY INSURANCE CORPORATION",
         "UNIVERSAL PROPERTY AND CASUALTY INSURANCE COMPANY",
@@ -4473,9 +4474,11 @@ def _clean_policy_column_merge(fields: Dict) -> None:
     """
     Post-extraction: clean policy_number that has column-merge alpha noise.
     E.g., "12345678924hourclaimreporting" → "123456789"
-    E.g., "12345678924-hourclaimreporting" → "123456789"
-    E.g., "12345678924" → "123456789" (trailing "24" from "24-hour")
     E.g., "HO-29-3847-F29-23TAgency" → "HO-29-3847-F29-23T"
+    
+    When two-column OCR merges a policy number with text from an adjacent column,
+    the result contains the real policy number followed by garbage alpha characters.
+    Extract just the leading numeric/policy portion.
     """
     if "policy_number" not in fields:
         return
@@ -4483,55 +4486,25 @@ def _clean_policy_column_merge(fields: Dict) -> None:
     if not val:
         return
     
-    # Pattern 1: digits followed by alpha noise (with optional hyphen/space separator)
-    # E.g., "12345678924-hourclaimreporting" → "123456789"
-    # E.g., "12345678924hourclaimreporti" → "123456789"
-    # Strategy: find where digits end and alpha begins, then try progressively
-    # shorter digit prefixes until we find one that looks like a valid policy
-    m_alpha = re.search(r'[a-zA-Z]{3,}', val)
-    if m_alpha and m_alpha.start() > 0:
-        # Everything before the first long alpha run (strip separators)
-        prefix = val[:m_alpha.start()].rstrip('-').rstrip()
-        # prefix might be "12345678924" or "123456789 24" etc.
-        digits_only = re.sub(r'[^0-9]', '', prefix)
-        if len(digits_only) >= 8:
-            # Try stripping trailing 1-3 digits (column-merge transition)
-            for strip_len in (3, 2, 1, 0):
-                candidate = digits_only[:len(digits_only)-strip_len] if strip_len else digits_only
-                if len(candidate) >= 6 and _looks_like_policy(candidate):
-                    # Only strip if the stripped digits + alpha look like a known pattern
-                    # (e.g., "24hour", "800", "12:01")
-                    if strip_len > 0:
-                        stripped = digits_only[len(digits_only)-strip_len:]
-                        # Accept strip if the stripped part + alpha forms a recognizable word
-                        alpha_start = val[m_alpha.start():m_alpha.start()+10].lower()
-                        combined_noise = stripped + alpha_start
-                        is_known_noise = any(combined_noise.startswith(p) for p in (
-                            "24hour", "24h", "800", "12hour", "1201",
-                            "24claim", "24-", "800a", "12a",
-                        ))
-                        if is_known_noise:
-                            fields["policy_number"]["value"] = candidate
-                            fields["policy_number"]["source"] += "_cleaned"
-                            return
-                    else:
-                        # No stripping needed — the alpha just starts right after
-                        fields["policy_number"]["value"] = candidate
-                        fields["policy_number"]["source"] += "_cleaned"
-                        return
-    
-    # Pattern 2: digits followed by lowercase alpha run (no separator)
-    # E.g., "12345678924hourclaimreporti" → "123456789"
+    # Detect: digits followed by lowercase alpha run (no spaces) = column merge artifact
+    # E.g., "12345678924hourclaimreporti" → leading "123456789" is the real policy number
     m = re.match(r'^(\d{6,16})(\d{0,2}[a-z]{3,})', val)
     if m:
         pol_part = m.group(1)
         noise = m.group(2)
+        # The transition digit(s) between policy and noise could belong to either.
+        # If removing them still gives a valid policy number, do so.
+        # E.g., "12345678924hour" → "123456789" (strip "24hour")
+        # Check if the noise starts with digits that are part of the adjacent text
+        # (e.g., "24" from "24-hour")
         noise_digits = re.match(r'^(\d+)', noise)
         if noise_digits:
+            # Try without the transitional digits first
             if _looks_like_policy(pol_part):
                 fields["policy_number"]["value"] = pol_part
                 fields["policy_number"]["source"] += "_cleaned"
                 return
+            # Try including them
             with_digits = pol_part + noise_digits.group(1)
             if _looks_like_policy(with_digits):
                 fields["policy_number"]["value"] = with_digits
@@ -4542,27 +4515,14 @@ def _clean_policy_column_merge(fields: Dict) -> None:
             fields["policy_number"]["source"] += "_cleaned"
             return
     
-    # Pattern 3: alphanumeric policy followed by Title-case alpha noise
-    # E.g., "HO293847F2923TAgencyName"
+    # Also handle: alphanumeric policy followed by alpha noise
+    # E.g., "HO293847F2923TAgencyName" — strip trailing lowercase words
     m2 = re.match(r'^([A-Z0-9\-]{6,25}?)([A-Z][a-z]{2,}.*)', val)
     if m2:
         pol_part = m2.group(1)
         if _looks_like_policy(pol_part):
             fields["policy_number"]["value"] = pol_part
             fields["policy_number"]["source"] += "_cleaned"
-            return
-    
-    # Pattern 4: pure-digit value with trailing digits from column merge
-    # E.g., "12345678924" = "123456789" + "24" (from "24-hour")
-    if val.isdigit() and len(val) >= 10:
-        for trail in ("24", "800", "12"):
-            tl = len(trail)
-            if val.endswith(trail) and len(val) - tl >= 6:
-                shorter = val[:-tl]
-                if _looks_like_policy(shorter):
-                    fields["policy_number"]["value"] = shorter
-                    fields["policy_number"]["source"] += "_trail_cleaned"
-                    return
 
 
 def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
