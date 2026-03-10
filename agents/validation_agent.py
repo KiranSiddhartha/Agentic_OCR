@@ -490,6 +490,11 @@ def validate_policy_number(value: str) -> Tuple[bool, str, float]:
     if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I): return False, v, 0.0
     if (re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v)) or re.match(r'^[A-Z]{2}\d{5,}$', v): return False, v, 0.0
     if re.search(r'\d{5}_\d+', v) or len(''.join(c for c in v if c.isdigit())) > 18 or re.fullmatch(r"\d{3}[-.\s]?\d{4}", v): return False, v, 0.0
+    # Reject phone numbers: 10-digit with area code (e.g., "864509-0009", "(864) 509-0009")
+    _pn_digits = ''.join(c for c in v if c.isdigit())
+    if len(_pn_digits) == 10 and re.match(r'^\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$', re.sub(r'[^\d()\-.\s]', '', v).strip()): return False, v, 0.0
+    if len(_pn_digits) == 10 and re.search(r'\d{3}[-]\d{4}$', v): return False, v, 0.0
+    if re.search(r'\(\d{3}\)', v): return False, v, 0.0
     # Join spaced digit groups: "063 078 674" → "063078674"
     parts_check = v.split()
     if all(p.isdigit() for p in parts_check) and 2 <= len(parts_check) <= 4:
@@ -831,6 +836,147 @@ def _salvage_from_lines(
         if m:
             amt = m.group(1).strip().rstrip(".")
             candidates["total_premium"] = f"${amt}"
+
+    # Policy number from labeled patterns
+    if "policy_number" in missing:
+        for m in re.finditer(
+            r'(?i)policy\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9][\w\s\-]{4,25})', text
+        ):
+            cand = re.sub(r'\s+', ' ', m.group(1)).strip()
+            cand = re.split(r'(?i)\s+(?:effective|expiration|insured|loan|agent|premium|policy\s*(?:type|period|description))\b', cand, maxsplit=1)[0].strip(' .,:;-')
+            compact = re.sub(r'[^A-Z0-9\-]', '', cand.upper())
+            if len(compact) >= 6 and re.search(r'\d{4,}', compact):
+                # CRITICAL: reject phone numbers
+                digits_only = re.sub(r'[^0-9]', '', compact)
+                if len(digits_only) == 10 or (len(digits_only) == 11 and digits_only.startswith('1')):
+                    continue  # Skip phone numbers
+                if re.search(r'\(\d{3}\)', cand):
+                    continue  # Skip (xxx) phone patterns
+                candidates["policy_number"] = compact
+                break
+        # Split-line: "Policy number" then value on next line
+        if "policy_number" not in candidates:
+            for i, line in enumerate(lines):
+                if re.search(r'(?i)^policy\s*(?:number|no\.?|#)\s*:?\s*$', str(line).strip()):
+                    for off in range(1, 5):
+                        if i + off >= len(lines):
+                            break
+                        cand = str(lines[i + off]).strip()
+                        if not cand or re.search(r'(?i)^(policy|loan|insured|agent|page)\b', cand):
+                            continue
+                        token = cand.split()[0]
+                        compact = re.sub(r'[^A-Z0-9\-]', '', token.upper())
+                        if len(compact) >= 6 and re.search(r'\d{4,}', compact):
+                            digits_only = re.sub(r'[^0-9]', '', compact)
+                            if len(digits_only) == 10 or (len(digits_only) == 11 and digits_only.startswith('1')):
+                                continue  # Skip phone numbers
+                            candidates["policy_number"] = compact
+                            break
+                    break
+
+    # Loan number from labeled patterns
+    if "loan_number" in missing:
+        m = re.search(
+            r'(?i)(?:loan\s*(?:number|no\.?|#|id)|loan/contract\s*(?:number|#)|mortgage\s+loan\s*no\.?)\s*[:\-]?\s*([\d][\d\s\-]{4,20})',
+            text,
+        )
+        if m:
+            digits = re.sub(r'[\s\-]', '', m.group(1))
+            if len(digits) >= 5:
+                candidates["loan_number"] = digits
+
+    # Mailing address from labeled blocks
+    if "mailing_address" in missing:
+        m = re.search(
+            r'(?i)(?:mailing\s+address|insured\s+mailing\s+address|mail\s+address)\s*[:\-]?\s*([^\n]+)',
+            text,
+        )
+        if m:
+            val = m.group(1).strip(' .,:;-')
+            if val and len(val) > 5:
+                candidates["mailing_address"] = val
+        if "mailing_address" not in candidates:
+            for i, line in enumerate(lines):
+                if re.search(r'(?i)mailing\s+address', str(line)):
+                    for off in range(1, 4):
+                        if i + off >= len(lines):
+                            break
+                        cand = str(lines[i + off]).strip()
+                        if cand and len(cand) >= 5 and not re.search(r'(?i)^(policy|named|effective|agent|premium)', cand):
+                            candidates["mailing_address"] = cand
+                            break
+                    break
+
+    # Cancellation date
+    if "cancellation_date" in missing:
+        _cancel_pats = [
+            r"(?i)policy\s+cancellation\s+date\s+is\s*:\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)cancellation\s+(?:effective\s+)?date\s*(?:is)?\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)(?:cancel(?:led|lation)|termination)\s+(?:effective\s+)?(?:on|date)?\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)non-?renewal\s+(?:effective\s+)?date\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)(?:cancel(?:led)?|terminated)\s+.*?on\s+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)terminate\s+this\s+policy\s+effective\s*:?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+            r"(?i)non-?renewal\s+date\s+and\s+time\s*:\s*\n?\s*(\w+\s+\d{1,2},?\s*\d{4})",
+        ]
+        for pat in _cancel_pats:
+            m = re.search(pat, text)
+            if m:
+                candidates["cancellation_date"] = m.group(1)
+                break
+        if "cancellation_date" not in candidates:
+            for line in lines:
+                ll = line.lower()
+                if any(w in ll for w in ("cancellation", "cancelled", "canceled", "termination")):
+                    dates = re.findall(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b', line)
+                    if dates:
+                        candidates["cancellation_date"] = dates[0]
+                        break
+            # Orphaned "MM/DD/YYYY AT HH:MM AM" pattern
+            if "cancellation_date" not in candidates:
+                for line in lines:
+                    m = re.match(r'^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s+(?:AT\s+\d{1,2}:\d{2}\s*(?:AM|PM))', line.strip(), re.I)
+                    if m:
+                        candidates["cancellation_date"] = m.group(1)
+                        break
+
+    # Cancellation reason
+    if "cancellation_reason" in missing:
+        m = re.search(r"(?i)reason\s+(?:for\s+)?(?:cancellation|termination|non-?renewal)\s*[:\-]?\s*(.{4,80})", text)
+        if m:
+            candidates["cancellation_reason"] = m.group(1).strip().rstrip(".,;:")
+        else:
+            for line in lines:
+                ll = line.lower()
+                if "premium" in ll and ("not been received" in ll or "non-payment" in ll or "nonpayment" in ll):
+                    candidates["cancellation_reason"] = "Non-payment of premium"
+                    break
+                if ("non-renewal" in ll or "nonrenewal" in ll or "non-renewed" in ll) and "date" not in ll:
+                    candidates["cancellation_reason"] = "Non-renewal"
+                    break
+                if "insured named below has requested" in ll or "borrower request" in ll:
+                    candidates["cancellation_reason"] = "Insured request"
+                    break
+                if "building has been sold" in ll or "removed, destroyed" in ll:
+                    candidates["cancellation_reason"] = "Building sold/removed/destroyed"
+                    break
+
+    # Balance due (INV)
+    if "balance_due" in missing:
+        m = re.search(
+            r'(?i)(?:balance\s+(?:to\s+pay|due)|amount\s+due|total\s+(?:amount\s+)?due|to\s+pay\s+in\s+full)\s*[:\$]?\s*\$?\s*([\d,]+\.?\d*)',
+            text,
+        )
+        if m:
+            candidates["balance_due"] = f"${m.group(1)}"
+
+    # Issue date (INV)
+    if "issue_date" in missing:
+        m = re.search(
+            r'(?i)(?:bill\s+date|invoice\s+date|statement\s+date|issue\s+date|billing\s+date)\s*[:\-]?\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})',
+            text,
+        )
+        if m:
+            candidates["issue_date"] = m.group(1)
 
     for field in missing:
         if field not in candidates or field in validated:

@@ -1,5 +1,6 @@
 #npm install concurrently
 from fastapi import FastAPI, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,9 +13,11 @@ import base64
 import re
 import io
 import zipfile
+import uuid
 from functools import lru_cache
 
-from pdf2image import convert_from_path
+# from pdf2image import convert_from_path
+import fitz
 from orchestrator import run_pipeline_batch
 from agents.document_router import classify_doc_type
 from agents.document_classifier import get_document_explanation
@@ -35,6 +38,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origin_regex=r"https://10\.0\.0\.\d+:9444",
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
 def load_input(file_path: str):
     """
@@ -43,16 +53,42 @@ def load_input(file_path: str):
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == ".pdf":
-        pil_pages = convert_from_path(file_path, dpi=300)
         pages = []
-        for p in pil_pages:
-            img = cv2.cvtColor(np.array(p), cv2.COLOR_RGB2BGR)
-            pages.append(img)
+
+        try:
+            doc = fitz.open(file_path)
+
+            for page in doc:
+                pix = page.get_pixmap(dpi=300)
+
+                img = np.frombuffer(
+                    pix.samples,
+                    dtype=np.uint8
+                ).reshape(pix.height, pix.width, pix.n)
+
+                # Convert RGBA → BGR if needed
+                if pix.n == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                else:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                pages.append(img)
+
+            doc.close()
+
+        except Exception as e:
+            print(f"[API] PDF conversion failed: {e}")
+            return []
+
         return pages
 
     img = cv2.imread(file_path)
-    return [img]
 
+    if img is None:
+        print(f"[API] Failed to read image: {file_path}")
+        return []
+
+    return [img]
 
 def _guess_mime_from_name(name: str) -> str:
     lower = (name or "").lower()
@@ -296,11 +332,22 @@ def _extract_policy_number_from_lines(lines):
         )[0].strip(" .,:;-")
         compact = re.sub(r"[^A-Z0-9\-]", "", cand.upper())
         if len(compact) >= 6 and re.search(r"\d{4,}", compact):
-            # OCR bleed fix: keep leading numeric policy core when token is
-            # "12345678924hourclaimreporti" or "12345678924-HOUR" style.
-            bleed = re.match(r"^(\d{6,16})(?:[-A-Z].*)$", compact)
+            # OCR bleed fix: strip trailing noise ONLY when it's clearly OCR merge
+            # Do NOT strip legitimate policy suffixes like "BP", "T", "F"
+            bleed = re.match(r"^(\d{6,16})([-]?[A-Z]{3,}.*)$", compact)
             if bleed:
-                return bleed.group(1)
+                suffix = bleed.group(2).lstrip("-")
+                noise_words = ("HOUR", "CLAIM", "REPORT", "AGENT", "INSURED",
+                               "EFFECTIVE", "POLICY", "PREMIUM", "STANDARD")
+                if any(suffix.startswith(nw) for nw in noise_words):
+                    result = bleed.group(1)
+                    # Also strip trailing digits that came from column merge
+                    # E.g., "12345678924" where "24" is from "24-HOUR"
+                    for trail in ("24", "800", "12"):
+                        if result.endswith(trail) and len(result) - len(trail) >= 6:
+                            result = result[:-len(trail)]
+                            break
+                    return result
             return compact
 
     # OCR variant: "Policy Number ; 2004939477" etc.
@@ -336,9 +383,18 @@ def _extract_policy_number_from_lines(lines):
                 token = cand.split()[0]
                 compact = re.sub(r"[^A-Z0-9]", "", token.upper())
                 if len(compact) >= 6 and re.search(r"\d{4,}", compact):
-                    bleed = re.match(r"^(\d{6,16})(?:[-A-Z].*)$", compact)
+                    bleed = re.match(r"^(\d{6,16})([-]?[A-Z]{3,}.*)$", compact)
                     if bleed:
-                        return bleed.group(1)
+                        suffix = bleed.group(2).lstrip("-")
+                        noise_words = ("HOUR", "CLAIM", "REPORT", "AGENT", "INSURED",
+                                       "EFFECTIVE", "POLICY", "PREMIUM", "STANDARD")
+                        if any(suffix.startswith(nw) for nw in noise_words):
+                            result = bleed.group(1)
+                            for trail in ("24", "800", "12"):
+                                if result.endswith(trail) and len(result) - len(trail) >= 6:
+                                    result = result[:-len(trail)]
+                                    break
+                            return result
                     return compact
     return None
 
@@ -691,8 +747,16 @@ def _augment_insured_with_secondary(existing_value, lines):
     )
     if m:
         rhs = re.sub(r"\s+", " ", m.group(1)).strip(" .,:;-")
-        if re.search(r"\b(and|&|/)\b", rhs, re.I):
-            return rhs
+        # Reject label fragments like "AND ADDRESS", "AND MAILING ADDRESS"
+        rhs_lower = rhs.lower()
+        is_label = any(frag in rhs_lower for frag in (
+            "address", "mailing", "location", "policy", "premium",
+            "coverage", "effective", "expiration", "information",
+        ))
+        if not is_label and re.search(r"\b(and|&|/)\b", rhs, re.I):
+            alpha_words = [w for w in rhs.split() if w.isalpha() and len(w) > 1]
+            if len(alpha_words) >= 3:
+                return rhs
     return base
 
 
@@ -737,13 +801,15 @@ def fill_missing_expected_fields(clean_fields: dict, expected_fields: list, all_
 
 @app.post("/preview")
 async def preview(file: UploadFile = File(...)):
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp:
+        suffix = os.path.splitext(file.filename or "")[-1]
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
         pages = load_input(tmp_path)
-        os.remove(tmp_path)
 
         if not pages:
             return JSONResponse(
@@ -755,8 +821,13 @@ async def preview(file: UploadFile = File(...)):
             "page_count": len(pages),
             "pages": pages_to_base64_png(pages),
         }
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @app.post("/expand-zip")
@@ -807,16 +878,18 @@ async def expand_zip(file: UploadFile = File(...)):
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
+    tmp_path = None
     try:
+        suffix = os.path.splitext(file.filename or "")[-1]
+
         # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
         pages = load_input(tmp_path)
 
         if not pages:
-            os.remove(tmp_path)
             return JSONResponse(
                 status_code=400,
                 content={"error": "Unable to read document"},
@@ -824,11 +897,10 @@ async def analyze(file: UploadFile = File(...)):
 
         start = time.time()
 
-        # Run pipeline
-        results = run_pipeline_batch(pages)
+        # Run CPU-heavy pipeline in a threadpool to avoid blocking the event loop
+        results = await run_in_threadpool(run_pipeline_batch, pages)
 
         if not results:
-            os.remove(tmp_path)
             return {
                 "document_type": "OTH",
                 "policy_type": "OTH",
@@ -881,15 +953,19 @@ async def analyze(file: UploadFile = File(...)):
 
         page_images = pages_to_base64_png(pages)
         raw_lines_by_page = [r.get("raw_lines", []) or [] for r in results]
+
         if ENABLE_STRUCTURED_OCR_DISPLAY:
             structured_lines = build_display_ocr_by_page(pages)
             if structured_lines:
                 raw_lines_by_page = structured_lines
                 all_lines = [ln for page_lines in raw_lines_by_page for ln in page_lines]
+
         clean_fields = fill_missing_expected_fields(clean_fields, expected_fields, all_lines)
+
         perfect = 0
         partial = 0
         failed = 0
+
         if expected_fields:
             for field_name in expected_fields:
                 value = clean_fields.get(field_name, {}).get("value")
@@ -902,8 +978,6 @@ async def analyze(file: UploadFile = File(...)):
         else:
             perfect = len(clean_fields)
 
-        os.remove(tmp_path)
-
         return {
             "document_type": doc_type,
             "policy_type": policy_type,
@@ -913,7 +987,7 @@ async def analyze(file: UploadFile = File(...)):
             "page_count": len(pages),
             "fields": clean_fields,
             "pages": page_images,
-            "raw_lines": all_lines,  # 🔥 THIS WAS MISSING
+            "raw_lines": all_lines,
             "raw_lines_by_page": raw_lines_by_page,
             "expected_fields": expected_fields,
             "summary_counts": {
@@ -926,6 +1000,10 @@ async def analyze(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 @app.get("/analyze")
