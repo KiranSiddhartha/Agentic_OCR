@@ -738,6 +738,7 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
         "AMERICAN FAMILY INSURANCE COMPANY",
         "CITIZENS PROPERTY INSURANCE CORPORATION",
         "UNIVERSAL PROPERTY AND CASUALTY INSURANCE COMPANY",
+        "ALLIED PROPERTY AND CASUALTY INSURANCE COMPANY",
         "FEDERATED NATIONAL INSURANCE COMPANY",
         "AEGIS SECURITY INSURANCE COMPANY",
         "HARTFORD FIRE INSURANCE COMPANY",
@@ -797,7 +798,16 @@ def _extract_carrier_keyword(lines: List[str]) -> Optional[Dict]:
                 score = SequenceMatcher(None, val_upper, known).ratio()
                 if score > best_score:
                     best_match, best_score = known, score
-            if best_score > 0.55 and best_match:  # 55% similarity threshold
+            # CRITICAL: Only use fuzzy match when:
+            # 1. Score is high enough (>=0.72) to be a genuine garbled match
+            # 2. The candidate does NOT already look like a valid abbreviated
+#               carrier (e.g. "ALLIED PROP AND CAS INS CO" is a real name,
+#               not a garbled version of something else).
+            _has_abbrev_carrier = bool(
+                re.search(r'\\b(?:ins|cas|prop|indem)\\b', ll)
+                and re.search(r'\\b(?:co|corp|grp)\\b', ll)
+            )
+            if best_score > 0.72 and best_match and not _has_abbrev_carrier:
                 return _r(best_match, "sc_carrier_fuzzy", 0.78)
     except ImportError:
         pass

@@ -215,13 +215,18 @@ PAGE_FILTER_PATTERNS = [
     "from: faxagent",
     "faxagent",
     "batch number",
-    "opex 3600",
-    "front image",
-    "rear image",
     "this page intentionally left blank",
     "acord 25",
     "advisory notice to policyholders",
     "coverage form",
+]
+
+# These patterns only trigger skip when they're the ENTIRE line content
+# (not embedded within insurance document text)
+_STANDALONE_SKIP_PATTERNS = [
+    "front image",
+    "rear image",
+    "opex 3600",
 ]
 
 def filter_artifact_pages(lines: List[str]) -> List[str]:
@@ -244,12 +249,24 @@ def filter_artifact_pages(lines: List[str]) -> List[str]:
         if any(p in ll for p in PAGE_FILTER_PATTERNS):
             skip_block = True
             continue
+        # Standalone patterns: only skip if the line is essentially just the pattern
+        if any(ll.strip() == p or ll.strip().startswith(p) and len(ll.strip()) < len(p) + 5 for p in _STANDALONE_SKIP_PATTERNS):
+            skip_block = True
+            continue
         
         # End skip block on strong document signals
         if skip_block and any(k in ll for k in (
             "declarations", "policy number", "insured",
             "effective date", "coverage a", "premium",
             "notice of cancellation", "certificate of insurance",
+            "insurance coverage notification",  # LexisNexis CAN/BREQ format
+            "important:", "coverage notification",
+            "total property notification",
+            "cancellation", "non-renewal", "nonrenewal",
+            "policy h", "policy #", "policy no",  # policy with value inline
+            "carrier", "pol type", "eff date", "pol from",
+            "mortgagee", "mortgage", "loss payee",
+            "reason", "customer initiated",
         )):
             skip_block = False
         

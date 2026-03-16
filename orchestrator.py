@@ -345,6 +345,8 @@ Rules:
 """
 
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+import logging
 
 # ================= INFRASTRUCTURE =================
 from preprocessing import preprocess
@@ -434,6 +436,7 @@ MULTI_PAGE_SUBTYPES = {
 # ============================================================
 
 _vision_agent: Optional[VisionAgent] = None
+logger = logging.getLogger("agentic_ocr.orchestrator")
 
 
 # ============================================================
@@ -453,6 +456,7 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
                       expensive fallback/LATE runs.
     """
     try:
+        logger.info("run_pipeline.start prior_fields=%d", len(prior_fields or {}))
         # ============================
         # STAGE 0 — OCR PREPROCESSING
         # ============================
@@ -469,16 +473,17 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         # If PaddleOCR returns empty (possible singleton corruption
         # from use_mp / mkldnn), recreate the engine and retry once.
         if not ocr or not ocr.get("text"):
-            print("[PIPELINE] OCR returned empty — recreating OCR engine and retrying")
+            logger.warning("run_pipeline.ocr_empty_retry")
             try:
                 from api.ocr_engine import OCREngine
                 vision.ocr_engine = OCREngine()
                 ocr = vision.ocr_engine.run_with_boxes(processed)
             except Exception as retry_err:
-                print(f"[PIPELINE] OCR retry failed: {retry_err}")
+                logger.exception("run_pipeline.ocr_retry_failed error=%s", retry_err)
         # ──────────────────────────────────────────────────────────
 
         if not ocr or not ocr.get("text"):
+            logger.warning("run_pipeline.no_ocr_text")
             return _empty_result("No OCR text")
 
         tokens = ocr.get("text", [])
@@ -518,12 +523,14 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         lines = correct_lines(lines, debug=debug)
 
         if not lines:
+            logger.warning("run_pipeline.no_usable_lines")
             return _empty_result("OCR produced no usable lines")
 
         # --- INS batch Section 6: Page Filtering ---
         # Filter out fax cover sheets, advisory notices, blank pages, etc.
         lines = filter_artifact_pages(lines)
         if not lines:
+            logger.warning("run_pipeline.all_lines_filtered")
             return _empty_result("All content filtered as artifacts")
 
         # ============================
@@ -710,6 +717,14 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         if debug:
             print(f"[FINAL] {len(final_fields)} validated fields, "
                   f"confidence={confidence:.3f}")
+        logger.info(
+            "run_pipeline.complete doc_type=%s policy_type=%s fields=%d confidence=%.3f approach=%s",
+            routing.doc_type,
+            routing.policy_type,
+            len(final_fields),
+            confidence,
+            routing.approach.value,
+        )
 
         return {
             "fields": final_fields,
@@ -727,10 +742,7 @@ def run_pipeline(image, max_retries=1, debug=False, use_cache=True,
         }
 
     except Exception as e:
-        # FIXED: Always log pipeline errors (not just in debug mode)
-        import traceback
-        print(f"[PIPELINE ERROR] {e}")
-        traceback.print_exc()
+        logger.exception("run_pipeline.failed error=%s", e)
         return _empty_result(str(e))
 
 
@@ -770,8 +782,13 @@ def _execute_approach(
         return result
 
     if approach == Approach.SC_SARDE_LATE:
-        sc_result = sc_te_extract(lines, missing_fields)
-        sarde_result = sarde_extract(lines)
+        # Run semantic + deterministic extraction concurrently; both read-only on
+        # the same input lines and are merged with the same precedence logic below.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_sc = ex.submit(sc_te_extract, lines, missing_fields)
+            fut_sarde = ex.submit(sarde_extract, lines)
+            sc_result = fut_sc.result()
+            sarde_result = fut_sarde.result()
 
         combined = _merge_results(sc_result, sarde_result)
 
@@ -834,6 +851,7 @@ def _run_late(vision, processed, ocr, existing, missing, debug):
     try:
         layout = vision.analyze_layout(processed, ocr)
     except Exception as e:
+        logger.exception("run_late.layout_analysis_failed error=%s", e)
         if debug:
             print(f"[LATE] Layout analysis failed: {e}")
         return {}
@@ -845,6 +863,7 @@ def _run_late(vision, processed, ocr, existing, missing, debug):
         re_agent = RelationExtractionAgent()
         relations = re_agent.extract_relations(layout, existing)
     except Exception as e:
+        logger.exception("run_late.relation_extraction_failed error=%s", e)
         if debug:
             print(f"[LATE] Relation extraction failed: {e}")
         relations = []
@@ -863,6 +882,7 @@ def _run_late(vision, processed, ocr, existing, missing, debug):
     try:
         return late_extract(ambiguous, relations, missing)
     except Exception as e:
+        logger.exception("run_late.extraction_failed error=%s", e)
         if debug:
             print(f"[LATE] Extraction failed: {e}")
         return {}
@@ -909,16 +929,30 @@ def run_pipeline_batch(images, max_retries=1, debug=False, use_cache=True):
     can skip expensive extraction for already-found fields."""
     results = []
     accumulated_fields: Dict[str, Dict] = {}
+    total_images = len(images or [])
+    logger.info("run_pipeline_batch.start images=%d", total_images)
 
     for i, img in enumerate(images):
-        result = run_pipeline(
-            img,
-            max_retries=max_retries,
-            debug=debug,
-            use_cache=use_cache,
-            prior_fields=accumulated_fields if i > 0 else None,
-        )
+        logger.info("run_pipeline_batch.page_start page=%d/%d", i + 1, total_images)
+        try:
+            result = run_pipeline(
+                img,
+                max_retries=max_retries,
+                debug=debug,
+                use_cache=use_cache,
+                prior_fields=accumulated_fields if i > 0 else None,
+            )
+        except Exception as e:
+            logger.exception("run_pipeline_batch.page_failed page=%d/%d error=%s", i + 1, total_images, e)
+            result = _empty_result(str(e))
+
         results.append(result)
+        logger.info(
+            "run_pipeline_batch.page_complete page=%d/%d fields=%d",
+            i + 1,
+            total_images,
+            len(result.get("fields", {}) if isinstance(result, dict) else {}),
+        )
         # Accumulate fields for next page
         for k, v in result.get("fields", {}).items():
             if k not in accumulated_fields:
@@ -931,6 +965,7 @@ def run_pipeline_batch(images, max_retries=1, debug=False, use_cache=True):
             if new_conf > prev_conf:
                 accumulated_fields[k] = v
 
+    logger.info("run_pipeline_batch.complete images=%d", total_images)
     return results
 
 

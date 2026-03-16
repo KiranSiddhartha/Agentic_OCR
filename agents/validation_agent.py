@@ -296,8 +296,11 @@
 #     return validate_and_arbitrate(structured, confidence, {"stage1": structured})
 
 import re
+import logging
 from datetime import datetime
 from typing import Dict, Tuple, Set, List, Optional
+
+logger = logging.getLogger("agentic_ocr.validation")
 
 # ============================================================
 # CONFIGURATION
@@ -346,7 +349,7 @@ FIELD_LABEL_HINTS = {
 SECTION_TITLES = {"summary", "home protection", "coverage", "coverages", "limits", "policy mortgage declarations summary", "declarations", "declarations summary", "mortgage/other interested parties", "applicable deductible(s)", "premiums", "forms and endorsements", "policy period", "policyholder since", "billing information", "payment plan", "discount information", "for your information", "important notice", "thank you", "office use space", "message(s)", "mortgagee(s)", "endorsements", "schedule", "notice", "rating information", "additional coverages", "discounts"}
 JUNK_VALUES = {"type", "interest", "policy", "coverage", "summary", "n/a", "none", "see attached", "continued", "page", "na", "tbd", "pending", "unknown", "included", "see policy"}
 MARKETING_SLOGANS = {"you're in good hands", "you're in good hands.", "youre in good hands", "on your side", "like a good neighbor", "we're all in this together", "nationwide is on your side", "for all that matters", "the promise", "keep the promise"}
-BAD_NAME_PHRASES = {"policy payment", "quickly & easily", "quickly and easily", "online", "pocket expenses", "out of pocket", "out-of-pocket", "and policy information", "policy information", "page 1 of", "page 2 of", "page 3 of", "mortgagee copy", "declarations page", "your policy", "our policy", "this policy", "policy conditions", "policy type", "policy period", "coverage detail", "coverage info", "premium info", "building type", "single family", "construction type", "roof-wall connection", "roof connection", "roof deck", "additional insured", "first named insured", "named insured:", "location id", "location of", "described location", "effective date", "expiration date", "endorsement", "deductible", "important notice", "special provisions"}
+BAD_NAME_PHRASES = {"policy payment", "quickly & easily", "quickly and easily", "online", "pocket expenses", "out of pocket", "out-of-pocket", "and policy information", "policy information", "page 1 of", "page 2 of", "page 3 of", "mortgagee copy", "declarations page", "your policy", "our policy", "this policy", "policy conditions", "policy type", "policy period", "coverage detail", "coverage info", "premium info", "building type", "single family", "construction type", "roof-wall connection", "roof connection", "roof deck", "additional insured", "first named insured", "named insured:", "location id", "location of", "described location", "effective date", "expiration date", "endorsement", "deductible", "important notice", "special provisions", "loss of use", "replacement cost", "unit owner", "master policy"}
 PRODUCT_NAMES = {"homesaver polcy", "homesaver policy", "homeowners policy", "dwelling policy", "mobilehome policy", "mobilehomeowners", "special form policy", "wind only policy", "condominium policy", "condominium owners", "rental unit owners", "ultrapack plus", "encompassone", "encompass one"}
 BAD_INSURED_COMPANY_NAMES = {"allied trust", "aegis", "aegis security", "aegis security insurance", "a egis", "properiy insurance", "property insurance", "insurance corporation", "insurance company", "insurance exchange", "mortgage company", "mortgage corp", "financial inc", "lending llc", "bank na"}
 BAD_CARRIER_PATTERNS = {"properiy insurance", "property insurance corporaion", "property insurance corporaiion", "insurance exchange*", "insurance company*", "insurance agency", "insurance services", "insurance center", "everett financial", "broker solutions", "nancy bond insurance", "geico ins agency", "allstate mortgage"}
@@ -478,14 +481,55 @@ def validate_carrier(value: str) -> Tuple[bool, str, float]:
 
 def validate_policy_number(value: str) -> Tuple[bool, str, float]:
     v = re.sub(r'^[.\s:;,]+', '', value.strip()).strip()
+    # CRITICAL: Reject currency/liability-amount values before anything else.
+    # Policy numbers never use comma-thousands separators ("500,000", "S10,000").
+    if re.match(r'^[A-Z]?\d{1,3}(,\d{3})+(\.\d{1,2})?$', v, re.I):
+        return False, v, 0.0
+    if re.match(r'^[$S]\s*\d{1,3}(,\d{3})*(\.\d{1,2})?$', v, re.I):
+        return False, v, 0.0
     # Strip trailing OCR-merged label text: "063 078 674 Policy descrip" → "063 078 674"
     v = re.sub(
         r'\s+(?:policy\s*(?:description|descrip|desc|type|period|number|info)?'
         r'|description|descrip)\b.*$',
         '', v, flags=re.I
     ).strip()
+    # Strip trailing label bleed seen in CAN docs:
+    # "60-04077225-2019 INSURED N" / "TX-HOV-00032479-01 Named I"
+    v = re.sub(
+        r'\s+(?:named?|name|insured?|insure[ds]?|policyholder|holder|'
+        r'mailing|address|mortgagee?|copy|loan|effective|expiration)\b.*$',
+        '',
+        v,
+        flags=re.I,
+    ).strip()
     # Strip trailing Title-case label bleed: "063 078 674 Mobilehome" → "063 078 674"
     v = re.sub(r'\s+[A-Z][a-z]\w*(?:\s+[A-Z][a-z]\w*)*\s*$', '', v).strip()
+    # Strip trailing OCR bleed seen in policy-number outputs:
+    # "648644419 MASTER POLCY" / "99047002652020FLOODPOLIC" / "99047002652020FLOOD"
+    # Note: both space-separated AND directly concatenated forms must be handled.
+    v = re.sub(
+        r'(?i)\s+(?:master\s+)?pol(?:icy|ic|cy|icy\w*)\b.*$',
+        '',
+        v,
+    ).strip()
+    # Handle directly-concatenated suffix (no space): "99047002652020FLOODPOLIC" or "99047002652020FLOOD"
+    v = re.sub(
+        r'(?i)(?:FLOOD|HOMEOWNERS?|DWELLING|WIND|CONDO|REPLACEMENT|COST)POL(?:IC(?:Y|ICS?)?|CY)?\w*$',
+        '',
+        v,
+    ).strip()
+    # Also catch bare label words glued directly after digits: "99047002652020FLOOD"
+    v = re.sub(
+        r'(?<=[0-9])(?:FLOOD|HOMEOWNERS?|DWELLING|WIND|CONDO|MASTER|POLCY|POLICY)\w*$',
+        '',
+        v,
+        flags=re.I,
+    ).strip()
+    v = re.sub(
+        r'(?i)\s+(?:flood|homeowners?|dwelling|wind|condo|replacement|cost)\b.*$',
+        '',
+        v,
+    ).strip()
     if _is_section_header_value(v) or _is_document_reference(v) or DATE_RE.search(v) or '$' in v: return False, v, 0.0
     if re.search(r'(date|time|page|due|liability|coverage|endorsement|premium|deductible|dwelling|personal|medical)', v, re.I): return False, v, 0.0
     if (re.search(r'\.\d{2,}', v) and not re.search(r'^[A-Z]', v)) or re.match(r'^[A-Z]{2}\d{5,}$', v): return False, v, 0.0
@@ -526,6 +570,24 @@ def validate_loan_number(value: str) -> Tuple[bool, str, float]:
 def validate_name(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
     if not v or len(v) < 2: return False, v, 0.0
+    # CRITICAL: Reject postal/delivery barcode artifacts — OCR of postal barcodes
+    # produces strings with mixed non-alpha characters (quotes, pipes, tildes)
+    # e.g. 'Ho enb"ob', 'lIp|prpd|Iq|rl', '|||||||||||||'
+    if re.search(r'["|\'`~|\\]{1}', v) or re.search(r'[|]{2,}', v):
+        return False, v, 0.0
+    # Also reject if >25% of characters are non-alphanumeric/space (barcode noise)
+    non_alnum = sum(1 for c in v if not c.isalnum() and c != ' ')
+    if len(v) > 0 and non_alnum / len(v) > 0.25:
+        return False, v, 0.0
+    # Strip trailing coverage/label bleed that can get glued to the name.
+    v = re.split(
+        r'(?i)\b(?:replacement\s+cost|loss\s+of\s+use|coverage\s+[a-z]|'
+        r'policy\s+period|effective\s+date|expiration\s+date)\b',
+        v,
+        maxsplit=1,
+    )[0].strip(" ,;:-")
+    if not v or len(v) < 2:
+        return False, v, 0.0
     
     # CRITICAL: Reject OCR-garbled label text masquerading as names
     v_nospace = re.sub(r'\s+', '', v.lower())
@@ -573,6 +635,8 @@ def validate_name(value: str) -> Tuple[bool, str, float]:
     if any(p in vl for p in BAD_NAME_PHRASES) or re.search(r'[$%*#@!]', v) or _is_document_reference(v) or _is_phone_number(v): return False, v, 0.0
     bad_starts = ("policy", "coverage", "premium", "billing", "copy", "page", "section", "office", "message", "declarations", "effective", "expiration", "total", "subtotal", "the ", "this ", "our ", "your ", "and ", "or ", "for ")
     if any(vl.startswith(w) for w in bad_starts): return False, v, 0.0
+    if re.match(r'(?i)^[A-Z]\.\s*(?:loss|coverage|dwelling|liability)\b', v):
+        return False, v, 0.0
     bad_ends = (" copy", " page", " info", " information", " type", " period", " date", " number", " account")
     if any(vl.endswith(w) for w in bad_ends): return False, v, 0.0
     has_entity = any(w in vl for w in ["llc", "inc", "corp", "company", "trust", "ltd", "dba"])
@@ -595,9 +659,24 @@ def validate_mortgage_company(value: str) -> Tuple[bool, str, float]:
 def validate_address(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
     if _is_section_header_value(v) or v.lower() in JUNK_VALUES or not v or len(v) < 5 or v.endswith(":"): return False, v, 0.0
+    # CRITICAL: Reject OCR-truncated/mangled addresses that lack a leading street number.
+    # e.g. "GUL CRYSIAL BEACHT77" is a corrupt version of "1900 GULF CRYSTAL BEACH TX 77650".
+    # A valid address must start with digits or "PO Box" — pure alpha starts are noise.
     vl = v.lower()
-    bad_patterns = ["policy period", "beginning", "through", "standard time", "coverage", "summary", "declarations", "effective date", "office use", "message", "mortgagee", "endorsement", "premium", "deductible", "page ", " of ", "building type", "construction", "roof", "single family", "owner occupied", "ph 87", "_8s$", "$$", "##", "exclusion", "poisoning", "liability", "inflation", "protection", "provisions", "amendment", "special form", "fungi", "ordinance", "personal property", "loss payee"]
-    if any(k in vl for k in bad_patterns) or re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v): return False, v, 0.0
+    # Reject if no leading digit and no PO Box and no city+state+zip pattern
+    if not re.match(r'^\d', v) and not PO_BOX_RE.match(v):
+        if not re.search(r'\b[A-Z]{2}\s*\d{5}', v):
+            return False, v, 0.0
+    bad_patterns = ["policy period", "beginning", "through", "standard time", "eastern time", "central time", "coverage", "summary", "declarations", "effective date", "office use", "message", "mortgagee", "endorsement", "premium", "deductible", "page ", " of ", "building type", "construction", "roof", "single family", "owner occupied", "ph 87", "_8s$", "$$", "##", "exclusion", "poisoning", "liability", "inflation", "protection", "provisions", "amendment", "special form", "fungi", "ordinance", "personal property", "loss payee"]
+    if any(k in vl for k in bad_patterns) or (re.search(r'\b\d{2}/\d{2}\b', v) and not re.search(r'\b\d{2}/\d{2}/\d{2,4}\b', v)): return False, v, 0.0
+    if "covered cause of loss" in vl:
+        return False, v, 0.0
+    if re.search(r'\d{10,}', v):
+        return False, v, 0.0
+    if re.search(r'(?i)\b(?:a\.?m\.?|p\.?m\.?)\b', v) and "time" in vl:
+        return False, v, 0.0
+    if re.match(r'^\d{7,}\b', v) and not re.search(r'\b(' + '|'.join(STREET_TYPES) + r')\b', vl):
+        return False, v, 0.0
     if _is_document_reference(v) or _is_mortgage_company_address(v): return False, v, 0.0
     if PO_BOX_RE.search(v):
         if len(v.split()) <= 4 and not re.search(r'\b[A-Z]{2}\s*\d{5}', v): return False, v, 0.0
@@ -607,6 +686,84 @@ def validate_address(value: str) -> Tuple[bool, str, float]:
     if re.match(r'^\d+\s+\w', v) and len(v.split()) >= 3: return True, _normalize_address(v), 0.88
     if bool(re.search(r'\d+', v)) and len(v.split()) >= 4: return True, _normalize_address(v), 0.80
     return False, v, 0.0
+
+
+def _extract_labeled_insured(lines: List[str]) -> str:
+    """
+    Prefer explicitly labeled insured blocks over unlabeled person names
+    (which are often agent/producer names on HAZ docs).
+    """
+    if not lines:
+        return ""
+    label_pat = re.compile(
+        r'(?i)(?:first\s+named\s+insured|named\s+insured|policyholder(?:/named\s+insured)?)\s*:\s*(.+)'
+    )
+    for i, line in enumerate(lines):
+        m = label_pat.search(str(line))
+        if m:
+            cand = m.group(1).strip(" ,;:-")
+            if cand:
+                ok, norm, _ = validate_name(cand)
+                if ok:
+                    return norm
+        if re.search(r'(?i)^(?:first\s+named\s+insured|named\s+insured|policyholder(?:/named\s+insured)?)\s*:?\s*$', str(line).strip()):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                cand = str(lines[j]).strip(" ,;:-")
+                if not cand:
+                    continue
+                if re.search(r'(?i)^(policy|loan|effective|expiration|mailing|location|address|premium|deductible|agent|producer)\b', cand):
+                    break
+                ok, norm, _ = validate_name(cand)
+                if ok:
+                    return norm
+                break
+    return ""
+
+
+def _normalize_insured_with_context(validated: Dict, lines: List[str]) -> Dict:
+    insured = validated.get("insured_name")
+    if not insured or not isinstance(insured, dict):
+        labeled = _extract_labeled_insured(lines)
+        if labeled:
+            validated["insured_name"] = {
+                "value": labeled,
+                "confidence": 0.92,
+                "source": "validation_context",
+                "validation_score": 0.92,
+            }
+        return validated
+
+    current = str(insured.get("value", "")).strip()
+    if not current:
+        return validated
+
+    labeled = _extract_labeled_insured(lines)
+    if labeled and labeled.lower() != current.lower():
+        validated["insured_name"]["value"] = labeled
+        validated["insured_name"]["confidence"] = max(
+            float(validated["insured_name"].get("confidence", 0.0) or 0.0), 0.92
+        )
+        validated["insured_name"]["source"] = "validation_context"
+        validated["insured_name"]["validation_score"] = max(
+            float(validated["insured_name"].get("validation_score", 0.0) or 0.0), 0.92
+        )
+        return validated
+
+    # If current name appears in agent/producer context, drop it unless we have a labeled insured.
+    pat = re.compile(re.escape(current), re.I)
+    for line in lines[:120]:
+        ll = str(line).lower()
+        if ("agent" in ll or "producer" in ll or "agency" in ll) and pat.search(str(line)):
+            if labeled:
+                validated["insured_name"]["value"] = labeled
+                validated["insured_name"]["source"] = "validation_context"
+                validated["insured_name"]["validation_score"] = max(
+                    float(validated["insured_name"].get("validation_score", 0.0) or 0.0), 0.90
+                )
+            else:
+                validated.pop("insured_name", None)
+            break
+    return validated
 
 def validate_date(value: str) -> Tuple[bool, str, float]:
     v = _normalize_whitespace(_strip_prefixes(value))
@@ -712,21 +869,47 @@ def _salvage_from_lines(
             if "expiration_date" in missing:
                 candidates["expiration_date"] = m.group(2)
         else:
+            # Pattern A2: "Policy Period: 01/01/2020 - 01/01/2021"
+            m2 = re.search(
+                r'(?is)policy\s+period[^0-9]*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})\s*(?:to|through|-)\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})',
+                text,
+            )
+            if m2:
+                if "effective_date" in missing:
+                    candidates["effective_date"] = m2.group(1)
+                if "expiration_date" in missing:
+                    candidates["expiration_date"] = m2.group(2)
+            else:
             # Pattern B: split lines:
             # "Policy Period"
             # "From: 01/01/2020 To: 01/01/2021"
             # or plain "01/01/2020 ... 01/01/2021" near that label.
-            for i, line in enumerate(lines):
-                if "policy period" not in line.lower():
-                    continue
-                window = " ".join(lines[i:i + 4])
-                d = re.findall(r'([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})', window)
-                if len(d) >= 2:
-                    if "effective_date" in missing:
-                        candidates["effective_date"] = d[0]
-                    if "expiration_date" in missing:
-                        candidates["expiration_date"] = d[1]
-                    break
+                for i, line in enumerate(lines):
+                    if "policy period" not in line.lower():
+                        continue
+                    window = " ".join(lines[i:i + 4])
+                    d = re.findall(r'([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})', window)
+                    if len(d) >= 2:
+                        if "effective_date" in missing:
+                            candidates["effective_date"] = d[0]
+                        if "expiration_date" in missing:
+                            candidates["expiration_date"] = d[1]
+                        break
+        # Pattern C: independently labeled dates
+        if "effective_date" in missing and "effective_date" not in candidates:
+            m_eff = re.search(
+                r'(?is)effective\s+date\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})',
+                text,
+            )
+            if m_eff:
+                candidates["effective_date"] = m_eff.group(1)
+        if "expiration_date" in missing and "expiration_date" not in candidates:
+            m_exp = re.search(
+                r'(?is)(?:expiration|expiry)\s+date\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})',
+                text,
+            )
+            if m_exp:
+                candidates["expiration_date"] = m_exp.group(1)
 
     # Property address from "Location"/"Described Location" blocks
     if "property_address" in missing:
@@ -1047,6 +1230,7 @@ def validate_and_arbitrate(merged_fields: Dict, ocr_confidence: float, stage_bre
 
     validated = _cross_validate(validated)
     validated = _normalize_carrier_with_context(validated, lines)
+    validated = _normalize_insured_with_context(validated, lines)
     
     # Defaults and Filtering
     default_fields = list(validators.keys()) + ["remit_info", "third_party_removed", "third_party_cancellation_date", "cancellation_reason", "cancellation_effective_date"]
@@ -1055,6 +1239,7 @@ def validate_and_arbitrate(merged_fields: Dict, ocr_confidence: float, stage_bre
     # Last-mile salvage for still-missing allowed fields
     validated = _salvage_from_lines(validated, allowed, lines, validators)
     validated = _normalize_carrier_with_context(validated, lines)
+    validated = _normalize_insured_with_context(validated, lines)
     validated = {f: d for f, d in validated.items() if f in allowed}
     
     # Missing Reasons
@@ -1063,6 +1248,227 @@ def validate_and_arbitrate(merged_fields: Dict, ocr_confidence: float, stage_bre
 
     final_conf = round(sum(scores)/len(scores)*0.6 + ocr_confidence*0.4, 3) if scores else round(ocr_confidence*0.4, 3)
     return validated, final_conf
+
+
+def postprocess_api_fields(
+    clean_fields: Dict,
+    expected_fields: List[str],
+    lines: List[str],
+    doc_type: str = "UNK",
+    policy_type: str = "UNK",
+    ocr_confidence: float = 0.85,
+) -> Dict:
+    """
+    API-focused post-processing wrapper:
+    - validates existing extracted fields
+    - salvages missing fields from OCR lines
+    - preserves bbox/page from incoming clean_fields when available
+    """
+    input_fields = clean_fields or {}
+    logger.info(
+        "postprocess_api_fields.start input_fields=%d expected_fields=%d lines=%d",
+        len(input_fields),
+        len(expected_fields or []),
+        len(lines or []),
+    )
+    expected = expected_fields or []
+    allowed_set = set(expected) if expected else None
+
+    merged_for_validation: Dict = {}
+    bbox_page_by_field: Dict = {}
+
+    for field, payload in input_fields.items():
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("value")
+        bbox_page_by_field[field] = {
+            "bbox": payload.get("bbox"),
+            "page": payload.get("page"),
+        }
+        if value is None:
+            continue
+        value_str = str(value).strip()
+        if not value_str:
+            continue
+        merged_for_validation[field] = {
+            "value": value_str,
+            "confidence": float(payload.get("confidence", 0.95) or 0.95),
+            "source": payload.get("source", "api_merge"),
+        }
+
+    try:
+        validated, _ = validate_and_arbitrate(
+            merged_for_validation,
+            ocr_confidence,
+            {"api": merged_for_validation},
+            doc_type=doc_type,
+            policy_type=policy_type,
+            lines=lines or [],
+        )
+    except Exception as e:
+        logger.exception("postprocess_api_fields.validate_failed error=%s", e)
+        validated = {}
+
+    # Build final payload in expected-field order when available.
+    ordered_fields = expected if expected else sorted(set(list(input_fields.keys()) + list(validated.keys())))
+    out: Dict = {}
+
+    for field in ordered_fields:
+        if allowed_set is not None and field not in allowed_set:
+            continue
+
+        v_data = validated.get(field, {})
+        v_value = v_data.get("value") if isinstance(v_data, dict) else None
+
+        if v_value is None or (isinstance(v_value, str) and not v_value.strip()):
+            # Keep original value when validator rejects/omits it.
+            # CRITICAL EXCEPTION: for insured_name and carrier_name, a validator
+            # rejection is definitive (e.g. barcode artifacts, bad carrier text).
+            # Do NOT re-insert values that were explicitly rejected for these fields.
+            _hard_reject_fields = {"insured_name", "carrier_name"}
+            raw = input_fields.get(field, {})
+            if isinstance(raw, dict):
+                raw_val = raw.get("value")
+                if raw_val is not None and str(raw_val).strip():
+                    # Skip re-insertion for hard-reject fields when validator said no
+                    if field in _hard_reject_fields:
+                        # Only re-insert if validator produced nothing at all
+                        # (i.e. field was not even attempted, not that it was rejected)
+                        if field not in validated:
+                            out[field] = {
+                                "value": str(raw_val).strip(),
+                                "bbox": raw.get("bbox"),
+                                "page": raw.get("page"),
+                            }
+                    else:
+                        out[field] = {
+                            "value": str(raw_val).strip(),
+                            "bbox": raw.get("bbox"),
+                            "page": raw.get("page"),
+                        }
+            continue
+
+        box_meta = bbox_page_by_field.get(field, {})
+        out[field] = {
+            "value": str(v_value).strip(),
+            "bbox": box_meta.get("bbox"),
+            "page": box_meta.get("page"),
+        }
+
+    logger.info("postprocess_api_fields.complete output_fields=%d", len(out))
+    return out
+
+
+def enrich_api_fields(
+    clean_fields: Dict,
+    expected_fields: List[str],
+    lines: List[str],
+    doc_type: str = "UNK",
+    policy_type: str = "UNK",
+    ocr_confidence: float = 0.85,
+) -> Dict:
+    """
+    Shared API enrichment flow:
+    1) keep incoming extracted fields
+    2) fill missing expected fields via stage1 + stage2
+    3) validate/salvage/normalize using postprocess_api_fields
+    """
+    expected = expected_fields or []
+    logger.info(
+        "enrich_api_fields.start clean_fields=%d expected_fields=%d lines=%d",
+        len(clean_fields or {}),
+        len(expected),
+        len(lines or []),
+    )
+    working: Dict = {}
+
+    for field, payload in (clean_fields or {}).items():
+        if isinstance(payload, dict):
+            working[field] = {
+                "value": payload.get("value"),
+                "bbox": payload.get("bbox"),
+                "page": payload.get("page"),
+            }
+
+    missing = [
+        f for f in expected
+        if not (
+            isinstance(working.get(f), dict)
+            and working[f].get("value") is not None
+            and str(working[f].get("value")).strip()
+        )
+    ]
+
+    if lines and missing:
+        try:
+            from agents.stage1_deterministic_agent import extract_fields as stage1_extract
+            stage1_result = stage1_extract(lines)
+        except Exception as e:
+            logger.exception("enrich_api_fields.stage1_failed error=%s", e)
+            stage1_result = {}
+        for f in missing:
+            data = stage1_result.get(f)
+            if not isinstance(data, dict):
+                continue
+            value = data.get("value")
+            if value is None or not str(value).strip():
+                continue
+            existing = working.get(f, {}) if isinstance(working.get(f), dict) else {}
+            working[f] = {
+                "value": str(value).strip(),
+                "bbox": existing.get("bbox"),
+                "page": existing.get("page"),
+                "confidence": float(data.get("confidence", 0.9) or 0.9),
+                "source": data.get("source", "stage1_deterministic"),
+            }
+
+    missing = [
+        f for f in expected
+        if not (
+            isinstance(working.get(f), dict)
+            and working[f].get("value") is not None
+            and str(working[f].get("value")).strip()
+        )
+    ]
+
+    if lines and missing:
+        try:
+            from agents.stage2_semantic_agent import extract_with_ner as stage2_extract
+            stage2_result = stage2_extract(lines, missing)
+        except Exception as e:
+            logger.exception("enrich_api_fields.stage2_failed error=%s", e)
+            stage2_result = {}
+        for f in missing:
+            data = stage2_result.get(f)
+            if not isinstance(data, dict):
+                continue
+            value = data.get("value")
+            if value is None or not str(value).strip():
+                continue
+            existing = working.get(f, {}) if isinstance(working.get(f), dict) else {}
+            working[f] = {
+                "value": str(value).strip(),
+                "bbox": existing.get("bbox"),
+                "page": existing.get("page"),
+                "confidence": float(data.get("confidence", 0.75) or 0.75),
+                "source": data.get("source", "stage2_semantic"),
+            }
+
+    try:
+        out = postprocess_api_fields(
+            working,
+            expected,
+            lines or [],
+            doc_type=doc_type,
+            policy_type=policy_type,
+            ocr_confidence=ocr_confidence,
+        )
+    except Exception as e:
+        logger.exception("enrich_api_fields.postprocess_failed error=%s", e)
+        out = working
+    logger.info("enrich_api_fields.complete output_fields=%d", len(out))
+    return out
+
 
 def validate_output(structured: Dict, confidence: float):
     return validate_and_arbitrate(structured, confidence, {"stage1": structured})

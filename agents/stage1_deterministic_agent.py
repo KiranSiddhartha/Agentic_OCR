@@ -626,6 +626,19 @@ def _looks_like_name(text: str) -> bool:
     if special > 2:
         return False
     
+    # CRITICAL: Reject postal barcode artifacts.
+    # USPS barcodes OCR as strings with double-quote chars or non-ASCII chars.
+    # Real person/company names never contain double-quote characters.
+    if '"' in text:
+        return False
+    # Reject if >20% of characters are non-alphanumeric/space (barcode noise)
+    _non_alnum = sum(1 for c in text if not c.isalnum() and c != ' ')
+    if len(text) > 0 and _non_alnum / len(text) > 0.20:
+        return False
+    # Reject if any non-ASCII characters present (Cyrillic/box-drawing from barcodes)
+    if any(ord(c) > 127 for c in text):
+        return False
+    
     # Block if starts with certain bad patterns
     bad_starts = (
         "policy", "coverage", "premium", "page", "section",
@@ -703,6 +716,15 @@ def _looks_like_policy(v: str) -> bool:
     
     # Block document references
     if _is_document_reference(v_original):
+        return False
+    
+    # CRITICAL: Block currency/liability-limit values.
+    # Policy numbers never use comma-thousands separators (e.g. "500,000", "S10,000").
+    # Pattern: optional single letter prefix, then digits with commas (NNN,NNN).
+    if re.match(r'^[A-Z]?\d{1,3}(,\d{3})+$', v_original, re.I):
+        return False
+    # Also block OCR-mangled dollar amounts: '$' read as 'S' prefix on currency values.
+    if re.match(r'^[$S]\s*\d{1,3}(,\d{3})*(\\.\d{1,2})?$', v_original, re.I):
         return False
     
     # Block dates - numeric and written
@@ -3678,6 +3700,277 @@ def _clean_insured_name(fields: Dict) -> None:
             fields["insured_name"]["value"] = f"{toks[1].upper()}, {toks[0].upper()}"
 
 
+def _recover_named_insured_from_block(lines: List[str], fields: Dict) -> None:
+    """
+    Prefer a clean person-name line from labeled insured blocks when the current
+    insured value is OCR-damaged.
+    """
+    current = fields.get("insured_name", {})
+    current_val = str(current.get("value", "")).strip()
+    current_src = current.get("source", "")
+    should_override = (
+        not current_val
+        or _is_low_quality_name(current_val)
+        or any(ch in current_val for ch in "[]{}|")
+        or current_src in ("insured_block", "mailing_block")
+    )
+    if not should_override:
+        return
+
+    stop_words = (
+        "location of insured property", "property location", "policy number",
+        "policy period", "sales rep", "producer", "processed by", "naic number",
+        "additional named insured", "forms and endorsements", "coverage",
+        "loan number", "mortgage", "other interests", "other interest",
+    )
+
+    def _candidate_score(name: str) -> int:
+        score = 0
+        if _looks_like_name(name):
+            score += 5
+        if not _is_low_quality_name(name):
+            score += 3
+        if re.fullmatch(r"[A-Z][A-Z'\-]+(?:,\s*[A-Z][A-Z'\-]+)?(?:\s+[A-Z][A-Z'\-]+)*", name):
+            score += 3
+        if re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", name):
+            score += 4
+        if any(ch in name for ch in "[]{}|"):
+            score -= 4
+        if any(ch.isdigit() for ch in name):
+            score -= 4
+        return score
+
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if not (
+            "named insured and mailing address" in ll
+            or "insured name and mailing address" in ll
+            or "insured mailing name and address" in ll
+        ):
+            continue
+
+        best_name = ""
+        best_score = -999
+        for j in range(i + 1, min(i + 6, len(lines))):
+            candidate = lines[j].strip()
+            if not candidate:
+                continue
+            cand_lower = candidate.lower()
+            if any(word in cand_lower for word in stop_words):
+                break
+            if _looks_like_address(candidate):
+                break
+            score = _candidate_score(candidate)
+            if score > best_score:
+                best_name = candidate
+                best_score = score
+
+        if best_name and best_score >= 6:
+            fields["insured_name"] = {
+                "value": _normalize_name(best_name),
+                "confidence": 0.94,
+                "source": "stage1_named_insured_block",
+            }
+            return
+
+
+def _recover_property_from_location_block(lines: List[str], fields: Dict) -> None:
+    """
+    Rebuild property address from a labeled property/location block and stop
+    before adjacent labels bleed into the address.
+    """
+    current_val = str(fields.get("property_address", {}).get("value", "")).strip()
+    current_lower = current_val.lower()
+    current_is_contaminated = any(
+        bad in current_lower for bad in (
+            "primary residence", "premium payor", "flood risk", "rated zone",
+            "community number", "policy period", "coverage", "mortgage",
+        )
+    )
+    if current_val and not current_is_contaminated:
+        return
+
+    triggers = (
+        "property location", "location of insured property", "property address",
+        "risk location",
+    )
+    stop_words = (
+        "primary residence", "premium payor", "flood risk", "current zone",
+        "community number", "community name", "grandfathered", "post-firm",
+        "program type", "building description", "policy period", "coverage",
+        "forms and endorsements", "loan number", "mortgage", "other interests",
+    )
+
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if not any(t in ll for t in triggers):
+            continue
+
+        parts = []
+        inline_value = ""
+        if ":" in line:
+            _, _, inline_value = line.partition(":")
+            inline_value = inline_value.strip()
+            if inline_value and not any(w in inline_value.lower() for w in stop_words):
+                parts.append(inline_value)
+
+        for j in range(i + 1, min(i + 5, len(lines))):
+            candidate = lines[j].strip()
+            if not candidate:
+                continue
+            cand_lower = candidate.lower()
+            if any(word in cand_lower for word in stop_words):
+                break
+            if candidate.endswith(":"):
+                break
+            parts.append(candidate)
+
+        if not parts:
+            continue
+
+        candidate_addr = _clean(" ".join(parts))
+        if candidate_addr:
+            fields["property_address"] = {
+                "value": candidate_addr,
+                "confidence": 0.9 if _looks_like_address(candidate_addr) else 0.78,
+                "source": "stage1_location_block",
+            }
+            return
+
+
+def _override_total_premium_from_explicit_label(lines: List[str], fields: Dict) -> None:
+    """Prefer an explicit 'Total Premium' amount over incidental premium deltas."""
+    for line in lines:
+        m = re.search(r'(?i)\btotal\s+premium\s*:\s*(\$[\d,]+(?:\.\d{2})?)', line)
+        if m:
+            fields["total_premium"] = {
+                "value": m.group(1),
+                "confidence": 0.97,
+                "source": "stage1_total_premium_label",
+            }
+            return
+
+
+def _recover_mortgage_from_interest_table(lines: List[str], fields: Dict) -> None:
+    """
+    Recover mortgage company from table rows like:
+      '1. Mortgagee    GATEWAY MORTGAGE'
+    """
+    current_val = str(fields.get("mortgage_company", {}).get("value", "")).strip()
+    current_lower = current_val.lower()
+    suspect_current = (
+        not current_val
+        or "payment plan" in current_lower
+        or "mortgagee bill" in current_lower
+        or "interest type" in current_lower
+    )
+    if not suspect_current:
+        return
+
+    for i, line in enumerate(lines):
+        m = re.search(r'(?i)\b\d+\.\s*mortgagee\b\s+(.+)$', line)
+        if not m:
+            m = re.search(r'(?i)\bmortgagee\b\s*:\s*(.+)$', line)
+        if not m:
+            continue
+
+        candidate = m.group(1).strip(" .:-")
+        if candidate and not _looks_like_address(candidate):
+            fields["mortgage_company"] = {
+                "value": candidate,
+                "confidence": 0.95,
+                "source": "stage1_mortgage_interest_table",
+            }
+            return
+
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and not _looks_like_address(nxt) and len(nxt) > 3:
+                fields["mortgage_company"] = {
+                    "value": nxt,
+                    "confidence": 0.93,
+                    "source": "stage1_mortgage_interest_table_nextline",
+                }
+                return
+
+
+def _prefer_brand_carrier_header(lines: List[str], fields: Dict) -> None:
+    """
+    For branded declaration headers like 'AAA Insurance' followed by
+    'underwritten by ...', prefer the explicit brand line over a fuzzy-matched
+    unrelated carrier.
+    """
+    current = fields.get("carrier_name", {})
+    current_src = current.get("source", "")
+    if current and "fuzzy_corrected" not in current_src:
+        return
+
+    for i, line in enumerate(lines[:6]):
+        candidate = line.strip()
+        cl = candidate.lower()
+        if re.fullmatch(r'[A-Z]{2,6}\s+Insurance', candidate, re.I):
+            if i + 1 < len(lines) and "underwritten by" in lines[i + 1].lower():
+                fields["carrier_name"] = {
+                    "value": candidate.upper(),
+                    "confidence": 0.95,
+                    "source": "stage1_brand_header",
+                }
+                return
+
+
+def _repair_flood_renewal_dates(lines: List[str], fields: Dict) -> None:
+    """
+    Flood renewals often repeat the original month/day each year. If the current
+    expiration matches the original month/day but the extracted effective date
+    does not, align the effective month/day to the expiration month/day and keep
+    the prior year.
+    """
+    joined = " ".join(lines).lower()
+    if "flood policy declarations" not in joined and "nfip" not in joined:
+        return
+
+    eff = fields.get("effective_date", {}).get("value")
+    exp = fields.get("expiration_date", {}).get("value")
+    if not eff or not exp:
+        return
+
+    m_orig = re.search(
+        r'(?i)original\s+new\s+business\s+effective\s+date\s*:\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        " ".join(lines),
+    )
+    if not m_orig:
+        return
+
+    def _parse_mmddyyyy(value: str):
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y"):
+            try:
+                from datetime import datetime
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
+
+    eff_dt = _parse_mmddyyyy(str(eff))
+    exp_dt = _parse_mmddyyyy(str(exp))
+    orig_dt = _parse_mmddyyyy(m_orig.group(1))
+    if not eff_dt or not exp_dt or not orig_dt:
+        return
+
+    if (exp_dt.month, exp_dt.day) != (orig_dt.month, orig_dt.day):
+        return
+    if (eff_dt.month, eff_dt.day) == (exp_dt.month, exp_dt.day):
+        return
+    if exp_dt.year - eff_dt.year not in (0, 1):
+        return
+
+    repaired = f"{exp_dt.month:02d}/{exp_dt.day:02d}/{exp_dt.year - 1:04d}"
+    fields["effective_date"] = {
+        "value": repaired,
+        "confidence": max(fields.get("effective_date", {}).get("confidence", 0.0), 0.9),
+        "source": "stage1_flood_renewal_repaired",
+    }
+
+
 def _is_mortgage_heading_noise(text: str) -> bool:
     ll = (text or "").lower()
     noise_phrases = (
@@ -4564,11 +4857,17 @@ def extract_fields(lines: List[str], layout_elements=None) -> Dict[str, Dict]:
     _extract_can_inv_fields(lines, extractor.fields)   # ← NEW: CAN + INV fields
     _extract_carrier_full_scan(lines, extractor.fields)
     _extract_nfip_direct_carrier(lines, extractor.fields)
+    _override_total_premium_from_explicit_label(lines, extractor.fields)
+    _recover_mortgage_from_interest_table(lines, extractor.fields)
     _clean_policy_number(extractor.fields)
     _clean_insured_name(extractor.fields)
+    _recover_named_insured_from_block(lines, extractor.fields)
+    _recover_property_from_location_block(lines, extractor.fields)
     _clean_carrier_ocr_bleed(extractor.fields)         # ← Fix OCR bleed on carrier name
+    _prefer_brand_carrier_header(lines, extractor.fields)
     _upgrade_brand_to_full_carrier(lines, extractor.fields)  # ← Upgrade single-word brand to full carrier
     _clean_policy_column_merge(extractor.fields)        # ← Strip column-merge alpha noise from policy number
+    _repair_flood_renewal_dates(lines, extractor.fields)
     
     return extractor.fields
 
